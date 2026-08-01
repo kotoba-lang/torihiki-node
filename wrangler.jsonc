@@ -1,0 +1,13 @@
+{
+  "name": "torihiki-node",
+  "main": "dist/worker.js",
+  "compatibility_date": "2026-08-01",
+  // The Durable Object IS the sequencer. Cloudflare guarantees one instance
+  // per id, single-threaded — which is exactly "there is exactly one writer",
+  // obtained without implementing a write lease or a fencing epoch.
+  "durable_objects": {
+    "bindings": [{ "name": "SEQUENCER", "class_name": "Sequencer" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Sequencer"] }],
+  "observability": { "enabled": true }
+}

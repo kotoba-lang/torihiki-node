@@ -1,0 +1,13 @@
+{
+  "name": "torihiki-node",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "shadow-cljs release worker",
+    "deploy": "npm run build && wrangler deploy"
+  },
+  "devDependencies": {
+    "shadow-cljs": "2.28.20",
+    "wrangler": "^4.0.0"
+  }
+}

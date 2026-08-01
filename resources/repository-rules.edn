@@ -1,0 +1,11 @@
+{:schema "kotoba.repository-role-rules.v0"
+ :this-repo
+ {:name "torihiki-node"
+  :prefix nil
+  :role :service
+  ;; It answers a request and stops. The Durable Object holds state between
+  ;; requests, but nothing here runs unprompted — there is no loop and no clock.
+  :execution :on-demand
+  :must [:run-the-real-engine :state-that-it-is-a-sequencer :verify-signatures]
+  :must-not [:reimplement-matching :trust-a-client-asserted-account]
+  :depends-on ["kotoba-lang/torihiki"]}}

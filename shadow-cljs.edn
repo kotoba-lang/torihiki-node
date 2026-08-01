@@ -1,0 +1,9 @@
+{:deps {:aliases []}
+ :builds
+ {:worker
+  {:target :esm
+   :output-dir "dist"
+   :runtime :custom
+   :modules {:worker {:exports {default torihiki-node.worker/handler
+                                Sequencer torihiki-node.worker/Sequencer}}}
+   :compiler-options {:infer-externs :auto}}}}
