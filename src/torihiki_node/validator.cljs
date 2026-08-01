@@ -32,14 +32,23 @@
   A vote from a witness whose key is not yet known is DROPPED, not deferred:
   fail closed, the same rule `engi.attest/lookup-verifier` states.
 
-  ## What does not work: the clock
+  ## The clock, and what is still wrong with it
 
-  The chain advances when something POSTs `/step`. The alarm is scheduled and
-  awaited, and it does not sustain the loop on its own — height sat at 177 for
-  two minutes with nothing stepping it. So this is a deployed, agreeing,
-  four-validator chain that somebody else has to wind, which is not the same
-  thing as a running one and is written here rather than left to be
-  discovered.
+  The alarm handler was not in the compiled bundle at all. `deftype` methods
+  are renamed by the advanced compiler unless something stops it; `fetch`
+  survives because the externs already know that name and `alarm` does not, so
+  Cloudflare called a method that had been compiled away. Every symptom
+  pointed at the alarm firing and doing nothing — the chain moved when `/step`
+  was POSTed — so three fixes went into the SCHEDULING before the handler
+  itself turned out to be missing. `goog.object/set` with a string literal
+  attaches it under a name the compiler cannot touch.
+
+  It runs on its own now, and not for long: the chain reaches a dozen blocks
+  and stops until something touches it again, at which point `rearm` sets a
+  new alarm and it goes again. So the honest description is a chain that winds
+  itself in bursts, which is better than one that has to be wound by hand and
+  is not a running chain. Cloudflare drops an alarm after repeated failures
+  and that is the first place to look.
 
   ## Three bugs the deployment had that the in-process harness could not
 
@@ -57,10 +66,12 @@
   - **`setAlarm` was fired and not returned.** A Durable Object may be put to
     sleep as soon as the handler resolves, so a write still in flight is a
     tick that never happens."
-  (:require [engi.attest :as att]
+  (:require [goog.object :as gobj]
+            [engi.attest :as att]
             [engi.consensus :as c]
             [engi.replica :as r]
             [engi.wire :as wire]
+            [kotoba.bytes.sha256 :as sha]
             [torihiki.address :as addr]
             [torihiki.api :as api]
             [torihiki.book :as bk]
@@ -68,7 +79,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "6")
+(def ^:const code-version "8")
 (def ^:const market-id 1)
 (def witnesses ["w1" "w2" "w3" "w4"])
 (def ^:const tick-ms 400)
@@ -100,19 +111,18 @@
     (dotimes [i n] (aset out i (.charCodeAt bin i)))
     out))
 
-(defn- sha256-hex [s]
-  ;; The block hash. WebCrypto's digest is async and `hash-fn` is not, so this
-  ;; cannot use it — the replica hashes a block while deciding whether to vote
-  ;; for it, and making that path async would push a platform concern into
-  ;; consensus code. FNV-1a over the canonical string is not cryptographic and
-  ;; is not pretending to be: it identifies blocks within one run. Making it a
-  ;; real digest needs a synchronous SHA-256, which `kotoba.bytes.sha256`
-  ;; already provides — a follow-up, and named here rather than left implicit.
-  (loop [h 2166136261 i 0]
-    (if (>= i (count s))
-      (str (.toString (bit-and h 0xffffffff) 16) "-" (count s))
-      (recur (bit-and (* (bit-xor h (.charCodeAt s i)) 16777619) 0xffffffff)
-             (inc i)))))
+(defn- block-hash
+  "SHA-256 of the canonical block string, synchronously.
+
+  It was FNV-1a, because WebCrypto's digest is async and `hash-fn` is not —
+  the replica hashes a block while deciding whether to vote for it, and making
+  that path async would push a platform concern into consensus code. The
+  answer was not to weaken the hash but to use one that is already
+  synchronous: `kotoba.bytes.sha256` is pure `.cljc` and `torihiki.state`
+  computes its state root with it. A block identifier a peer can forge
+  collisions in is a peer that can make two blocks look like one."
+  [s]
+  (sha/sha256-hex s))
 
 ;; ── the replica ─────────────────────────────────────────────────────────────
 
@@ -180,7 +190,7 @@
                          (r/replica {:witness name
                                      :witnesses witnesses
                                      :quorum (c/quorum-size (count witnesses))
-                                     :hash-fn (fn [b] (sha256-hex (c/canonical-block b)))
+                                     :hash-fn (fn [b] (block-hash (c/canonical-block b)))
                                      :chain-id chain-id
                                      :verify-fn (fn [w payload sig]
                                                   (or (= w name)
@@ -199,9 +209,16 @@
                                           :derive-account addr/derive}))
                                       :root-fn st/state-root}}))
                    (set! (.-ready this) true)
-                   (.put ^js (.-storage do-state) "witness" name)
-                   (.setAlarm ^js (.-storage do-state) (+ (js/Date.now) tick-ms))
-                   nil)))))
+                   ;; RETURNED. This was fired and forgotten, and a Durable
+                   ;; Object may be put to sleep as soon as the handler
+                   ;; resolves — so the very first alarm was lost and the loop
+                   ;; never started. The chain then only moved when something
+                   ;; POSTed /step, which looked like the alarm firing and
+                   ;; doing nothing rather than never firing at all.
+                   (-> (.put ^js (.-storage do-state) "witness" name)
+                       (.then (fn [_]
+                                (.setAlarm ^js (.-storage do-state)
+                                           (+ (js/Date.now) tick-ms))))))))))
 
   ;; A synchronous answer from a cache the async fetch fills. Unknown key ->
   ;; false, never "unknown": a verifier that treats "I was not asked about
@@ -300,7 +317,7 @@
     (set! (.-last-error this) (str (or (.-message e) e)))
     nil)
 
-  (alarm [this]
+  (tickNow [this]
     (-> (if (.-witness this)
           (js/Promise.resolve (.-witness this))
           (.get ^js (.-storage do-state) "witness"))
@@ -355,11 +372,23 @@
                   (json {:ok false :error (str (or (.-message e) e))
                          :witness (.-witness this)} 500)))))
 
+  (rearm [this]
+    ;; If no alarm is pending, set one. A loop that can be lost needs
+    ;; something that notices it is gone, and every request is a free chance
+    ;; to look — cheaper than a chain that stops silently and waits to be
+    ;; wound by hand.
+    (-> (.getAlarm ^js (.-storage do-state))
+        (.then (fn [a]
+                 (when-not a
+                   (.setAlarm ^js (.-storage do-state) (+ (js/Date.now) tick-ms)))))
+        (.catch (fn [_] nil))))
+
   (handle [this ^js request]
     (let [url (js/URL. (.-url request))
           path (.-pathname url)
           w (or (.get (.-searchParams url) "w") "w1")]
       (-> (.boot this w)
+          (.then (fn [_] (.rearm this)))
           (.then
            (fn [_]
              (case path
@@ -424,6 +453,24 @@
                (json {:ok false :reason "not-found"} 404)))))))
 
   )
+
+
+;; ── the alarm, attached by its literal name ─────────────────────────────────
+;;
+;; `deftype` methods are renamed by the advanced compiler unless something
+;; stops it. `fetch` survives because it is a name the externs already know;
+;; `alarm` is not, so Cloudflare looked for a method that had been compiled
+;; away and the loop never ran once. Every symptom pointed at the alarm firing
+;; and doing nothing — the chain moved when /step was POSTed, so the clock
+;; looked broken rather than absent — and three fixes went into the scheduling
+;; before the handler itself turned out not to be there.
+;;
+;; `aset` with a string literal cannot be renamed.
+;; `goog.object/set` rather than `aset`: aset on a prototype with an unused
+;; result was eliminated outright, and the built bundle contained no "alarm"
+;; anywhere — the fix compiled away as thoroughly as the bug did.
+(gobj/set (.-prototype Validator) "alarm"
+          (fn [] (this-as this (.tickNow ^js this))))
 
 (def handler
   #js {:fetch
