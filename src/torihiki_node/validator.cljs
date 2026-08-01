@@ -56,17 +56,22 @@
   itself turned out to be missing. `goog.object/set` with a string literal
   attaches it under a name the compiler cannot touch.
 
-  **It still does not run on its own.** The handler is in the built bundle —
-  `Ap.prototype.alarm=function(){return this.tickNow()}` — and `rearm` now
-  overwrites the alarm on every request rather than only setting one when
-  none is pending, since a dropped alarm still reads as pending and the
-  watchdog was looking at a corpse. The queue sits at one message and
-  `last-error` stays empty, which means `tickNow` is not being entered at all.
+  The alarm was firing the whole time. `wrangler tail` said so in thirty
+  seconds — 153 alarm invocations, outcome ok, zero exceptions — after two
+  rounds of fixes aimed at a clock that was not broken. `tickNow` was still
+  calling `dispatch` with only the tick's own outbox while `ingest` queued
+  into a buffer nothing drained, so the queue sat at one message and the chain
+  sat at one block, and every symptom pointed at a dead alarm.
 
-  So: four validators, deployed, agreeing on a state root, advancing only when
-  something POSTs `/step`. `wrangler tail` is the next thing to look at and
-  has not been looked at. Saying it works because everything visible from here
-  looks right would be the mistake this file has already made three times.
+  The instrument was named as the next step two iterations before it was used.
+  Both intervening fixes were correct and neither was the bug.
+
+  ## Where it stands, exactly
+
+  The alarm fires, the queue drains, every replica agrees, and the chain is at
+  height ONE with no certificates. Votes are not reaching quorum and the
+  reason is not yet known. Everything above is a fix for something that was
+  genuinely wrong and none of it is the thing that is wrong now.
 
   ## Three bugs the deployment had that the in-process harness could not
 
@@ -97,7 +102,23 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "10")
+(def ^:const code-version "11")
+
+(defn- do-name
+  "The Durable Object id for a witness, versioned.
+
+  A Durable Object keeps running the code it started with until it is evicted,
+  and a DO with a self-rescheduling 400ms alarm NEVER goes idle — so the very
+  mechanism that makes it a running chain makes it impossible to update. Three
+  minutes of complete silence did not evict it; polling to check whether the
+  new version was live was itself keeping the old version alive.
+
+  Putting the version in the name means a deploy creates new objects. The
+  outer fetch handler always runs the new code, so it addresses the new ones,
+  and the old ones talk among themselves until they idle out. State is lost on
+  upgrade, which is honest here because it was only ever in memory."
+  [w]
+  (str w "-v" code-version))
 (def ^:const market-id 1)
 (def witnesses ["w1" "w2" "w3" "w4"])
 (def ^:const tick-ms 400)
@@ -253,7 +274,7 @@
       ;; is one request against a stall nobody can see.
       (for [w witnesses :when (not= w (.-witness this))]
         (-> (.fetch (.get ^js (.-VALIDATOR env)
-                          (.idFromName ^js (.-VALIDATOR env) w))
+                          (.idFromName ^js (.-VALIDATOR env) (do-name w)))
                     (str "https://v/head?w=" w))
             (.then #(.json %))
             (.then (fn [j] (when-let [k (aget j "pubkey")]
@@ -337,7 +358,7 @@
                       (clj->js
                        (for [w witnesses :when (not= w (.-witness this))]
                          (-> (.fetch (.get ^js (.-VALIDATOR env)
-                                           (.idFromName ^js (.-VALIDATOR env) w))
+                                           (.idFromName ^js (.-VALIDATOR env) (do-name w)))
                                      (js/Request. (str "https://v/msg?w=" w)
                                                   #js {:method "POST" :body body}))
                              (.catch (fn [_] nil)))))))))
@@ -364,10 +385,12 @@
                  (if (zero? (r/height (.-replica this)))
                    (let [[s' out] (r/start (.-replica this) (js/Date.now))]
                      (set! (.-replica this) s')
-                     (.dispatch this out))
+                     (.queue! this out)
+                     (.flush! this))
                    (let [[s' out] (r/on-tick (.-replica this) (js/Date.now))]
                      (set! (.-replica this) s')
-                     (.dispatch this out)))))
+                     (.queue! this out)
+                     (.flush! this)))))
         ;; The alarm must reschedule even when the tick threw, or one failure
         ;; stops the replica forever and it looks like a network problem.
         (.catch (fn [e] (.note! this e) nil))
@@ -519,4 +542,4 @@
                ^js ns* (.-VALIDATOR env)]
            (if-not (some #{w} witnesses)
              (json {:ok false :reason "unknown-witness"} 404)
-             (.fetch (.get ns* (.idFromName ns* w)) request))))})
+             (.fetch (.get ns* (.idFromName ns* (do-name w))) request))))})
