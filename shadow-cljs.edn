@@ -6,4 +6,11 @@
    :runtime :custom
    :modules {:worker {:exports {default torihiki-node.worker/handler
                                 Sequencer torihiki-node.worker/Sequencer}}}
+   :compiler-options {:infer-externs :auto}}
+  :validator
+  {:target :esm
+   :output-dir "dist-validator"
+   :runtime :custom
+   :modules {:worker {:exports {default torihiki-node.validator/handler
+                                Validator torihiki-node.validator/Validator}}}
    :compiler-options {:infer-externs :auto}}}}

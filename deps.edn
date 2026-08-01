@@ -2,6 +2,13 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         org.clojure/clojurescript {:mvn/version "1.11.132"}
         thheller/shadow-cljs {:mvn/version "2.28.20"}
+        ;; The consensus layer. The validator Worker runs engi.replica with
+        ;; torihiki.state as its machine; the sequencer Worker does not use it
+        ;; and pays nothing for it, since shadow-cljs only compiles what is
+        ;; required.
+        io.github.kotoba-lang/engi
+        {:git/url "https://github.com/kotoba-lang/engi.git"
+         :git/sha "bd1d8260839c060872bbe68905d6f818ebd1b4b8"}
         io.github.kotoba-lang/torihiki
         {:git/url "https://github.com/kotoba-lang/torihiki.git"
          :git/sha "b1eba4d60d935575a72b663a2fde9dfe5676ec35"}}}

@@ -1,0 +1,13 @@
+{
+  "name": "torihiki-validator",
+  "main": "dist-validator/worker.js",
+  "compatibility_date": "2026-08-01",
+  // Four Durable Objects, w1..w4, each a replica. Cloudflare guarantees one
+  // instance per id, so "this witness is one process" comes from the platform
+  // rather than from a lease — the same reason the sequencer is a DO.
+  "durable_objects": {
+    "bindings": [{ "name": "VALIDATOR", "class_name": "Validator" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Validator"] }],
+  "observability": { "enabled": true }
+}
