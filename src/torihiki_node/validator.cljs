@@ -32,6 +32,19 @@
   A vote from a witness whose key is not yet known is DROPPED, not deferred:
   fail closed, the same rule `engi.attest/lookup-verifier` states.
 
+  ## Messages are queued and flushed once a tick, not dispatched on arrival
+
+  Dispatching from `ingest` amplifies: one message in produces three out, each
+  of which produces three more at the peer that receives it. In one process
+  that is cheap and it is what the harness does. Over HTTP it is a fan-out
+  that grows per round until it hits a subrequest limit, and the visible
+  symptom is a chain that runs for a dozen blocks and stops — which reads as
+  the alarm dying rather than as the network eating itself.
+
+  So an outbox is queued and the tick flushes it: three POSTs per replica per
+  tick, whatever happened in between. Bounded, and the same total work spread
+  over one round instead of doubling inside it.
+
   ## The clock, and what is still wrong with it
 
   The alarm handler was not in the compiled bundle at all. `deftype` methods
@@ -43,12 +56,17 @@
   itself turned out to be missing. `goog.object/set` with a string literal
   attaches it under a name the compiler cannot touch.
 
-  It runs on its own now, and not for long: the chain reaches a dozen blocks
-  and stops until something touches it again, at which point `rearm` sets a
-  new alarm and it goes again. So the honest description is a chain that winds
-  itself in bursts, which is better than one that has to be wound by hand and
-  is not a running chain. Cloudflare drops an alarm after repeated failures
-  and that is the first place to look.
+  **It still does not run on its own.** The handler is in the built bundle —
+  `Ap.prototype.alarm=function(){return this.tickNow()}` — and `rearm` now
+  overwrites the alarm on every request rather than only setting one when
+  none is pending, since a dropped alarm still reads as pending and the
+  watchdog was looking at a corpse. The queue sits at one message and
+  `last-error` stays empty, which means `tickNow` is not being entered at all.
+
+  So: four validators, deployed, agreeing on a state root, advancing only when
+  something POSTs `/step`. `wrangler tail` is the next thing to look at and
+  has not been looked at. Saying it works because everything visible from here
+  looks right would be the mistake this file has already made three times.
 
   ## Three bugs the deployment had that the in-process harness could not
 
@@ -79,7 +97,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "8")
+(def ^:const code-version "10")
 (def ^:const market-id 1)
 (def witnesses ["w1" "w2" "w3" "w4"])
 (def ^:const tick-ms 400)
@@ -277,7 +295,19 @@
                                        (set! (.-replica this) s')
                                        (into acc o)))
                                    [] msgs)]
-                   (.dispatch this out))))))
+                   ;; Queued, not sent. See the namespace docstring: sending
+                   ;; from here is what turned one message into nine.
+                   (.queue! this out)
+                   nil)))))
+
+  (queue! [this outbox]
+    (set! (.-outq this) (into (vec (or (.-outq this) [])) outbox))
+    nil)
+
+  (flush! [this]
+    (let [q (vec (or (.-outq this) []))]
+      (set! (.-outq this) [])
+      (.dispatch this q)))
 
   ;; Sign each outbound vote and new-view, then post the batch to every peer.
   (dispatch [this outbox]
@@ -346,7 +376,11 @@
         ;; flight is a tick that never happens — the loop stops with nothing
         ;; to read, which is what it did.
         (.then (fn [_]
-                 (.setAlarm ^js (.-storage do-state) (+ (js/Date.now) tick-ms))))))
+                 (.setAlarm ^js (.-storage do-state) (+ (js/Date.now) tick-ms))))
+        ;; An alarm handler that rejects is retried with backoff and then
+        ;; dropped, and a dropped alarm is a chain that stops for good. It
+        ;; must not reject, ever.
+        (.catch (fn [e] (.note! this e) nil))))
 
   ;; Drives one round from outside. The alarm is the normal clock; this exists
   ;; because a clock you cannot step by hand is a clock you cannot debug, and
@@ -357,10 +391,12 @@
                  (if (zero? (r/height (.-replica this)))
                    (let [[s' out] (r/start (.-replica this) (js/Date.now))]
                      (set! (.-replica this) s')
-                     (.dispatch this out))
+                     (.queue! this out)
+                     (.flush! this))
                    (let [[s' out] (r/on-tick (.-replica this) (js/Date.now))]
                      (set! (.-replica this) s')
-                     (.dispatch this out)))))
+                     (.queue! this out)
+                     (.flush! this)))))
         (.catch (fn [e] (.note! this e) nil))))
 
   (fetch [this ^js request]
@@ -377,10 +413,12 @@
     ;; something that notices it is gone, and every request is a free chance
     ;; to look — cheaper than a chain that stops silently and waits to be
     ;; wound by hand.
-    (-> (.getAlarm ^js (.-storage do-state))
-        (.then (fn [a]
-                 (when-not a
-                   (.setAlarm ^js (.-storage do-state) (+ (js/Date.now) tick-ms)))))
+    ;; Always overwrites, rather than only setting when none is pending.
+    ;; Cloudflare drops an alarm after repeated failures, and a dropped alarm
+    ;; still reads as "one is pending" to the check that was here — so the
+    ;; watchdog looked at a corpse and decided nothing needed doing. The queue
+    ;; sat at one message for four minutes with no error recorded anywhere.
+    (-> (.setAlarm ^js (.-storage do-state) (+ (js/Date.now) tick-ms))
         (.catch (fn [_] nil))))
 
   (handle [this ^js request]
@@ -413,6 +451,7 @@
                         :verified-sigs (count (js/Object.keys (or (.-verified this) #js {})))
                         :msgs-in (or (.-msgs-in this) 0)
                         :msgs-out (or (.-msgs-out this) 0)
+                        :queued (count (or (.-outq this) []))
                         :last-error (or (.-last-error this) nil)
                         :consensus (str (c/quorum-size (count witnesses))
                                         " of " (count witnesses)
