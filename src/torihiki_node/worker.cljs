@@ -46,7 +46,7 @@
   expensive way: twice in one session a fix was deployed, verified present in
   the bundle, and then contradicted by the live endpoint, which was still
   running the previous build. Without a marker there is nothing to check."
-  "5")
+  "6")
 (def ^:const market-id 1)
 
 (def market
@@ -190,6 +190,23 @@
                      (do
                        (set! (.-ex this) ex')
                        (set! (.-height this) h)
+                       ;; A bounded ring of recent fills. The engine's event
+                       ;; buffer is reset every block, so a terminal that
+                       ;; wanted a tape had nowhere to read one — and the
+                       ;; alternative, replaying the log on every poll, would
+                       ;; make a read cost what a cold start costs. Bounded on
+                       ;; purpose: this is a view, not history. History is the
+                       ;; log, and a client that needs it replays.
+                       (set! (.-tape this)
+                             (into (vec (take-last 200
+                                          (concat (or (.-tape this) [])
+                                                  (map (fn [f]
+                                                         {:level (:level f)
+                                                          :qty (:qty f)
+                                                          :side (:taker-side f)
+                                                          :h h})
+                                                       (bk/fills (get-in ex' [:books market-id]))))))
+                                   []))
                        (-> (.put ^js (.-storage do-state)
                                  (str "tx:" (.padStart (str h) 12 "0"))
                                  (js/JSON.stringify (clj->js entry)))
@@ -219,6 +236,11 @@
                              (api/account-state ex (js/parseInt (or (q "id") "0"))))
                  "/market" (json-response
                             (api/market-info ex (js/parseInt (or (q "id") "1"))))
+                 "/trades" (json-response
+                            {:market market-id
+                             :trades (vec (reverse (take-last
+                                                    (js/parseInt (or (q "n") "20"))
+                                                    (or (.-tape this) []))))})
                  "/head" (json-response
                           {:chain-id chain-id
                            :code-version code-version
