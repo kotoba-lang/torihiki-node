@@ -4,4 +4,4 @@
         thheller/shadow-cljs {:mvn/version "2.28.20"}
         io.github.kotoba-lang/torihiki
         {:git/url "https://github.com/kotoba-lang/torihiki.git"
-         :git/sha "e686ff4e8081a6d1b298e84e6947c2e3fe5d33ee"}}}
+         :git/sha "b1eba4d60d935575a72b663a2fde9dfe5676ec35"}}}

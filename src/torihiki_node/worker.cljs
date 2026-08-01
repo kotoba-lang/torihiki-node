@@ -32,6 +32,7 @@
             [torihiki.clearing :as cl]
             [torihiki.auth :as auth]
             [torihiki.api :as api]
+            [torihiki.address :as addr]
             [torihiki.book :as bk]))
 
 (def ^:const chain-id "torihiki-devnet-1")
@@ -46,7 +47,7 @@
   expensive way: twice in one session a fix was deployed, verified present in
   the bundle, and then contradicted by the live endpoint, which was still
   running the previous build. Without a marker there is nothing to check."
-  "7")
+  "8")
 (def ^:const market-id 1)
 
 (def market
@@ -166,7 +167,14 @@
                             (.-ex this)
                             {:height h :ts (* h 1000) :txs [entry]}
                             {:chain-id chain-id
-                             :verify-fn (fn [_pk _payload _sig] (true? ok?))})
+                             :verify-fn (fn [_pk _payload _sig] (true? ok?))
+                             ;; A key may only claim the account id derived
+                             ;; from it. Without this, whoever gets a
+                             ;; transaction in first owns the id — which under
+                             ;; a single sequencer means whoever asks first,
+                             ;; and under consensus means whoever orders the
+                             ;; block. Existing bindings are untouched.
+                             :derive-account addr/derive})
                        rejected (first (:rejected ex'))
                        authenticated? (not (contains? auth/reasons (:reason rejected)))]
                    ;; A transaction that authenticated and THEN failed
@@ -251,6 +259,7 @@
                            ;; that stays quiet about this will be assumed to
                            ;; be the other thing
                            :consensus "none — single sequencer, not a validator set"
+                           :account-ids "derived from the key (torihiki.address)"
                            ;; Every margin, liquidation and ADL number this
                            ;; node produces is exact arithmetic over
                            ;; collateral. The engine can name a bridge
