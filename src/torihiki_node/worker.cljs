@@ -46,7 +46,7 @@
   expensive way: twice in one session a fix was deployed, verified present in
   the bundle, and then contradicted by the live endpoint, which was still
   running the previous build. Without a marker there is nothing to check."
-  "6")
+  "7")
 (def ^:const market-id 1)
 
 (def market
@@ -250,7 +250,19 @@
                            ;; stated in the response on purpose — a service
                            ;; that stays quiet about this will be assumed to
                            ;; be the other thing
-                           :consensus "none — single sequencer, not a validator set"})
+                           :consensus "none — single sequencer, not a validator set"
+                           ;; Every margin, liquidation and ADL number this
+                           ;; node produces is exact arithmetic over
+                           ;; collateral. The engine can name a bridge
+                           ;; authority so that only it may credit an account;
+                           ;; this devnet deliberately names none, so any
+                           ;; account credits itself. Stated for the same
+                           ;; reason :consensus is: it will otherwise be
+                           ;; assumed to be the other thing.
+                           :bridge-authority (:bridge-authority ex)
+                           :collateral (if (:bridge-authority ex)
+                                         "bridged"
+                                         "unbacked — any account may credit itself (devnet faucet)")})
                  (json-response {:ok false :reason "not-found"} 404)))))))))
 
 (def handler
