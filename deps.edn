@@ -8,7 +8,7 @@
         ;; required.
         io.github.kotoba-lang/engi
         {:git/url "https://github.com/kotoba-lang/engi.git"
-         :git/sha "bd1d8260839c060872bbe68905d6f818ebd1b4b8"}
+         :git/sha "c9f30f5b8981fbc4743a2cacb2dff57a29a6b5a3"}
         io.github.kotoba-lang/torihiki
         {:git/url "https://github.com/kotoba-lang/torihiki.git"
          :git/sha "b1eba4d60d935575a72b663a2fde9dfe5676ec35"}}}

@@ -66,12 +66,35 @@
   The instrument was named as the next step two iterations before it was used.
   Both intervening fixes were correct and neither was the bug.
 
-  ## Where it stands, exactly
+  ## What is actually wrong now: the replica state is in memory
 
-  The alarm fires, the queue drains, every replica agrees, and the chain is at
-  height ONE with no certificates. Votes are not reaching quorum and the
-  reason is not yet known. Everything above is a fix for something that was
-  genuinely wrong and none of it is the thing that is wrong now.
+  Three votes, three buckets — every replica voted for a DIFFERENT height-one
+  block, so no two votes are for the same decision and quorum can never form.
+
+  The reason is that a replica is rebuilt from `genesis` on every boot, and a
+  Durable Object is evicted routinely. w2 leads height one; each time it comes
+  back it is at height zero again and proposes a fresh block, whose timestamp
+  makes it a different block from the one before. The network accumulates
+  incompatible height-one proposals forever.
+
+  In one process this cannot happen — nothing restarts. Deployed, it is fatal
+  and it is not a bug in any of the fixes below: the chain, the pacemaker
+  state and the machine have to be persisted and replayed on boot, the way
+  `torihiki-node`'s sequencer already persists its transaction log. That is
+  the next piece of work and it has not been done.
+
+  ## The deadlock at genesis
+
+  The chain sat at height one with no certificates and nothing on the wire —
+  262 alarms, 786 peer fetches, zero messages sent. The absence was the clue:
+  nothing throws when a replica has nothing to say.
+
+  `engi.pacemaker` starts with a deadline of 0 and `on-tick` read that as no
+  clock yet. A replica that never saw a certificate never got a deadline,
+  never timed out, never sent a new-view, and therefore never got a
+  certificate. In one process the first certificate forms in a millisecond and
+  that state is never occupied; over HTTP, one lost vote at genesis is a chain
+  that sits there forever. Fixed in engi, not here.
 
   ## Three bugs the deployment had that the in-process harness could not
 
@@ -102,7 +125,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "11")
+(def ^:const code-version "15")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
@@ -285,6 +308,16 @@
   ;; synchronously. The rules stay synchronous and the asynchrony stays at the
   ;; edge — the shape `engi.attest/pending-checks` exists for.
   (ingest [this msgs]
+    ;; Learn the keys FIRST. A message that arrived before its sender's key
+    ;; was known could not be verified, so it was dropped — and a dropped
+    ;; message is not retried, because the sender has no idea it was lost.
+    ;; Keys were learned at the top of a tick, so every vote that arrived in
+    ;; the gap between ticks was thrown away, which over HTTP is most of them.
+    ;; The chain reached height one and stopped with a single vote recorded.
+    (-> (.learnKeys this)
+        (.then (fn [_] (.ingest2 this msgs)))))
+
+  (ingest2 [this msgs]
     (-> (js/Promise.all
          (clj->js
           (for [m msgs
