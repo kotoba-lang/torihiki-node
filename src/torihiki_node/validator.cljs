@@ -316,7 +316,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "51")
+(def ^:const code-version "55")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
@@ -447,9 +447,22 @@
                                      :quorum (c/quorum-size (count witnesses))
                                      :hash-fn (fn [b] (block-hash (c/canonical-block b)))
                                      :chain-id chain-id
+                                     ;; No special case for our own witness.
+                                     ;; Trusting itself let the UNSIGNED copy
+                                     ;; of its own vote into the record — the
+                                     ;; one folded when the vote is produced,
+                                     ;; before this Worker has signed it — so
+                                     ;; the certificate named three witnesses
+                                     ;; and carried two signatures: fine
+                                     ;; locally, unverifiable by anyone else,
+                                     ;; and a replica that had fallen behind
+                                     ;; could never accept it. Dropping it
+                                     ;; costs nothing, because the signed copy
+                                     ;; is folded back as soon as dispatch has
+                                     ;; signed it. A certificate is only worth
+                                     ;; what a peer can check.
                                      :verify-fn (fn [w payload sig]
-                                                  (or (= w name)
-                                                      (.verifyCached this w payload sig)))
+                                                  (.verifyCached this w payload sig))
                                      :machine
                                      {:init-fn genesis
                                       :apply-fn
@@ -698,6 +711,23 @@
                       (.then (fn [s] (assoc msg :sig (b64 s))))))))))
           (.then (fn [signed]
                    (set! (.-msgs-out this) (+ (or (.-msgs-out this) 0) (count signed)))
+                   ;; Fold our OWN signed messages back in.
+                   ;;
+                   ;; The replica folds its vote when it produces it, and here
+                   ;; is where that vote acquires a signature — so what it
+                   ;; recorded was the unsigned copy, and the certificate it
+                   ;; built named three witnesses and carried two signatures.
+                   ;; It certified fine locally and could not be verified by
+                   ;; anybody else: w3 refused it below-quorum and could never
+                   ;; catch up on a chain that was otherwise committing.
+                   ;;
+                   ;; Feeding the signed copy back replaces the record with
+                   ;; one a peer can check. It is the same vote — same block,
+                   ;; same height, same view — so this is not a second vote.
+                   (doseq [m signed
+                           :when (and (:sig m) (= :vote (:type m)))]
+                     (let [[s' _] (r/on-message (.-replica this) m (js/Date.now))]
+                       (set! (.-replica this) s')))
                    (let [body (js/JSON.stringify
                                (clj->js {:msgs (mapv wire/encode signed)}))]
                      (js/Promise.all
@@ -938,6 +968,8 @@
                         :last-proposal (:last-proposal (.-replica this))
                         :last-sync-outcome (:last-sync (.-replica this))
                         :tip-certificate (r/tip-certificate (.-replica this))
+                        :dropped-votes (:dropped-votes (.-replica this))
+                        :last-dropped-vote (:last-dropped-vote (.-replica this))
                         :delivery (js->clj (or (.-delivery this) #js {}))
 
                         :last-error (or (.-last-error this) nil)
