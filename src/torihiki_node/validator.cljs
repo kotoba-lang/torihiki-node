@@ -354,7 +354,7 @@
                                           2 "==" 3 "=" "")]
                                 #js {:privateKey sk :pub (str std pad)})))))))))
 
-(def ^:const code-version "61")
+(def ^:const code-version "62")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
@@ -743,6 +743,18 @@
 
   ;; Sign each outbound vote and new-view, then post the batch to every peer.
   (dispatch [this outbox]
+    ;; Counted HERE, where the messages actually leave.
+    ;;
+    ;; `/head` has been reporting `sent-types {}` and nothing ever wrote
+    ;; `outtypes` — the field was read in one place and set in none, so the
+    ;; number said "this replica has sent nothing" while it was sending. I was
+    ;; one step from chasing that as the reason the chain stopped. An
+    ;; instrument that is never written reads exactly like a measurement.
+    (let [t (or (.-outtypes this) #js {})]
+      (doseq [{:keys [msg]} outbox]
+        (let [k (name (:type msg))]
+          (gobj/set t k (inc (or (gobj/get t k) 0)))))
+      (set! (.-outtypes this) t))
     (if (empty? outbox)
       (js/Promise.resolve nil)
       (-> (js/Promise.all
