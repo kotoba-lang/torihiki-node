@@ -354,7 +354,7 @@
                                           2 "==" 3 "=" "")]
                                 #js {:privateKey sk :pub (str std pad)})))))))))
 
-(def ^:const code-version "73")
+(def ^:const code-version "75")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -754,6 +754,10 @@
                    (.queue! this out)
                    (.persist! this))))))
 
+  ;; Persistence was turned OFF here for one deploy, to test whether writing a
+  ;; `blk:` key per block was the height-225 ceiling. It is not: the chain
+  ;; stopped at 225 with nothing being written. Restored, because restart
+  ;; recovery is not optional and the experiment answered its question.
   (persist! [this]
     ;; Everything adopted since the last write. Cheap because the chain only
     ;; grows: a block that is in storage is a block this replica already
