@@ -354,7 +354,7 @@
                                           2 "==" 3 "=" "")]
                                 #js {:privateKey sk :pub (str std pad)})))))))))
 
-(def ^:const code-version "72")
+(def ^:const code-version "73")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -403,7 +403,17 @@
   ;; does not run. The engi measurement stands; this deployment keeps four
   ;; until the three silent replicas are explained.
   ["w1" "w2" "w3" "w4"])
-(def ^:const tick-ms 400)
+(def ^:const tick-ms
+  "200, halved from 400 to ask one question: is the ceiling at height 225 a
+  property of the CHAIN or of the CLOCK?
+
+  Seven stalls at exactly 225 have survived every protocol change made, and
+  the chain is deterministic — same blocks, same hashes, every run — so a
+  state-dependent bug would land on the same height every time and so would a
+  time-dependent one, because the block rate has also been the same every
+  time. Halving the tick separates them: if the ceiling is the chain it stays
+  at 225, and if it is elapsed time it moves to roughly 450."
+  200)
 
 ;; ── the machine ─────────────────────────────────────────────────────────────
 
