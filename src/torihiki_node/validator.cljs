@@ -177,13 +177,20 @@
   Wasteful, not fatal, and worth fixing by answering the asker instead of the
   room.
 
-  The one that matters is w3\u0027s `below-quorum`. `engi.sync` requires a quorum
-  of VERIFIED signatures on the certificate inside a segment, and w3 cannot
-  verify enough of them — so the block it needs is refused by the check that
-  is supposed to let it in, and it can never catch up. That is a key
-  availability problem, which makes the trust-on-first-use key distribution
-  above not a devnet shortcut but the thing standing between this chain and
-  working.
+  The one that matters is `below-quorum`: `engi.sync` requires a quorum of
+  VERIFIED signatures on the certificate inside a segment, and a replica that
+  cannot verify enough of them is refused the block by the check that exists
+  to let it in.
+
+  One cause of that is now fixed and was not enough. A certificate remembered
+  a single view while `vote-payload` covers the view, so votes cast in
+  different views — which is what replicas that time out independently
+  produce — could not all be reconstructed, and at most one signature could
+  verify. Certificates carry a view per witness now.
+
+  `below-quorum` persists after that fix. Reading it as key availability was
+  a guess and it was wrong twice over: the keys were fine, and so is the
+  payload now. What remains is unread.
 
   ## The deployed chain was DOWN, and this is how it was found
 
@@ -277,7 +284,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "45")
+(def ^:const code-version "47")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
