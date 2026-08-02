@@ -316,7 +316,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "55")
+(def ^:const code-version "57")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
@@ -726,6 +726,26 @@
                    ;; same height, same view — so this is not a second vote.
                    (doseq [m signed
                            :when (and (:sig m) (= :vote (:type m)))]
+                     ;; Cache our own signature as verified BEFORE folding.
+                     ;;
+                     ;; Removing the self-trust from verify-fn meant the
+                     ;; replica now asks the cache about its own vote, and
+                     ;; nothing had put it there — so it dropped the signed
+                     ;; copy too, as `did-not-verify`, and with three
+                     ;; potential voters against a quorum of three a single
+                     ;; dropped vote is fatal. The chain sat at height two
+                     ;; with one or two of these on every replica.
+                     ;;
+                     ;; Recording it rather than re-verifying: this Worker
+                     ;; produced the signature a moment ago with its own key,
+                     ;; and a WebCrypto call to learn that would be asking a
+                     ;; question we already answered.
+                     (aset (.-verified this)
+                           (str (.-witness this) "|"
+                                (att/vote-payload chain-id (:view m) (:height m)
+                                                  (:block-hash m) (.-witness this))
+                                "|" (:sig m))
+                           true)
                      (let [[s' _] (r/on-message (.-replica this) m (js/Date.now))]
                        (set! (.-replica this) s')))
                    (let [body (js/JSON.stringify
