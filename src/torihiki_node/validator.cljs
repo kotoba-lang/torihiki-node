@@ -316,7 +316,45 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "60")
+(def ^:const pkcs8-ed25519-prefix
+  "The 16 bytes PKCS8 puts in front of a raw Ed25519 seed. An Ed25519 private
+  key IS its 32-byte seed; this header is what `importKey \"pkcs8\"` expects
+  around it, and it is constant, so wrapping a seed is not a key format of my
+  own invention."
+  #js [0x30 0x2e 0x02 0x01 0x00 0x30 0x05 0x06 0x03 0x2b 0x65 0x70
+       0x04 0x22 0x04 0x20])
+
+(defn- derive-keypair
+  "The keypair `witness` has on `chain`, the same one every time.
+
+  See the call site for why this is derived rather than generated. Returns a
+  promise of `#js {:privateKey k :pub b64}`."
+  [chain witness]
+  (let [seed-src (.encode (js/TextEncoder.) (str chain "|" witness "|ed25519"))]
+    (-> (js/crypto.subtle.digest "SHA-256" seed-src)
+        (.then (fn [d]
+                 (let [seed (js/Uint8Array. d)
+                       pk (js/Uint8Array. 48)]
+                   (.set pk (js/Uint8Array.from pkcs8-ed25519-prefix) 0)
+                   (.set pk seed 16)
+                   (js/crypto.subtle.importKey "pkcs8" pk #js {:name "Ed25519"}
+                                               true #js ["sign"]))))
+        (.then (fn [sk]
+                 ;; The public half is not derivable from the private key
+                 ;; through WebCrypto, so it is carried by jwk round trip:
+                 ;; export the private key as jwk, and its "x" member IS the
+                 ;; public key, base64url. Converted to the standard base64
+                 ;; every peer already exchanges.
+                 (-> (js/crypto.subtle.exportKey "jwk" sk)
+                     (.then (fn [^js j]
+                              (let [x (aget j "x")
+                                    std (-> x (.replace (js/RegExp. "-" "g") "+")
+                                            (.replace (js/RegExp. "_" "g") "/"))
+                                    pad (case (mod (.-length std) 4)
+                                          2 "==" 3 "=" "")]
+                                #js {:privateKey sk :pub (str std pad)})))))))))
+
+(def ^:const code-version "61")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
@@ -414,25 +452,39 @@
                    ;;
                    ;; A validator whose identity does not survive a restart is
                    ;; not a validator.
-                   (if stored
-                     (-> (js/crypto.subtle.importKey
-                          "pkcs8" (b64-> (aget stored "priv"))
-                          #js {:name "Ed25519"} true #js ["sign"])
-                         (.then (fn [sk]
-                                  #js {:privateKey sk :pub (aget stored "pub")})))
-                     (-> (js/crypto.subtle.generateKey #js {:name "Ed25519"} true
-                                                       #js ["sign" "verify"])
-                         (.then (fn [^js kp]
-                                  (js/Promise.all
-                                   #js [(js/crypto.subtle.exportKey "pkcs8" (.-privateKey kp))
-                                        (js/crypto.subtle.exportKey "raw" (.-publicKey kp))
-                                        (js/Promise.resolve kp)])))
-                         (.then (fn [[priv pub kp]]
-                                  (-> (.put ^js (.-storage do-state) "key"
-                                            #js {"priv" (b64 priv) "pub" (b64 pub)})
-                                      (.then (fn [_]
-                                               #js {:privateKey (.-privateKey kp)
-                                                    :pub (b64 pub)})))))))))
+                   ;; DERIVED FROM THE NAME, not generated.
+                   ;;
+                   ;; Persisting the keypair made an identity survive a
+                   ;; restart, and it does — of the SAME Durable Object.
+                   ;; Renaming the object (which every `code-version` bump
+                   ;; does, because that is how a self-rescheduling alarm is
+                   ;; made to pick up a deploy at all) gives a fresh object
+                   ;; with empty storage, so every replica came up with a new
+                   ;; key while its peers held the old one. Fourteen votes
+                   ;; dropped as `did-not-verify` at w3, two votes for its own
+                   ;; tip, one short of quorum, forever. The votes were well
+                   ;; formed and the signatures were real; they were the wrong
+                   ;; key, and trust-on-first-use keeps the first one it saw.
+                   ;;
+                   ;; Two workarounds that undo each other: versioned names
+                   ;; exist to defeat eviction, and defeat key agreement.
+                   ;;
+                   ;; Deriving the seed from chain-id and witness name breaks
+                   ;; the tie — w3 is the same w3 in every incarnation, so
+                   ;; there is nothing for first-use to get wrong. An Ed25519
+                   ;; private key IS its 32-byte seed, and PKCS8 wraps it in a
+                   ;; fixed 16-byte prefix, so this is an import rather than a
+                   ;; key-generation scheme of my own.
+                   ;;
+                   ;; It is a DEVNET answer and a worse one than what it
+                   ;; replaces in exactly one way: anybody who knows the
+                   ;; chain-id and a witness name can compute that witness's
+                   ;; private key. Real validators are given keys they
+                   ;; generate themselves and publish in genesis. This is
+                   ;; written down rather than hidden because the deployment
+                   ;; is a devnet with mintable collateral and the alternative
+                   ;; is a chain that cannot agree at all.
+                   (derive-keypair chain-id name)))
           (.then (fn [^js k]
                    (set! (.-kp this) k)
                    (set! (.-pub this) (.-pub k))
