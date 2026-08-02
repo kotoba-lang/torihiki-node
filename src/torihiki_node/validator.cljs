@@ -316,7 +316,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "57")
+(def ^:const code-version "59")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
