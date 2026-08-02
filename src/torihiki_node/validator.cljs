@@ -104,14 +104,20 @@
   less traffic, found gaps, and ticked. A watchdog that resets the timer on
   every request is a timer that never expires under load.
 
-  ## Open: two genuine transactions were refused with bad-nonce
+  ## A proposer has to verify its own transactions
 
-  A forged transaction is refused with `:bad-signature`, which is the check
-  working. But the two genuine ones submitted alongside it — a deposit at
-  nonce 1 and an order at nonce 2, sent to two different replicas — were both
-  refused `:bad-nonce`, and the account ends with no collateral. Submitting to
-  two replicas means the chain, not the client, decides the order, so nonce 2
-  arriving first would explain one refusal and not both. Unresolved.
+  Verification happens when a PROPOSAL arrives, which covers every replica
+  except the one that made it: a proposer never receives its own block, so its
+  cache had no answer for the transactions it had just put in it, and its own
+  `apply-block` refused them as `:bad-signature` while every peer accepted
+  them. Two replicas holding different balances for the same account — the
+  disagreement this whole protocol exists to prevent, arrived at by an
+  asymmetry in who checks what.
+
+  So a transaction is verified when it is SUBMITTED as well, and refused at
+  the edge if it does not hold up. That is not the authority — every replica
+  still checks inside `apply-block`, which is where it has to be — it is the
+  proposer answering the question about its own block before it asks it.
 
   ## The chain is persisted, because a Durable Object restarts
 
@@ -181,7 +187,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "23")
+(def ^:const code-version "24")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
@@ -399,6 +405,21 @@
     (-> (.learnKeys this)
         (.then (fn [_] (.ingest2 this msgs)))))
 
+  (verifyTx [this env]
+    ;; One envelope, verified and cached. Used both when a transaction is
+    ;; submitted here and when it arrives inside somebody's proposal.
+    (set! (.-txok this) (or (.-txok this) #js {}))
+    (let [payload (tauth/signing-payload chain-id (:account env)
+                                         (:nonce env) (:tx env))
+          k (str (:pubkey env) "|" payload "|" (:sig env))]
+      (-> (js/crypto.subtle.importKey "raw" (b64-> (:pubkey env))
+                                      #js {:name "Ed25519"} false #js ["verify"])
+          (.then (fn [pk] (js/crypto.subtle.verify
+                           #js {:name "Ed25519"} pk (b64-> (:sig env))
+                           (.encode (js/TextEncoder.) payload))))
+          (.then (fn [ok] (aset (.-txok this) k (true? ok)) (true? ok)))
+          (.catch (fn [_] false)))))
+
   (verifyTxs [this msgs]
     ;; Every transaction carried by every proposal in this batch. Verified
     ;; here because the seam that consumes the answer is synchronous and the
@@ -418,16 +439,8 @@
             raw (:engi.block/proposals (:block m))
             :let [env (try (decode-tx raw) (catch :default _ nil))]
             :when (and env (:pubkey env) (:sig env) (integer? (:account env)))
-            :let [payload (tauth/signing-payload chain-id (:account env)
-                                                 (:nonce env) (:tx env))
-                  k (str (:pubkey env) "|" payload "|" (:sig env))]]
-        (-> (js/crypto.subtle.importKey "raw" (b64-> (:pubkey env))
-                                        #js {:name "Ed25519"} false #js ["verify"])
-            (.then (fn [pk] (js/crypto.subtle.verify
-                             #js {:name "Ed25519"} pk (b64-> (:sig env))
-                             (.encode (js/TextEncoder.) payload))))
-            (.then (fn [ok] (aset (.-txok this) k (true? ok)) nil))
-            (.catch (fn [_] nil))))))
+            ]
+        (.verifyTx this env))))
       (catch :default e (.note! this e) (js/Promise.resolve nil))))
 
   (ingest2 [this msgs]
@@ -671,7 +684,7 @@
                                         " — chained HotStuff, engi.replica")
                         :key-distribution "trust-on-first-use — a devnet answer, not a real one"
                         :transport "HTTP between Durable Objects, not WebSockets"
-                        :tx-auth "signatures checked by torihiki.auth on every replica"
+                        :tx-auth "signatures checked by torihiki.auth on every replica; public keys are raw Ed25519, base64"
                         :refused (frequencies
                                   (:refused (:machine-state (.-replica this))))}
                        200))
@@ -704,15 +717,19 @@
                (-> (.text request)
                    (.then (fn [t]
                             (let [env (try (decode-tx t) (catch :default _ nil))]
-                              (if (and env (:pubkey env) (:sig env)
-                                       (integer? (:account env))
-                                       (integer? (:nonce env)))
-                                (do (set! (.-replica this)
-                                          (r/submit (.-replica this) t))
-                                    (json {:ok true :queued true
-                                           :account (:account env)} 200))
-                                (json {:ok false :reason "malformed-envelope"}
-                                      400))))))
+                              (if-not (and env (:pubkey env) (:sig env)
+                                           (integer? (:account env))
+                                           (integer? (:nonce env)))
+                                (json {:ok false :reason "malformed-envelope"} 400)
+                                (-> (.verifyTx this env)
+                                    (.then (fn [ok]
+                                             (if ok
+                                               (do (set! (.-replica this)
+                                                         (r/submit (.-replica this) t))
+                                                   (json {:ok true :queued true
+                                                          :account (:account env)} 200))
+                                               (json {:ok false
+                                                      :reason "bad-signature"} 401))))))))))
 
                "/account"
                (let [ex (:machine-state (.-replica this))
