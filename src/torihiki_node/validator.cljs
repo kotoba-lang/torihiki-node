@@ -82,13 +82,14 @@
   votes a second time at a height it already voted at, which is equivocation —
   committed by accident, against itself.
 
-  **It is still three votes across three block hashes at height one.** So the
-  persistence is in and it is not sufficient, or it is not taking effect, and
-  which of those is true is not yet known. The next thing to look at is w2 —
-  the leader for height one — through `wrangler tail`, specifically whether it
-  proposes more than once and whether `persist!` has completed before it does.
-  Recording this as fixed because the persistence is in would be the same
-  mistake as the three scheduling fixes for a clock that was firing.
+  Persistence alone was not enough and could not have been. A block carried
+  the wall clock in its header, so a leader that restarted proposed a
+  different block for the same height, and the write only had to lose one race
+  against eviction for the split to happen again. engi derives a block time
+  from its parent now, which makes proposing a pure function of the chain — a
+  restarted leader re-proposes the byte-identical block and nothing has to win
+  a race. Persistence still earns its keep: it is what stops a restart from
+  voting twice at a height it already voted at.
 
   ## The deadlock at genesis
 
@@ -132,7 +133,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "16")
+(def ^:const code-version "17")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
