@@ -354,7 +354,7 @@
                                           2 "==" 3 "=" "")]
                                 #js {:privateKey sk :pub (str std pad)})))))))))
 
-(def ^:const code-version "64")
+(def ^:const code-version "66")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
@@ -372,7 +372,32 @@
   [w]
   (str w "-v" code-version))
 (def ^:const market-id 1)
-(def witnesses ["w1" "w2" "w3" "w4"])
+(def witnesses
+  "Seven, not four.
+  
+  A Durable Object is evicted constantly, and four witnesses with a quorum of
+  three have ZERO margin under that: evict one and exactly quorum remains, so
+  a single lost message costs a round. Measured in engi's harness, sixty
+  seconds, evicting one replica per second against not evicting at all:
+
+    N=4   377 -> 168 blocks   2.24x penalty
+    N=7   260 -> 153 blocks   1.70x
+
+  Seven leaves six against a quorum of five and has one to spare. It buys that
+  with throughput — seven replicas are more messages per round, 260 against
+  377 with nothing being evicted — and the deployment is the case where things
+  ARE being evicted, which is where the trade pays.
+
+  Keys are derived from the witness name, so adding three costs nothing but
+  this line; there is no key to distribute for w5, w6 or w7."
+  ;; REVERTED to four. Seven was deployed and the chain stopped at height two
+  ;; with four votes against a quorum of five — three of the seven never voted
+  ;; at all, where four witnesses had reached 139 in half the time. Whatever
+  ;; the harness is modelling about churn, it is not modelling what these seven
+  ;; Durable Objects do, and the measured penalty is not worth a chain that
+  ;; does not run. The engi measurement stands; this deployment keeps four
+  ;; until the three silent replicas are explained.
+  ["w1" "w2" "w3" "w4"])
 (def ^:const tick-ms 400)
 
 ;; ── the machine ─────────────────────────────────────────────────────────────
