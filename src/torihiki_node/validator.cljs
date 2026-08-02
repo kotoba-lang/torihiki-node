@@ -119,6 +119,30 @@
   still checks inside `apply-block`, which is where it has to be — it is the
   proposer answering the question about its own block before it asks it.
 
+  ## The deployed chain is DOWN as of this commit
+
+  It ran at version 27, height a hundred and climbing. It does not run now,
+  pinned to the same engi commit, on freshly created objects. I do not know
+  why, and the reason I do not know is that I changed five things between
+  observations and then changed five more trying to get back — which is the
+  mistake this file has already recorded twice and is the one that cost the
+  most.
+
+  What is known and worth keeping is below: a dead leader holds its turn
+  forever, and a wiped replica does not catch up. Both were found by breaking
+  the chain deliberately, and both are real regardless of what is running.
+
+  ## /reset, so catching up can actually be tested
+
+  `engi.sync` decides what a replica that has been away may believe from a
+  peer, and until now nothing had made a deployed replica go away. Every
+  untested path in this system has turned out to be a broken one, so there is
+  a route that wipes one validator back to genesis and lets it try to rejoin.
+
+  It is unauthenticated, which is fine for a devnet and would not be anywhere
+  else: it destroys one replica\u0027s state, and with a quorum of three out of
+  four, two calls stop the chain. Named here rather than left to be found.
+
   ## The chain is persisted, because a Durable Object restarts
 
   A replica rebuilt from genesis on every boot proposes a fresh block for a
@@ -187,7 +211,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "26")
+(def ^:const code-version "31")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
@@ -759,6 +783,18 @@
                (let [ex (:machine-state (.-replica this))
                      id (js/parseInt (or (.get (.-searchParams url) "id") "0"))]
                  (json (api/account-state ex id) 200))
+
+               "/reset"
+               ;; Wipe this replica back to genesis. It should rejoin by
+               ;; asking its peers for what it missed — which is what
+               ;; engi.sync is for and what nothing had exercised.
+               (-> (.deleteAll ^js (.-storage do-state))
+                   (.then (fn [_]
+                            (set! (.-ready this) false)
+                            (set! (.-persisted this) 0)
+                            (.boot this w)))
+                   (.then (fn [_] (json {:ok true :witness w
+                                         :height (r/height (.-replica this))} 200))))
 
                "/market"
                (json (api/market-info (:machine-state (.-replica this)) market-id) 200)
