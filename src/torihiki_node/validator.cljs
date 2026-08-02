@@ -87,8 +87,8 @@
   which of those is true is not yet known. The next thing to look at is w2 —
   the leader for height one — through `wrangler tail`, specifically whether it
   proposes more than once and whether `persist!` has completed before it does.
-  Writing "persisted, therefore fixed" would be the same mistake as the three
-  scheduling fixes for a clock that was firing.
+  Recording this as fixed because the persistence is in would be the same
+  mistake as the three scheduling fixes for a clock that was firing.
 
   ## The deadlock at genesis
 
