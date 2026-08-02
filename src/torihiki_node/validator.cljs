@@ -134,11 +134,24 @@
     matching fix, re-sending a vote when the same block arrives twice, could
     never fire because nothing sent the block twice.
 
-  What is left, measured: the chain runs to a couple of hundred blocks with
-  all four replicas in lockstep on the same state root, and then stops. At
-  the stop every replica holds the same height and the same root and nobody
-  proposes the next block. That is a different failure from the ones above —
-  agreement is not the problem — and it is not diagnosed.
+  What is left, and it now has a name. The instrument reports, at the stall:
+
+    w1 tip 2  votes-for-tip 2  view 16
+    w2 tip 2  votes-for-tip 2  view 16
+    w3 tip 1  votes-for-tip 0  view 21
+    w4 tip 2  votes-for-tip 2  view 51
+
+  Three replicas hold the height-2 block with two votes for it — one short of
+  the quorum of three. The fourth is a block behind and will not vote for it,
+  because its lock came from a certificate carrying a view the block does not
+  beat. And the views are 16, 16, 21 and 51: the replicas are nowhere near
+  each other.
+
+  So the stall is view divergence, and the pacemaker\u0027s safety rule is doing
+  exactly what it should with locks that were formed in views nobody shares.
+  The dependency analysis had this as a suspected edge — that the stall and
+  the fault-tolerance gap are the same problem — and the reading is what
+  confirms it. One fix, not two: view synchronisation that converges.
 
   ## The deployed chain was DOWN, and this is how it was found
 
@@ -232,7 +245,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "38")
+(def ^:const code-version "41")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
@@ -355,6 +368,8 @@
                    (set! (.-witness this) name)
                    (set! (.-keys this) #js {})
                    (set! (.-verified this) #js {})
+                   (set! (.-delivery this) #js {})
+                   (set! (.-why this) #js {})
                    (set! (.-replica this)
                          (r/replica {:witness name
                                      :witnesses witnesses
@@ -616,12 +631,25 @@
                                (clj->js {:msgs (mapv wire/encode signed)}))]
                      (js/Promise.all
                       (clj->js
+                       ;; Delivery is recorded per peer. A message that was
+                       ;; sent and a message that arrived are different
+                       ;; facts, and every stall so far has been one of them
+                       ;; being mistaken for the other.
                        (for [w witnesses :when (not= w (.-witness this))]
                          (-> (.fetch (.get ^js (.-VALIDATOR env)
                                            (.idFromName ^js (.-VALIDATOR env) (do-name w)))
                                      (js/Request. (str "https://v/msg?w=" w)
                                                   #js {:method "POST" :body body}))
-                             (.catch (fn [_] nil)))))))))
+                             (.then (fn [^js r]
+                                      (let [k (str w (if (.-ok r) ":ok" ":err"))]
+                                        (aset (.-delivery this) k
+                                              (inc (or (aget (.-delivery this) k) 0))))
+                                      nil))
+                             (.catch (fn [_]
+                                       (let [k (str w ":throw")]
+                                         (aset (.-delivery this) k
+                                               (inc (or (aget (.-delivery this) k) 0))))
+                                       nil)))))))))
           (.then (fn [_] nil)))))
 
   (note! [this e]
@@ -698,6 +726,35 @@
       (let [[s' out] (r/on-tick (.-replica this) now)]
         (set! (.-replica this) s')
         (.queue! this out))
+      ;; Why this replica did NOT propose.
+      ;;
+      ;; Every counter here says what happened. A stall is the absence of
+      ;; something happening, and the absence has a reason that nothing was
+      ;; recording — so each stall so far has been diagnosed by adding one
+      ;; more counter and waiting. This records the reason directly: the
+      ;; three conditions `propose` checks, and which of them said no.
+      (let [st (.-replica this)
+            tip (r/tip st)
+            th (:engi.block/height tip)
+            next-h (inc th)
+            certified? (some? (get (:qcs st) (block-hash (c/canonical-block tip))))
+            leader (nth witnesses (mod next-h (count witnesses)))
+            mine? (= leader (.-witness this))]
+        (set! (.-why this)
+              #js {"tip-height" th
+                   "next-height" next-h
+                   "tip-certified" certified?
+                   "leader-of-next" leader
+                   "my-turn" mine?
+                   "would-propose" (and certified? mine?)
+                   "blocked-by" (cond (not certified?) "no certificate for the tip"
+                                      (not mine?) (str "not my turn, " leader " leads")
+                                      :else "nothing")
+                   "view" (:view (:pm st))
+                   "deadline-in-ms" (- (:deadline (:pm st) 0) now)
+                   "votes-for-tip" (count (get (:votes st)
+                                               (block-hash (c/canonical-block tip)) {}))}))
+
       ;; Re-broadcast the tip while it has no certificate.
       ;;
       ;; Retransmission is a transport concern and this is the transport. The
@@ -753,6 +810,14 @@
                    (.setAlarm ^js (.-storage do-state) (+ (js/Date.now) tick-ms)))))
         (.catch (fn [_] nil))))
 
+  (alarmPending [this]
+    ;; The clock itself, not its effects. Three stalls were diagnosed as
+    ;; "the alarm is not firing" from the absence of its effects, and one of
+    ;; those times the alarm was firing 153 times a minute.
+    (-> (.getAlarm ^js (.-storage do-state))
+        (.then (fn [a] (if a (- a (js/Date.now)) nil)))
+        (.catch (fn [_] :unknown))))
+
   (handle [this ^js request]
     (let [url (js/URL. (.-url request))
           path (.-pathname url)
@@ -798,6 +863,9 @@
                         :seen-types (js->clj (or (.-types this) #js {}))
                         :sent-types (js->clj (or (.-outtypes this) #js {}))
                         :last-sync-request (or (.-lastsync this) nil)
+                        :why-not-proposing (js->clj (or (.-why this) #js {}))
+                        :delivery (js->clj (or (.-delivery this) #js {}))
+
                         :last-error (or (.-last-error this) nil)
                         :consensus (str (c/quorum-size (count witnesses))
                                         " of " (count witnesses)
@@ -867,6 +935,14 @@
                             (.boot this w)))
                    (.then (fn [_] (json {:ok true :witness w
                                          :height (r/height (.-replica this))} 200))))
+
+               "/clock"
+               ;; The clock itself, not its effects. Three stalls were called
+               ;; "the alarm is not firing" from the absence of its effects,
+               ;; and one of those times it was firing 153 times a minute.
+               (-> (.alarmPending this)
+                   (.then (fn [in-ms] (json {:witness (.-witness this)
+                                             :alarm-in-ms in-ms} 200))))
 
                "/market"
                (json (api/market-info (:machine-state (.-replica this)) market-id) 200)
