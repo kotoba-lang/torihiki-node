@@ -354,23 +354,28 @@
                                           2 "==" 3 "=" "")]
                                 #js {:privateKey sk :pub (str std pad)})))))))))
 
-(def ^:const code-version "71")
+(def ^:const code-version "72")
 
 (defn- do-name
-  "The Durable Object id for a witness, versioned.
+  "The Durable Object id for a witness. NO VERSION IN IT.
 
-  A Durable Object keeps running the code it started with until it is evicted,
-  and a DO with a self-rescheduling 400ms alarm NEVER goes idle — so the very
-  mechanism that makes it a running chain makes it impossible to update. Three
-  minutes of complete silence did not evict it; polling to check whether the
-  new version was live was itself keeping the old version alive.
+  It used to carry `code-version`, on the belief that a DO with a
+  self-rescheduling 400ms alarm never idles and so never picks up a deploy.
+  That belief was wrong, and `wrangler tail` shows it: alarm events on objects
+  created many versions ago carry the CURRENT scriptVersion. Cloudflare runs
+  every Durable Object on the latest deployed script.
 
-  Putting the version in the name means a deploy creates new objects. The
-  outer fetch handler always runs the new code, so it addresses the new ones,
-  and the old ones talk among themselves until they idle out. State is lost on
-  upgrade, which is honest here because it was only ever in memory."
+  So the versioned name bought nothing and cost the chain. A bump ABANDONS the
+  previous objects — which keep ticking, keep believing their persisted
+  witness name, and, since keys are derived from that name, keep signing votes
+  everybody accepts. Fourteen generations in one session gave several objects
+  each claiming to be w1, voting at different heights, and the deployment
+  reported `equivocators [w4]` with no Byzantine node deployed.
+
+  One object per witness, forever. See `tickNow` for what stops the ones
+  already abandoned."
   [w]
-  (str w "-v" code-version))
+  w)
 (def ^:const market-id 1)
 (def witnesses
   "Seven, not four.
@@ -889,7 +894,23 @@
         ;; flight is a tick that never happens — the loop stops with nothing
         ;; to read, which is what it did.
         (.then (fn [_]
-                 (.setAlarm ^js (.-storage do-state) (+ (js/Date.now) tick-ms))))
+                 ;; Stop the clock in an object nobody is talking to.
+                 ;;
+                 ;; Abandoned generations cannot be told anything — nothing
+                 ;; routes to their ids any more — so they have to notice for
+                 ;; themselves. A live replica receives `/msg` from its peers
+                 ;; several times a second; an abandoned one receives nothing,
+                 ;; ever. Not rescheduling is the only way one of them ends,
+                 ;; because a self-rescheduling alarm is otherwise immortal.
+                 ;;
+                 ;; Generous window: a chain that is merely stalled still has
+                 ;; peers posting votes and new-views every tick, so silence
+                 ;; for two minutes means nobody is addressing this object at
+                 ;; all. A canonical replica that somehow does go quiet is
+                 ;; woken by the next request, which is how it started.
+                 (let [q (or (.-lastInbound this) 0)]
+                   (when (or (zero? q) (< (- (js/Date.now) q) 120000))
+                     (.setAlarm ^js (.-storage do-state) (+ (js/Date.now) tick-ms))))))
         ;; An alarm handler that rejects is retried with backoff and then
         ;; dropped, and a dropped alarm is a chain that stops for good. It
         ;; must not reject, ever.
@@ -904,6 +925,10 @@
         (.catch (fn [e] (.note! this e) nil))))
 
   (fetch [this ^js request]
+    ;; Somebody is addressing this object. `tickNow` uses it to decide whether
+    ;; to keep its clock running: an abandoned generation is addressed by
+    ;; nobody, ever, and that is the only thing that distinguishes it.
+    (set! (.-lastInbound this) (js/Date.now))
     (-> (.handle this request)
         (.catch (fn [e]
                   ;; An unhandled throw inside a Durable Object surfaces as an
