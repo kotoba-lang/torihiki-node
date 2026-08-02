@@ -134,15 +134,11 @@
     matching fix, re-sending a vote when the same block arrives twice, could
     never fire because nothing sent the block twice.
 
-  What is left, measured rather than guessed: every replica now sees
-  proposals, votes and new-views, all four hold the same tip at height one,
-  and one of them has a certificate for it. The chain does not commit.
-
-  The counters say what to look at next. Every replica is receiving hundreds
-  of `sync-request` messages, which `handle-proposal` only sends when a
-  proposal arrives whose PARENT it does not have — and all four hold the same
-  two blocks, so somebody is proposing on a parent nobody else has. That is
-  one question with a short answer, and it is the next one.
+  What is left, measured: the chain runs to a couple of hundred blocks with
+  all four replicas in lockstep on the same state root, and then stops. At
+  the stop every replica holds the same height and the same root and nobody
+  proposes the next block. That is a different failure from the ones above —
+  agreement is not the problem — and it is not diagnosed.
 
   ## The deployed chain was DOWN, and this is how it was found
 
@@ -236,7 +232,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "36")
+(def ^:const code-version "38")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
@@ -800,6 +796,8 @@
                         :tip-hash (block-hash (c/canonical-block
                                                (r/tip (.-replica this))))
                         :seen-types (js->clj (or (.-types this) #js {}))
+                        :sent-types (js->clj (or (.-outtypes this) #js {}))
+                        :last-sync-request (or (.-lastsync this) nil)
                         :last-error (or (.-last-error this) nil)
                         :consensus (str (c/quorum-size (count witnesses))
                                         " of " (count witnesses)
