@@ -147,11 +147,23 @@
   beat. And the views are 16, 16, 21 and 51: the replicas are nowhere near
   each other.
 
-  So the stall is view divergence, and the pacemaker\u0027s safety rule is doing
-  exactly what it should with locks that were formed in views nobody shares.
-  The dependency analysis had this as a suspected edge — that the stall and
-  the fault-tolerance gap are the same problem — and the reading is what
-  confirms it. One fix, not two: view synchronisation that converges.
+  Views converge now — 246, 246, 246, 247 where they were 16, 16, 21 and 51 —
+  and the chain still stops. The reading after the fix:
+
+    w1 tip 2  votes-for-tip 2  view 246
+    w2 tip 2  votes-for-tip 2  view 246
+    w3 tip 1  votes-for-tip 2  view 246
+    w4 tip 2  votes-for-tip 2  view 247
+
+  Every replica is one vote short of the quorum of three, and the votes are
+  split across two heights: two for the block at height one, two for the block
+  at height two. w3 will not move to height two, so its vote can never join
+  the three that would certify it, and the three that could certify it are
+  each holding two.
+
+  Convergence was necessary and is not sufficient. What is left is why w3 does
+  not adopt a block whose parent it holds — it receives thousands of proposals
+  for it — and that is the next reading, not the next guess.
 
   ## The deployed chain was DOWN, and this is how it was found
 
@@ -245,7 +257,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "41")
+(def ^:const code-version "42")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
