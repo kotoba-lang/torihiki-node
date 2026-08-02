@@ -187,7 +187,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "24")
+(def ^:const code-version "26")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
@@ -334,6 +334,28 @@
                                             (true? (aget (or (.-txok this) #js {})
                                                          (str pk "|" payload "|" sig))))
                                           :derive-account addr/derive})
+                                            ;; The tape lives INSIDE the
+                                            ;; machine, so every replica
+                                            ;; derives the same one from the
+                                            ;; same blocks. The sequencer
+                                            ;; keeps its tape beside the
+                                            ;; engine, which is fine when
+                                            ;; there is one writer and would
+                                            ;; be four different tapes here.
+                                            (as-> ex'
+                                                  (update ex' :tape
+                                                          (fn [t]
+                                                            (into []
+                                                                  (take-last
+                                                                   200
+                                                                   (concat
+                                                                    (or t [])
+                                                                    (map (fn [f]
+                                                                           {:level (:level f)
+                                                                            :qty (:qty f)
+                                                                            :side (:taker-side f)
+                                                                            :h (:engi.block/height block)})
+                                                                         (bk/fills (get-in ex' [:books market-id])))))))))
                                             ;; apply-block resets :rejected
                                             ;; every block, so a fold ends
                                             ;; holding only the last one's —
@@ -653,6 +675,8 @@
                         :code-version code-version
                         :chain-id chain-id
                         :height (r/height s)
+                        :resting (bk/resting-count
+                                  (get-in (:machine-state s) [:books market-id]))
                         :committed (r/committed-height s)
                         :view (:view (:pm s))
                         :state-root (r/state-root s)
@@ -736,6 +760,15 @@
                      id (js/parseInt (or (.get (.-searchParams url) "id") "0"))]
                  (json (api/account-state ex id) 200))
 
+               "/market"
+               (json (api/market-info (:machine-state (.-replica this)) market-id) 200)
+
+               "/trades"
+               (let [ex (:machine-state (.-replica this))
+                     n (js/parseInt (or (.get (.-searchParams url) "n") "20"))]
+                 (json {:market market-id
+                        :trades (vec (reverse (take-last n (:tape ex []))))} 200))
+
                "/book"
                (json (let [ex (:machine-state (.-replica this))]
                        {:market market-id
@@ -769,9 +802,19 @@
 (def handler
   #js {:fetch
        (fn [^js request ^js env _ctx]
+         (if (= "OPTIONS" (.-method request))
+           ;; A browser will not POST across an origin without asking first,
+           ;; and an unanswered preflight is a page whose buttons fail with a
+           ;; network error rather than a rejection. The sequencer answered
+           ;; this from the day it had a terminal; the validator did not have
+           ;; one until now.
+           (js/Response. nil
+                         #js {:headers #js {"access-control-allow-origin" "*"
+                                            "access-control-allow-methods" "GET,POST,OPTIONS"
+                                            "access-control-allow-headers" "content-type"}})
          (let [url (js/URL. (.-url request))
                w (or (.get (.-searchParams url) "w") "w1")
                ^js ns* (.-VALIDATOR env)]
            (if-not (some #{w} witnesses)
              (json {:ok false :reason "unknown-witness"} 404)
-             (.fetch (.get ns* (.idFromName ns* (do-name w))) request))))})
+             (.fetch (.get ns* (.idFromName ns* (do-name w))) request)))))})
