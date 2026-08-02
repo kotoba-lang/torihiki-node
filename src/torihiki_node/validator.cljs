@@ -188,9 +188,25 @@
   produce — could not all be reconstructed, and at most one signature could
   verify. Certificates carry a view per witness now.
 
-  `below-quorum` persists after that fix. Reading it as key availability was
-  a guess and it was wrong twice over: the keys were fine, and so is the
-  payload now. What remains is unread.
+  `below-quorum` persisted after that fix, and the next instrument read it
+  properly rather than guessing a third time:
+
+    witnesses  [w1 w2 w4]      three, so the threshold is met
+    sigs       [w1 w2 w4]      all present
+    views      null            <- the certificate carries none
+    qc-view    2
+    attest     bad-signature
+    per-witness {w1 false, w2 false, w4 false}
+
+  All three signatures fail, and the certificate has no per-witness views, so
+  every payload is rebuilt from qc-view 2 while the votes were signed at the
+  views their replicas had reached. The encode/decode path preserves views —
+  checked directly, built with views 5, 6 and 7 and decoded with the same — so
+  this certificate was BUILT without them.
+
+  Which build path drops them is the next question, and it is a small one:
+  fold-vote certifies from stored votes that each carry a view, and every
+  other place a certificate enters :qcs takes it from the wire.
 
   ## The deployed chain was DOWN, and this is how it was found
 
@@ -284,7 +300,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "47")
+(def ^:const code-version "49")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
