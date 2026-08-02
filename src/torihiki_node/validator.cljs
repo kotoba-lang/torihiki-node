@@ -204,9 +204,25 @@
   checked directly, built with views 5, 6 and 7 and decoded with the same — so
   this certificate was BUILT without them.
 
-  Which build path drops them is the next question, and it is a small one:
-  fold-vote certifies from stored votes that each carry a view, and every
-  other place a certificate enters :qcs takes it from the wire.
+  Certificates are tagged with the path that built them now, and the reading
+  says something simpler and worse than a shape problem:
+
+    w1 tip 2  tip-certificate null
+    w2 tip 2  tip-certificate null
+    w3 tip 1  tip-certificate null
+    w4 tip 2  tip-certificate null
+
+  NOBODY holds a certificate for their own tip. Not one of the four. So the
+  certificate that keeps being refused as `below-quorum` is not the one
+  blocking them — it is a certificate for height 1 arriving inside a
+  sync-response, carrying qc-view 2 and no per-witness views, which every
+  replica was already past.
+
+  What blocks all four is that no block any of them adopted has ever been
+  certified. Votes exist — the earlier readings counted two per tip — and a
+  quorum of three is never assembled, so `:qcs` stays empty and `propose`
+  cannot fire for anybody. The chain is not deadlocked on a bad certificate.
+  It has never made one.
 
   ## The deployed chain was DOWN, and this is how it was found
 
@@ -300,7 +316,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "49")
+(def ^:const code-version "51")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
@@ -921,6 +937,7 @@
                         :why-not-proposing (js->clj (or (.-why this) #js {}))
                         :last-proposal (:last-proposal (.-replica this))
                         :last-sync-outcome (:last-sync (.-replica this))
+                        :tip-certificate (r/tip-certificate (.-replica this))
                         :delivery (js->clj (or (.-delivery this) #js {}))
 
                         :last-error (or (.-last-error this) nil)
