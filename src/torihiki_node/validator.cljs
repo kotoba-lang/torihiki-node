@@ -354,7 +354,7 @@
                                           2 "==" 3 "=" "")]
                                 #js {:privateKey sk :pub (str std pad)})))))))))
 
-(def ^:const code-version "62")
+(def ^:const code-version "63")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
@@ -1046,6 +1046,18 @@
                         :tip-hash (block-hash (c/canonical-block
                                                (r/tip (.-replica this))))
                         :seen-types (js->clj (or (.-types this) #js {}))
+                        ;; The mempool, and what has come out of it.
+                        ;;
+                        ;; `/tx` answers `queued true` and nothing observable
+                        ;; follows; neither number existed, so "queued" was
+                        ;; the last thing anyone could see about a
+                        ;; transaction. `pending` says whether it is still
+                        ;; waiting to be proposed and `txs-in-chain` whether
+                        ;; any transaction has ever reached a block — one
+                        ;; question each, and they fail in different places.
+                        :pending (count (:pending (.-replica this)))
+                        :txs-in-chain (reduce + 0 (map #(count (:engi.block/proposals %))
+                                                       (:chain (.-replica this))))
                         :sent-types (js->clj (or (.-outtypes this) #js {}))
                         :last-sync-request (or (.-lastsync this) nil)
                         :why-not-proposing (js->clj (or (.-why this) #js {}))
