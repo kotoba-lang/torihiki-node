@@ -134,9 +134,15 @@
     matching fix, re-sending a vote when the same block arrives twice, could
     never fire because nothing sent the block twice.
 
-  What is left: w3 and w4 receive new-views and nothing else. w1 and w2 see
-  proposals and votes. Delivery is asymmetric and nothing in `dispatch`
-  distinguishes them, which is the next thing to measure rather than guess at.
+  What is left, measured rather than guessed: every replica now sees
+  proposals, votes and new-views, all four hold the same tip at height one,
+  and one of them has a certificate for it. The chain does not commit.
+
+  The counters say what to look at next. Every replica is receiving hundreds
+  of `sync-request` messages, which `handle-proposal` only sends when a
+  proposal arrives whose PARENT it does not have — and all four hold the same
+  two blocks, so somebody is proposing on a parent nobody else has. That is
+  one question with a short answer, and it is the next one.
 
   ## The deployed chain was DOWN, and this is how it was found
 
@@ -230,7 +236,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "35")
+(def ^:const code-version "36")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
@@ -710,8 +716,20 @@
       ;; second time.
       (let [st (.-replica this)
             tip (r/tip st)
-            h (:engi.block/height tip)]
-        (when (and (pos? h) (nil? (get (:qcs st) (block-hash (c/canonical-block tip)))))
+            h (:engi.block/height tip)
+            n (inc (or (.-rounds this) 0))]
+        (set! (.-rounds this) n)
+        ;; Only the PROPOSER, and only every eighth round.
+        ;;
+        ;; Re-broadcasting from everybody on every tick was twenty thousand
+        ;; proposals and eight thousand sync-requests per replica in a few
+        ;; minutes — a storm that drowned the votes it was supposed to
+        ;; rescue. A retransmission that costs more than the message it
+        ;; replaces is not a retransmission.
+        (when (and (pos? h)
+                   (= (:engi.block/proposer tip) (.-witness this))
+                   (zero? (mod n 8))
+                   (nil? (get (:qcs st) (block-hash (c/canonical-block tip)))))
           (.queue! this [{:to :all :msg {:type :proposal :block tip}}])))
       (.flush! this)))
 
