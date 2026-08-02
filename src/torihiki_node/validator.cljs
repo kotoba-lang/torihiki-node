@@ -119,7 +119,26 @@
   still checks inside `apply-block`, which is where it has to be — it is the
   proposer answering the question about its own block before it asks it.
 
-  ## The deployed chain is DOWN as of this commit
+  ## Where it stands: further, and still not committing
+
+  Bisecting one change at a time got the chain from height zero to height one
+  with a certificate, which is three fixes further than it was:
+
+  - a non-leader at height zero never reached `on-tick`, so its clock never
+    started and it never sent a new-view. It was `start` OR `on-tick`; it has
+    to be `start` AND `on-tick`.
+  - the bootstrap block was proposed exactly once. Over HTTP to peers that may
+    not exist yet, once is a message that can be lost, and then nothing.
+  - the tip was never re-broadcast while it lacked a certificate, so the
+    receivers that missed it had nothing to vote on again — and engi\u0027s
+    matching fix, re-sending a vote when the same block arrives twice, could
+    never fire because nothing sent the block twice.
+
+  What is left: w3 and w4 receive new-views and nothing else. w1 and w2 see
+  proposals and votes. Delivery is asymmetric and nothing in `dispatch`
+  distinguishes them, which is the next thing to measure rather than guess at.
+
+  ## The deployed chain was DOWN, and this is how it was found
 
   It ran at version 27, height a hundred and climbing. It does not run now,
   pinned to the same engi commit, on freshly created objects. I do not know
@@ -211,7 +230,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "31")
+(def ^:const code-version "35")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
@@ -426,10 +445,22 @@
   (learnKeys [this]
     (js/Promise.all
      (clj->js
-      ;; Re-asked every tick rather than once. A cached key that is wrong is
-      ;; indistinguishable from a peer that is silent, and the cost of asking
-      ;; is one request against a stall nobody can see.
-      (for [w witnesses :when (not= w (.-witness this))]
+      ;; Only for keys we do not have.
+      ;;
+      ;; This asked for all three every time, and `ingest` calls it on every
+      ;; inbound batch — so each arriving message cost three outbound HTTP
+      ;; round trips, from every replica, to every other. The replicas
+      ;; receiving the most traffic spent all their time on it and their own
+      ;; alarms never got a turn: three of four sat at height zero, view zero,
+      ;; having sent nothing at all while receiving four hundred messages. The
+      ;; fourth was the leader, got the least traffic, and was the only one
+      ;; ticking.
+      ;;
+      ;; A key that is wrong is still indistinguishable from a peer that is
+      ;; silent, and re-asking is still the answer — but from the tick, on a
+      ;; schedule, not from the path that runs once per message.
+      (for [w witnesses :when (and (not= w (.-witness this))
+                                   (not (aget (.-keys this) w)))]
         (-> (.fetch (.get ^js (.-VALIDATOR env)
                           (.idFromName ^js (.-VALIDATOR env) (do-name w)))
                     (str "https://v/head?w=" w))
@@ -608,16 +639,7 @@
                    ;; refuses.
                    (js/Promise.reject (js/Error. "alarm before any request")))))
         (.then (fn [_] (.learnKeys this)))
-        (.then (fn [_]
-                 (if (zero? (r/height (.-replica this)))
-                   (let [[s' out] (r/start (.-replica this) (js/Date.now))]
-                     (set! (.-replica this) s')
-                     (.queue! this out)
-                     (.flush! this))
-                   (let [[s' out] (r/on-tick (.-replica this) (js/Date.now))]
-                     (set! (.-replica this) s')
-                     (.queue! this out)
-                     (.flush! this)))))
+        (.then (fn [_] (.round this)))
         (.then (fn [_] (.persist! this)))
         ;; The alarm must reschedule even when the tick threw, or one failure
         ;; stops the replica forever and it looks like a network problem.
@@ -638,16 +660,7 @@
   ;; a stalled replica gives you nothing else to pull on.
   (step [this]
     (-> (.learnKeys this)
-        (.then (fn [_]
-                 (if (zero? (r/height (.-replica this)))
-                   (let [[s' out] (r/start (.-replica this) (js/Date.now))]
-                     (set! (.-replica this) s')
-                     (.queue! this out)
-                     (.flush! this))
-                   (let [[s' out] (r/on-tick (.-replica this) (js/Date.now))]
-                     (set! (.-replica this) s')
-                     (.queue! this out)
-                     (.flush! this)))))
+        (.then (fn [_] (.round this)))
         (.catch (fn [e] (.note! this e) nil))))
 
   (fetch [this ^js request]
@@ -658,6 +671,49 @@
                   ;; difference between a bug and a mystery.
                   (json {:ok false :error (str (or (.-message e) e))
                          :witness (.-witness this)} 500)))))
+
+  (round [this]
+    ;; One round: bootstrap if there is nothing yet, and ALWAYS tick.
+    ;;
+    ;; It used to be one or the other, and at height zero that meant a
+    ;; non-leader never reached on-tick — so its clock never started, it never
+    ;; timed out, and it never sent a new-view. Three of four sat at height
+    ;; zero, view zero, having sent nothing at all while receiving hundreds of
+    ;; messages, and a manual step produced nothing either, which is what
+    ;; finally said it was the branch and not the alarm.
+    ;;
+    ;; And the leader proposed the bootstrap block exactly once. Over HTTP to
+    ;; peers that may not have been created yet, once is a message that can
+    ;; simply be lost — and then the chain never starts, because the leader is
+    ;; at height one needing a certificate it will never be given.
+    ;; Re-proposing is safe: a block is a pure function of its parent now, so
+    ;; it is the same block, byte for byte, every time.
+    (let [now (js/Date.now)]
+      (when (zero? (r/height (.-replica this)))
+        (let [[s' out] (r/start (.-replica this) now)]
+          (set! (.-replica this) s')
+          (.queue! this out)))
+      (let [[s' out] (r/on-tick (.-replica this) now)]
+        (set! (.-replica this) s')
+        (.queue! this out))
+      ;; Re-broadcast the tip while it has no certificate.
+      ;;
+      ;; Retransmission is a transport concern and this is the transport. The
+      ;; leader proposes once; if that message is lost, the receivers never
+      ;; vote, the height never certifies, and the leader cannot propose again
+      ;; because proposing needs the certificate it is waiting for. The chain
+      ;; sits at that height forever with every replica holding the block and
+      ;; nobody able to say so again.
+      ;;
+      ;; engi re-sends a vote when it sees the same block twice, which is the
+      ;; other half and useless on its own: nothing was sending the block a
+      ;; second time.
+      (let [st (.-replica this)
+            tip (r/tip st)
+            h (:engi.block/height tip)]
+        (when (and (pos? h) (nil? (get (:qcs st) (block-hash (c/canonical-block tip)))))
+          (.queue! this [{:to :all :msg {:type :proposal :block tip}}])))
+      (.flush! this)))
 
   (rearm [this]
     ;; If no alarm is pending, set one. A loop that can be lost needs
