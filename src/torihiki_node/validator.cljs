@@ -66,22 +66,29 @@
   The instrument was named as the next step two iterations before it was used.
   Both intervening fixes were correct and neither was the bug.
 
-  ## What is actually wrong now: the replica state is in memory
+  ## The chain is persisted, because a Durable Object restarts
 
-  Three votes, three buckets — every replica voted for a DIFFERENT height-one
-  block, so no two votes are for the same decision and quorum can never form.
+  A replica rebuilt from genesis on every boot proposes a fresh block for a
+  height it already proposed, and a Durable Object is evicted routinely. The
+  network accumulated incompatible height-one proposals until no two votes
+  were for the same decision — three votes, three block hashes, one height.
 
-  The reason is that a replica is rebuilt from `genesis` on every boot, and a
-  Durable Object is evicted routinely. w2 leads height one; each time it comes
-  back it is at height zero again and proposes a fresh block, whose timestamp
-  makes it a different block from the one before. The network accumulates
-  incompatible height-one proposals forever.
+  So every adopted block is written to storage and replayed through
+  `engi.replica/replay` on boot. Not re-verified: re-checking is re-litigating
+  a decision this replica already made and recorded, the same distinction the
+  sequencer in this repo draws when it replays its transaction log.
 
-  In one process this cannot happen — nothing restarts. Deployed, it is fatal
-  and it is not a bug in any of the fixes below: the chain, the pacemaker
-  state and the machine have to be persisted and replayed on boot, the way
-  `torihiki-node`'s sequencer already persists its transaction log. That is
-  the next piece of work and it has not been done.
+  Replay also restores the heights already voted at. Without that a restart
+  votes a second time at a height it already voted at, which is equivocation —
+  committed by accident, against itself.
+
+  **It is still three votes across three block hashes at height one.** So the
+  persistence is in and it is not sufficient, or it is not taking effect, and
+  which of those is true is not yet known. The next thing to look at is w2 —
+  the leader for height one — through `wrangler tail`, specifically whether it
+  proposes more than once and whether `persist!` has completed before it does.
+  Writing "persisted, therefore fixed" would be the same mistake as the three
+  scheduling fixes for a clock that was firing.
 
   ## The deadlock at genesis
 
@@ -125,7 +132,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "15")
+(def ^:const code-version "16")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
@@ -270,6 +277,7 @@
                                           :verify-fn (fn [_ _ _] true)
                                           :derive-account addr/derive}))
                                       :root-fn st/state-root}}))
+                   (set! (.-persisted this) 0)
                    (set! (.-ready this) true)
                    ;; RETURNED. This was fired and forgotten, and a Durable
                    ;; Object may be put to sleep as soon as the handler
@@ -277,7 +285,20 @@
                    ;; never started. The chain then only moved when something
                    ;; POSTed /step, which looked like the alarm firing and
                    ;; doing nothing rather than never firing at all.
-                   (-> (.put ^js (.-storage do-state) "witness" name)
+                   (-> (.list ^js (.-storage do-state) #js {:prefix "blk:"})
+                       (.then (fn [entries]
+                                (let [blocks (keep (fn [raw]
+                                                     (let [[m _] (wire/decode
+                                                                  (js->clj (js/JSON.parse raw)))]
+                                                       (:block m)))
+                                                   (js/Array.from (.values entries)))]
+                                  (when (seq blocks)
+                                    (set! (.-replica this)
+                                          (r/replay (.-replica this) (vec blocks)))
+                                    (set! (.-persisted this)
+                                          (count (:chain (.-replica this)))))
+                                  nil)))
+                       (.then (fn [_] (.put ^js (.-storage do-state) "witness" name)))
                        (.then (fn [_]
                                 (.setAlarm ^js (.-storage do-state)
                                            (+ (js/Date.now) tick-ms))))))))))
@@ -352,7 +373,25 @@
                    ;; Queued, not sent. See the namespace docstring: sending
                    ;; from here is what turned one message into nine.
                    (.queue! this out)
-                   nil)))))
+                   (.persist! this))))))
+
+  (persist! [this]
+    ;; Everything adopted since the last write. Cheap because the chain only
+    ;; grows: a block that is in storage is a block this replica already
+    ;; decided to keep.
+    (let [chain (:chain (.-replica this))
+          from (or (.-persisted this) 0)
+          new (subvec chain (min from (count chain)))]
+      (if (empty? new)
+        (js/Promise.resolve nil)
+        (-> (js/Promise.all
+             (clj->js
+              (for [b new]
+                (.put ^js (.-storage do-state)
+                      (str "blk:" (.padStart (str (:engi.block/height b)) 12 "0"))
+                      (js/JSON.stringify (clj->js (wire/encode {:type :proposal
+                                                                :block b})))))))
+            (.then (fn [_] (set! (.-persisted this) (count chain)) nil))))))
 
   (queue! [this outbox]
     (set! (.-outq this) (into (vec (or (.-outq this) [])) outbox))
@@ -424,6 +463,7 @@
                      (set! (.-replica this) s')
                      (.queue! this out)
                      (.flush! this)))))
+        (.then (fn [_] (.persist! this)))
         ;; The alarm must reschedule even when the tick threw, or one failure
         ;; stops the replica forever and it looks like a network problem.
         (.catch (fn [e] (.note! this e) nil))
