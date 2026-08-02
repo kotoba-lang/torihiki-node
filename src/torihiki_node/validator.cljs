@@ -66,6 +66,33 @@
   The instrument was named as the next step two iterations before it was used.
   Both intervening fixes were correct and neither was the bug.
 
+  ## Transactions are authenticated, and the check is asynchronous
+
+  It was `(fn [_ _ _] true)` — every transaction in every block applied
+  without asking whether the account had authorised it. Anyone who could POST
+  to `/tx` could spend anyone else\u2019s collateral, and every replica would agree
+  on the result.
+
+  The check cannot be synchronous here: `torihiki.auth` calls `verify-fn`
+  inside `apply-block`, and a Worker only has an asynchronous verifier. So the
+  transactions in a PROPOSAL are verified when the proposal arrives, the
+  answers are cached, and the synchronous seam consults the cache. There is
+  time for it because the three-chain rule puts two blocks between a proposal
+  and its commit — the same trade `torihiki-node` made when it verified a
+  signature before applying a block rather than making `apply-block` async.
+
+  A transaction whose signature was never checked verifies as FALSE, never as
+  unknown. Fail closed, the rule `engi.attest/lookup-verifier` states.
+
+  **This deploy is a regression and it is deployed anyway.** Version 17 was
+  committing blocks unattended with all four replicas agreeing; 18 and 19 sit
+  at height one with one certificate, two votes and no error recorded. The
+  transaction check is correct and worth keeping — without it anyone who can
+  POST to `/tx` spends anyone else\u2019s collateral — but it went in alongside
+  four other edits and the chain stopped, and which of the five did it is not
+  yet known. Reverting would drop a live security hole to buy back a running
+  devnet; leaving it silent would be worse than either.
+
   ## The chain is persisted, because a Durable Object restarts
 
   A replica rebuilt from genesis on every boot proposes a fresh block for a
@@ -127,13 +154,14 @@
             [engi.wire :as wire]
             [kotoba.bytes.sha256 :as sha]
             [torihiki.address :as addr]
+            [torihiki.auth :as tauth]
             [torihiki.api :as api]
             [torihiki.book :as bk]
             [torihiki.clearing :as cl]
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "17")
+(def ^:const code-version "19")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
@@ -269,14 +297,26 @@
                                      {:init-fn genesis
                                       :apply-fn
                                       (fn [ex block]
-                                        (st/apply-block
+                                        (-> (st/apply-block
                                          ex {:height (:engi.block/height block)
                                              :ts (:engi.block/ts block)
                                              :txs (mapv decode-tx
                                                         (:engi.block/proposals block))}
                                          {:chain-id chain-id
-                                          :verify-fn (fn [_ _ _] true)
-                                          :derive-account addr/derive}))
+                                          :verify-fn
+                                          (fn [pk payload sig]
+                                            (true? (aget (or (.-txok this) #js {})
+                                                         (str pk "|" payload "|" sig))))
+                                          :derive-account addr/derive})
+                                            ;; apply-block resets :rejected
+                                            ;; every block, so a fold ends
+                                            ;; holding only the last one's —
+                                            ;; which reads as nothing ever
+                                            ;; having been refused.
+                                            (as-> ex' (update ex' :refused
+                                                              (fnil into [])
+                                                              (map :reason
+                                                                   (:rejected ex'))))))
                                       :root-fn st/state-root}}))
                    (set! (.-persisted this) 0)
                    (set! (.-ready this) true)
@@ -339,7 +379,35 @@
     (-> (.learnKeys this)
         (.then (fn [_] (.ingest2 this msgs)))))
 
+  (verifyTxs [this msgs]
+    ;; Every transaction carried by every proposal in this batch. Verified
+    ;; here because the seam that consumes the answer is synchronous and the
+    ;; platform verifier is not; the three-chain rule leaves two blocks of
+    ;; room between a proposal arriving and the block committing.
+    (set! (.-txok this) (or (.-txok this) #js {}))
+    (js/Promise.all
+     (clj->js
+      (for [m msgs
+            :when (= :proposal (:type m))
+            raw (:engi.block/proposals (:block m))
+            :let [env (try (decode-tx raw) (catch :default _ nil))]
+            :when (and env (:pubkey env) (:sig env) (integer? (:account env)))
+            :let [payload (tauth/signing-payload chain-id (:account env)
+                                                 (:nonce env) (:tx env))
+                  k (str (:pubkey env) "|" payload "|" (:sig env))]]
+        (-> (js/crypto.subtle.importKey "raw" (b64-> (:pubkey env))
+                                        #js {:name "Ed25519"} false #js ["verify"])
+            (.then (fn [pk] (js/crypto.subtle.verify
+                             #js {:name "Ed25519"} pk (b64-> (:sig env))
+                             (.encode (js/TextEncoder.) payload))))
+            (.then (fn [ok] (aset (.-txok this) k (true? ok)) nil))
+            (.catch (fn [_] nil)))))))
+
   (ingest2 [this msgs]
+    (-> (.verifyTxs this msgs)
+        (.then (fn [_] (.foldMsgs this msgs)))))
+
+  (foldMsgs [this msgs]
     (-> (js/Promise.all
          (clj->js
           (for [m msgs
@@ -554,7 +622,10 @@
                                         " of " (count witnesses)
                                         " — chained HotStuff, engi.replica")
                         :key-distribution "trust-on-first-use — a devnet answer, not a real one"
-                        :transport "HTTP between Durable Objects, not WebSockets"}
+                        :transport "HTTP between Durable Objects, not WebSockets"
+                        :tx-auth "signatures checked by torihiki.auth on every replica"
+                        :refused (frequencies
+                                  (:refused (:machine-state (.-replica this))))}
                        200))
 
                "/msg"
@@ -573,10 +644,27 @@
                                          :committed (r/committed-height (.-replica this))} 200))))
 
                "/tx"
+               ;; Shape only. Whether the account authorised it is decided by
+               ;; torihiki.auth inside apply-block, on every replica, which is
+               ;; where it has to be: a check done here would be this node
+               ;; vouching for a transaction the others never examined.
                (-> (.text request)
                    (.then (fn [t]
-                            (set! (.-replica this) (r/submit (.-replica this) t))
-                            (json {:ok true :queued true} 200))))
+                            (let [env (try (decode-tx t) (catch :default _ nil))]
+                              (if (and env (:pubkey env) (:sig env)
+                                       (integer? (:account env))
+                                       (integer? (:nonce env)))
+                                (do (set! (.-replica this)
+                                          (r/submit (.-replica this) t))
+                                    (json {:ok true :queued true
+                                           :account (:account env)} 200))
+                                (json {:ok false :reason "malformed-envelope"}
+                                      400))))))
+
+               "/account"
+               (let [ex (:machine-state (.-replica this))
+                     id (js/parseInt (or (.get (.-searchParams url) "id") "0"))]
+                 (json (api/account-state ex id) 200))
 
                "/book"
                (json (let [ex (:machine-state (.-replica this))]
