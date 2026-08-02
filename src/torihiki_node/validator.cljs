@@ -84,14 +84,34 @@
   A transaction whose signature was never checked verifies as FALSE, never as
   unknown. Fail closed, the rule `engi.attest/lookup-verifier` states.
 
-  **This deploy is a regression and it is deployed anyway.** Version 17 was
-  committing blocks unattended with all four replicas agreeing; 18 and 19 sit
-  at height one with one certificate, two votes and no error recorded. The
-  transaction check is correct and worth keeping — without it anyone who can
-  POST to `/tx` spends anyone else\u2019s collateral — but it went in alongside
-  four other edits and the chain stopped, and which of the five did it is not
-  yet known. Reverting would drop a live security hole to buy back a running
-  devnet; leaving it silent would be worse than either.
+  The regression that came with this was not in it. Versions 18 to 21 sat at
+  height one exchanging new-views forever, and the cause was in engi: a
+  new-view carrying the bootstrap genesis certificate was refused because that
+  certificate has no signatures, so replicas that had not yet certified
+  anything could not tell each other they had timed out. Their views drifted
+  to 5, 6, 6 and 6 and no timeout certificate could form. Nothing threw,
+  because refusing an unverifiable certificate is what that code is for.
+
+  What found it was `/head` reporting the genesis hash, the tip hash and a
+  count of message types seen. All four agreed on both hashes and the only
+  type moving was `new-view`, which is a very short list of possible causes.
+
+  And then a second one, of my own making: `rearm` overwrote the alarm on
+  every request. Every inbound message runs it, so under a steady stream of
+  peer traffic each arrival pushed the alarm another 400ms out and it never
+  fired. Three of four validators sat at height zero having sent nothing, ever,
+  while receiving a hundred and sixty messages; the fourth was the leader, got
+  less traffic, found gaps, and ticked. A watchdog that resets the timer on
+  every request is a timer that never expires under load.
+
+  ## Open: two genuine transactions were refused with bad-nonce
+
+  A forged transaction is refused with `:bad-signature`, which is the check
+  working. But the two genuine ones submitted alongside it — a deposit at
+  nonce 1 and an order at nonce 2, sent to two different replicas — were both
+  refused `:bad-nonce`, and the account ends with no collateral. Submitting to
+  two replicas means the chain, not the client, decides the order, so nonce 2
+  arriving first would explain one refusal and not both. Unresolved.
 
   ## The chain is persisted, because a Durable Object restarts
 
@@ -161,7 +181,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "19")
+(def ^:const code-version "23")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
@@ -385,6 +405,12 @@
     ;; platform verifier is not; the three-chain rule leaves two blocks of
     ;; room between a proposal arriving and the block committing.
     (set! (.-txok this) (or (.-txok this) #js {}))
+    ;; The seq is realised INSIDE this call, so anything that throws while
+    ;; building it throws synchronously out of here rather than rejecting a
+    ;; promise — and the whole batch of votes goes with it, silently, because
+    ;; the sender never learns its message was dropped. Wrapped so a bad
+    ;; transaction cannot cost the consensus messages it was travelling with.
+    (try
     (js/Promise.all
      (clj->js
       (for [m msgs
@@ -401,7 +427,8 @@
                              #js {:name "Ed25519"} pk (b64-> (:sig env))
                              (.encode (js/TextEncoder.) payload))))
             (.then (fn [ok] (aset (.-txok this) k (true? ok)) nil))
-            (.catch (fn [_] nil)))))))
+            (.catch (fn [_] nil))))))
+      (catch :default e (.note! this e) (js/Promise.resolve nil))))
 
   (ingest2 [this msgs]
     (-> (.verifyTxs this msgs)
@@ -578,12 +605,23 @@
     ;; something that notices it is gone, and every request is a free chance
     ;; to look — cheaper than a chain that stops silently and waits to be
     ;; wound by hand.
-    ;; Always overwrites, rather than only setting when none is pending.
-    ;; Cloudflare drops an alarm after repeated failures, and a dropped alarm
-    ;; still reads as "one is pending" to the check that was here — so the
-    ;; watchdog looked at a corpse and decided nothing needed doing. The queue
-    ;; sat at one message for four minutes with no error recorded anywhere.
-    (-> (.setAlarm ^js (.-storage do-state) (+ (js/Date.now) tick-ms))
+    ;; Sets an alarm only when there is none or the pending one is already
+    ;; overdue.
+    ;;
+    ;; It used to overwrite unconditionally, which was a fix for a dropped
+    ;; alarm still reading as pending — and it starved the clock. Every
+    ;; inbound message runs this, so under a steady stream of peer traffic
+    ;; each arrival pushed the alarm another 400ms into the future and it
+    ;; never fired at all. Three of four validators sat at height zero having
+    ;; sent nothing, ever, while receiving a hundred and sixty messages; the
+    ;; fourth was the leader, got less traffic, found gaps, and ticked.
+    ;;
+    ;; A watchdog that resets the timer on every request is a timer that never
+    ;; expires under load.
+    (-> (.getAlarm ^js (.-storage do-state))
+        (.then (fn [a]
+                 (when (or (nil? a) (< a (js/Date.now)))
+                   (.setAlarm ^js (.-storage do-state) (+ (js/Date.now) tick-ms)))))
         (.catch (fn [_] nil))))
 
   (handle [this ^js request]
@@ -617,6 +655,16 @@
                         :msgs-in (or (.-msgs-in this) 0)
                         :msgs-out (or (.-msgs-out this) 0)
                         :queued (count (or (.-outq this) []))
+                        ;; Two replicas that disagree about the genesis hash
+                        ;; disagree about everything, silently: a proposal
+                        ;; that does not extend the tip is refused with no
+                        ;; message and no error, which is correct and gives
+                        ;; you nothing to read.
+                        :genesis-hash (block-hash (c/canonical-block
+                                                   (first (:chain (.-replica this)))))
+                        :tip-hash (block-hash (c/canonical-block
+                                               (r/tip (.-replica this))))
+                        :seen-types (js->clj (or (.-types this) #js {}))
                         :last-error (or (.-last-error this) nil)
                         :consensus (str (c/quorum-size (count witnesses))
                                         " of " (count witnesses)
@@ -634,6 +682,11 @@
                             (let [raw (js->clj (aget body "msgs"))
                                   msgs (keep (fn [m] (first (wire/decode m))) raw)]
                               (set! (.-msgs-in this) (+ (or (.-msgs-in this) 0) (count msgs)))
+                              (set! (.-types this) (or (.-types this) #js {}))
+                              (doseq [m msgs]
+                                (let [k (name (:type m))]
+                                  (aset (.-types this) k
+                                        (inc (or (aget (.-types this) k) 0)))))
                               (-> (.ingest this (vec msgs))
                                   (.then (fn [_] (json {:ok true :n (count msgs)} 200)))))))
                    (.catch (fn [_] (json {:ok false :reason "bad-batch"} 400))))
