@@ -161,9 +161,29 @@
   the three that would certify it, and the three that could certify it are
   each holding two.
 
-  Convergence was necessary and is not sufficient. What is left is why w3 does
-  not adopt a block whose parent it holds — it receives thousands of proposals
-  for it — and that is the next reading, not the next guess.
+  Convergence was necessary and not sufficient, and two more readings named
+  what is left:
+
+    w1 tip 2  lastprop no-parent 225   sync: offered 1 (2..2) adopted 0  does-not-attach
+    w2 tip 2  lastprop already-voted   sync: offered 1 (2..2) adopted 0  does-not-attach
+    w3 tip 1  lastprop already-voted   sync: offered 1 (2..2) adopted 0  BELOW-QUORUM
+    w4 tip 2  lastprop already-voted   sync: offered 1 (2..2) adopted 0  does-not-attach
+
+  A proposal for height 225 is in flight, so the chain does run — somewhere.
+  What it does not do is take everybody with it.
+
+  The `does-not-attach` refusals are benign: a sync-response is broadcast to
+  everybody, so three replicas keep being offered a block they already hold.
+  Wasteful, not fatal, and worth fixing by answering the asker instead of the
+  room.
+
+  The one that matters is w3\u0027s `below-quorum`. `engi.sync` requires a quorum
+  of VERIFIED signatures on the certificate inside a segment, and w3 cannot
+  verify enough of them — so the block it needs is refused by the check that
+  is supposed to let it in, and it can never catch up. That is a key
+  availability problem, which makes the trust-on-first-use key distribution
+  above not a devnet shortcut but the thing standing between this chain and
+  working.
 
   ## The deployed chain was DOWN, and this is how it was found
 
@@ -257,7 +277,7 @@
             [torihiki.state :as st]))
 
 (def ^:const chain-id "torihiki-engi-devnet-1")
-(def ^:const code-version "42")
+(def ^:const code-version "45")
 
 (defn- do-name
   "The Durable Object id for a witness, versioned.
@@ -876,6 +896,8 @@
                         :sent-types (js->clj (or (.-outtypes this) #js {}))
                         :last-sync-request (or (.-lastsync this) nil)
                         :why-not-proposing (js->clj (or (.-why this) #js {}))
+                        :last-proposal (:last-proposal (.-replica this))
+                        :last-sync-outcome (:last-sync (.-replica this))
                         :delivery (js->clj (or (.-delivery this) #js {}))
 
                         :last-error (or (.-last-error this) nil)
