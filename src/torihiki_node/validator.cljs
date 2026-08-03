@@ -354,7 +354,7 @@
                                           2 "==" 3 "=" "")]
                                 #js {:privateKey sk :pub (str std pad)})))))))))
 
-(def ^:const code-version "75")
+(def ^:const code-version "76")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -886,6 +886,7 @@
     nil)
 
   (tickNow [this]
+    (when-not (.-bootAt this) (set! (.-bootAt this) (js/Date.now)))
     (-> (if (.-witness this)
           (js/Promise.resolve (.-witness this))
           (.get ^js (.-storage do-state) "witness"))
@@ -922,8 +923,19 @@
                  ;; for two minutes means nobody is addressing this object at
                  ;; all. A canonical replica that somehow does go quiet is
                  ;; woken by the next request, which is how it started.
-                 (let [q (or (.-lastInbound this) 0)]
-                   (when (or (zero? q) (< (- (js/Date.now) q) 120000))
+                 (let [q (or (.-lastInbound this) 0)
+                       b (or (.-bootAt this) (js/Date.now))]
+                   ;; `(zero? q)` used to be an EXEMPTION here — "never
+                   ;; received anything, so keep going" — which is exactly
+                   ;; backwards: an object nobody has ever addressed is
+                   ;; precisely the abandoned one. `equivocators [w3 w4]` came
+                   ;; back on a deployment with no Byzantine node while this
+                   ;; was live, which is what a duplicate identity looks like.
+                   ;;
+                   ;; Measured from boot instead, so a genuinely new object
+                   ;; gets its grace period and an old one that has been
+                   ;; talking to nobody for two minutes stops.
+                   (when (< (- (js/Date.now) (max q b)) 120000)
                      (.setAlarm ^js (.-storage do-state) (+ (js/Date.now) tick-ms))))))
         ;; An alarm handler that rejects is retried with backoff and then
         ;; dropped, and a dropped alarm is a chain that stops for good. It
@@ -943,6 +955,7 @@
     ;; to keep its clock running: an abandoned generation is addressed by
     ;; nobody, ever, and that is the only thing that distinguishes it.
     (set! (.-lastInbound this) (js/Date.now))
+    (when-not (.-bootAt this) (set! (.-bootAt this) (js/Date.now)))
     (-> (.handle this request)
         (.catch (fn [e]
                   ;; An unhandled throw inside a Durable Object surfaces as an
