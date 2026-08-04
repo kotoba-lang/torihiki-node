@@ -313,6 +313,7 @@
             [torihiki.api :as api]
             [torihiki.book :as bk]
             [torihiki.clearing :as cl]
+            [torihiki.snapshot :as tsnap]
             [torihiki.state :as st]))
 
 (def ^:const chain-id
@@ -361,7 +362,7 @@
                                           2 "==" 3 "=" "")]
                                 #js {:privateKey sk :pub (str std pad)})))))))))
 
-(def ^:const code-version "79")
+(def ^:const code-version "80")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -410,6 +411,28 @@
   ;; does not run. The engi measurement stands; this deployment keeps four
   ;; until the three silent replicas are explained.
   ["w1" "w2" "w3" "w4"])
+(def ^:const checkpoint-every
+  "Write a checkpoint every N committed blocks.
+
+  This is the number that decides how much of the log a restart still has to
+  fold: at worst `checkpoint-every` blocks, never the whole chain. 100 keeps
+  the tail replay well inside one invocation while writing one extra key per
+  hundred blocks.
+
+  The pages `catchUp` folds are still bounded — a checkpoint changes how MANY
+  pages there are, not how big one is. Both bounds are needed: without the
+  page bound one invocation can exceed its budget, and without the checkpoint
+  the number of invocations grows with the chain."
+  100)
+
+(def ^:const checkpoints-kept
+  "How many checkpoints to keep. Two, not one: a checkpoint written while the
+  object is being reset could be a half-written key, and the older one is what
+  makes that survivable rather than fatal."
+  2)
+
+(defn- ckpt-key [h] (str "snap:" (.padStart (str h) 12 "0")))
+
 (def ^:const tick-ms
   "200, halved from 400 to ask one question: is the ceiling at height 225 a
   property of the CHAIN or of the CLOCK?
@@ -489,73 +512,16 @@
   ;; Boot: the witness name, the signing key, and the replica. Everything is
   ;; in memory — this is a devnet and a validator that is evicted rejoins by
   ;; catching up, which is what inga.sync is for.
-  (boot [this name]
-    ;; Re-boots when the name it holds is not the name it is being addressed
-    ;; by. A Durable Object keeps running the code and the state it started
-    ;; with until it is evicted, so a deploy that fixes a naming bug does not
-    ;; fix the objects already holding the wrong name — three validators went
-    ;; on believing they were w1 across two deploys, and only self-healing on
-    ;; the mismatch cleared it.
-    (if (and (.-ready this) (= (.-witness this) name))
-      (js/Promise.resolve nil)
-      (-> (.get ^js (.-storage do-state) "key")
-          (.then (fn [stored]
-                   ;; The key is PERSISTED, not regenerated.
-                   ;;
-                   ;; It was regenerated on every boot, and a Durable Object
-                   ;; is evicted routinely — so a validator came back with a
-                   ;; new identity while every peer still held the old public
-                   ;; key, and every vote it sent verified as false. The
-                   ;; symptom was three replicas holding two votes each,
-                   ;; one short of quorum, with no error anywhere: signatures
-                   ;; that do not verify are dropped silently, which is
-                   ;; correct and gives you nothing to read.
-                   ;;
-                   ;; A validator whose identity does not survive a restart is
-                   ;; not a validator.
-                   ;; DERIVED FROM THE NAME, not generated.
-                   ;;
-                   ;; Persisting the keypair made an identity survive a
-                   ;; restart, and it does — of the SAME Durable Object.
-                   ;; Renaming the object (which every `code-version` bump
-                   ;; does, because that is how a self-rescheduling alarm is
-                   ;; made to pick up a deploy at all) gives a fresh object
-                   ;; with empty storage, so every replica came up with a new
-                   ;; key while its peers held the old one. Fourteen votes
-                   ;; dropped as `did-not-verify` at w3, two votes for its own
-                   ;; tip, one short of quorum, forever. The votes were well
-                   ;; formed and the signatures were real; they were the wrong
-                   ;; key, and trust-on-first-use keeps the first one it saw.
-                   ;;
-                   ;; Two workarounds that undo each other: versioned names
-                   ;; exist to defeat eviction, and defeat key agreement.
-                   ;;
-                   ;; Deriving the seed from chain-id and witness name breaks
-                   ;; the tie — w3 is the same w3 in every incarnation, so
-                   ;; there is nothing for first-use to get wrong. An Ed25519
-                   ;; private key IS its 32-byte seed, and PKCS8 wraps it in a
-                   ;; fixed 16-byte prefix, so this is an import rather than a
-                   ;; key-generation scheme of my own.
-                   ;;
-                   ;; It is a DEVNET answer and a worse one than what it
-                   ;; replaces in exactly one way: anybody who knows the
-                   ;; chain-id and a witness name can compute that witness's
-                   ;; private key. Real validators are given keys they
-                   ;; generate themselves and publish in genesis. This is
-                   ;; written down rather than hidden because the deployment
-                   ;; is a devnet with mintable collateral and the alternative
-                   ;; is a chain that cannot agree at all.
-                   (derive-keypair chain-id name)))
-          (.then (fn [^js k]
-                   (set! (.-kp this) k)
-                   (set! (.-pub this) (.-pub k))
-                   (set! (.-witness this) name)
-                   (set! (.-keys this) #js {})
-                   (set! (.-verified this) #js {})
-                   (set! (.-delivery this) #js {})
-                   (set! (.-why this) #js {})
-                   (set! (.-replica this)
-                         (r/replica {:witness name
+  ;; The options `r/replica` takes, in one place.
+  ;;
+  ;; `resume` needs exactly the same ones — the injected seams (hash-fn,
+  ;; sign-fn, verify-fn, machine) are functions and a snapshot cannot carry
+  ;; them, so the caller has to put them back. Two copies of this map would be
+  ;; two definitions of what this chain IS: a different hash-fn or a different
+  ;; machine on the resume path is a replica that agrees on the order and
+  ;; disagrees on the result, which every number about it would hide.
+  (replicaOpts [this name]
+                         {:witness name
                                      :witnesses witnesses
                                      :quorum (c/quorum-size (count witnesses))
                                      :hash-fn (fn [b] (block-hash (c/canonical-block b)))
@@ -622,7 +588,74 @@
                                                               (fnil into [])
                                                               (map :reason
                                                                    (:rejected ex'))))))
-                                      :root-fn st/state-root}}))
+                                      :root-fn st/state-root}})
+
+  (boot [this name]
+    ;; Re-boots when the name it holds is not the name it is being addressed
+    ;; by. A Durable Object keeps running the code and the state it started
+    ;; with until it is evicted, so a deploy that fixes a naming bug does not
+    ;; fix the objects already holding the wrong name — three validators went
+    ;; on believing they were w1 across two deploys, and only self-healing on
+    ;; the mismatch cleared it.
+    (if (and (.-ready this) (= (.-witness this) name))
+      (js/Promise.resolve nil)
+      (-> (.get ^js (.-storage do-state) "key")
+          (.then (fn [stored]
+                   ;; The key is PERSISTED, not regenerated.
+                   ;;
+                   ;; It was regenerated on every boot, and a Durable Object
+                   ;; is evicted routinely — so a validator came back with a
+                   ;; new identity while every peer still held the old public
+                   ;; key, and every vote it sent verified as false. The
+                   ;; symptom was three replicas holding two votes each,
+                   ;; one short of quorum, with no error anywhere: signatures
+                   ;; that do not verify are dropped silently, which is
+                   ;; correct and gives you nothing to read.
+                   ;;
+                   ;; A validator whose identity does not survive a restart is
+                   ;; not a validator.
+                   ;; DERIVED FROM THE NAME, not generated.
+                   ;;
+                   ;; Persisting the keypair made an identity survive a
+                   ;; restart, and it does — of the SAME Durable Object.
+                   ;; Renaming the object (which every `code-version` bump
+                   ;; does, because that is how a self-rescheduling alarm is
+                   ;; made to pick up a deploy at all) gives a fresh object
+                   ;; with empty storage, so every replica came up with a new
+                   ;; key while its peers held the old one. Fourteen votes
+                   ;; dropped as `did-not-verify` at w3, two votes for its own
+                   ;; tip, one short of quorum, forever. The votes were well
+                   ;; formed and the signatures were real; they were the wrong
+                   ;; key, and trust-on-first-use keeps the first one it saw.
+                   ;;
+                   ;; Two workarounds that undo each other: versioned names
+                   ;; exist to defeat eviction, and defeat key agreement.
+                   ;;
+                   ;; Deriving the seed from chain-id and witness name breaks
+                   ;; the tie — w3 is the same w3 in every incarnation, so
+                   ;; there is nothing for first-use to get wrong. An Ed25519
+                   ;; private key IS its 32-byte seed, and PKCS8 wraps it in a
+                   ;; fixed 16-byte prefix, so this is an import rather than a
+                   ;; key-generation scheme of my own.
+                   ;;
+                   ;; It is a DEVNET answer and a worse one than what it
+                   ;; replaces in exactly one way: anybody who knows the
+                   ;; chain-id and a witness name can compute that witness's
+                   ;; private key. Real validators are given keys they
+                   ;; generate themselves and publish in genesis. This is
+                   ;; written down rather than hidden because the deployment
+                   ;; is a devnet with mintable collateral and the alternative
+                   ;; is a chain that cannot agree at all.
+                   (derive-keypair chain-id name)))
+          (.then (fn [^js k]
+                   (set! (.-kp this) k)
+                   (set! (.-pub this) (.-pub k))
+                   (set! (.-witness this) name)
+                   (set! (.-keys this) #js {})
+                   (set! (.-verified this) #js {})
+                   (set! (.-delivery this) #js {})
+                   (set! (.-why this) #js {})
+                   (set! (.-replica this) (r/replica (.replicaOpts this name)))
                    (set! (.-persisted this) 0)
                    (set! (.-ready this) true)
                    ;; The log is NOT replayed here.
@@ -654,6 +687,8 @@
                    ;; are exactly one call over all of them.
                    (set! (.-replayCursor this) "")
                    (set! (.-caughtUp this) false)
+                   (set! (.-lastCkpt this) -1)
+                   (set! (.-bootedFromCkpt this) false)
                    ;; RETURNED. This was fired and forgotten, and a Durable
                    ;; Object may be put to sleep as soon as the handler
                    ;; resolves — so the very first alarm was lost and the loop
@@ -661,9 +696,58 @@
                    ;; POSTed /step, which looked like the alarm firing and
                    ;; doing nothing rather than never firing at all.
                    (-> (.put ^js (.-storage do-state) "witness" name)
+                       ;; Start from the newest checkpoint, so `catchUp` folds
+                       ;; the tail above it instead of the whole log.
+                       ;;
+                       ;; Paging the replay bounded one invocation; it did not
+                       ;; bound how many invocations there are, and that is
+                       ;; what took the chain down again on 2026-08-04 during
+                       ;; the inga migration: a deploy evicted all four
+                       ;; replicas at once, each began folding two thousand
+                       ;; blocks, and w1 went 449 -> 124 as it was reset and
+                       ;; restarted before it could finish. The devnet had to
+                       ;; be wiped. A checkpoint is what makes a code change
+                       ;; stop costing the chain.
+                       (.then (fn [_] (.restoreCheckpoint this)))
                        (.then (fn [_]
                                 (.setAlarm ^js (.-storage do-state)
                                            (+ (js/Date.now) tick-ms))))))))))
+
+  ;; Adopt the newest checkpoint, if there is one that parses.
+  ;;
+  ;; A checkpoint that does not parse is skipped rather than thrown from, and
+  ;; the next one back is tried. That is why `checkpoint-kept` is two: a write
+  ;; interrupted by a reset leaves a key that reads back as half an EDN form,
+  ;; and a replica that died on it would be a replica whose recovery mechanism
+  ;; is also its failure mode — which is exactly the shape of the bug this
+  ;; whole line of work exists to remove.
+  (restoreCheckpoint [this]
+    (-> (.list ^js (.-storage do-state) #js {:prefix "snap:" :reverse true
+                                             :limit checkpoints-kept})
+        (.then (fn [^js entries]
+                 (let [vals (js/Array.from (.values entries))
+                       ks (js/Array.from (.keys entries))]
+                   (loop [i 0]
+                     (if (>= i (alength vals))
+                       nil
+                       (let [restored
+                             (try
+                               (let [snap (tsnap/read-string* (aget vals i))
+                                     snap (update snap :machine-state tsnap/restore)]
+                                 (r/resume (.replicaOpts this (.-witness this)) snap))
+                               (catch :default e (.note! this e) nil))]
+                         (if restored
+                           (do (set! (.-replica this) restored)
+                               (set! (.-lastCkpt this) (r/height restored))
+                               (set! (.-bootedFromCkpt this) true)
+                               ;; Everything at or below the checkpoint is
+                               ;; already folded into it.
+                               (set! (.-replayCursor this)
+                                     (str "blk:" (subs (aget ks i) (count "snap:"))))
+                               (set! (.-persisted this) (count (:chain restored)))
+                               true)
+                           (recur (inc i)))))))))
+        (.catch (fn [e] (.note! this e) nil))))
 
   ;; Delete one bounded page of this object's storage, and say what is left.
   ;;
@@ -865,6 +949,47 @@
   ;; `blk:` key per block was the height-225 ceiling. It is not: the chain
   ;; stopped at 225 with nothing being written. Restored, because restart
   ;; recovery is not optional and the experiment answered its question.
+  ;; A checkpoint: the replica as data, so a restart does not have to fold the
+  ;; log to get back to where it was.
+  ;;
+  ;; TWO snapshots compose here and each covers what the other cannot.
+  ;; `inga.replica/snapshot` bounds the consensus state (a tail of the chain,
+  ;; the certificates naming it, the pacemaker, and the `:voted-below`
+  ;; watermark that keeps a resumed replica from voting twice). Its
+  ;; `:machine-state` it carries whole — and this machine's state is a
+  ;; `torihiki` exchange holding `Book` records backed by typed arrays, which
+  ;; is not data and does not serialise. `torihiki.snapshot/capture` turns
+  ;; that into plain data whose `canonical-bytes` are byte-identical on
+  ;; restore, which is the only equality that matters: two states can be `=`
+  ;; and encode differently, and it is the encoding a validator signs.
+  (checkpoint! [this]
+    (let [s (.-replica this)
+          h (r/height s)]
+      (if (or (zero? h)
+              (pos? (mod h checkpoint-every))
+              (= h (or (.-lastCkpt this) -1)))
+        (js/Promise.resolve nil)
+        (let [snap (-> (r/snapshot s) (update :machine-state tsnap/capture))]
+          (-> (.put ^js (.-storage do-state) (ckpt-key h) (tsnap/write-string snap))
+              (.then (fn [_]
+                       (set! (.-lastCkpt this) h)
+                       ;; Drop the ones past the keep count. `.list` with
+                       ;; `reverse` gives newest first, so what to delete is
+                       ;; whatever is left after taking the ones we keep.
+                       (.list ^js (.-storage do-state)
+                              #js {:prefix "snap:" :reverse true})))
+              (.then (fn [^js entries]
+                       (let [ks (js/Array.from (.keys entries))
+                             stale (drop checkpoints-kept ks)]
+                         (if (seq stale)
+                           (.delete ^js (.-storage do-state) (clj->js (vec stale)))
+                           (js/Promise.resolve 0)))))
+              (.catch (fn [e]
+                        ;; A checkpoint that fails is a slower restart, not a
+                        ;; broken replica. It must never take the tick with it.
+                        (.note! this e)
+                        nil)))))))
+
   (persist! [this]
     ;; Everything adopted since the last write. Cheap because the chain only
     ;; grows: a block that is in storage is a block this replica already
@@ -1018,7 +1143,8 @@
                  (when done?
                    (-> (.learnKeys this)
                        (.then (fn [_] (.round this)))
-                       (.then (fn [_] (.persist! this)))))))
+                       (.then (fn [_] (.persist! this)))
+                       (.then (fn [_] (.checkpoint! this)))))))
         ;; The alarm must reschedule even when the tick threw, or one failure
         ;; stops the replica forever and it looks like a network problem.
         (.catch (fn [e] (.note! this e) nil))
@@ -1253,6 +1379,11 @@
                  (json {:witness (.-witness this)
                         :pubkey (.-pub this)
                         :code-version code-version
+                        ;; So a restart can be READ rather than inferred: the
+                        ;; checkpoint this replica last wrote, and whether it
+                        ;; booted from one.
+                        :checkpoint (.-lastCkpt this)
+                        :booted-from-checkpoint (true? (.-bootedFromCkpt this))
                         :chain-id chain-id
                         :height (r/height s)
                         :resting (bk/resting-count
