@@ -354,7 +354,7 @@
                                           2 "==" 3 "=" "")]
                                 #js {:privateKey sk :pub (str std pad)})))))))))
 
-(def ^:const code-version "76")
+(def ^:const code-version "78")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -414,6 +414,20 @@
   time. Halving the tick separates them: if the ceiling is the chain it stays
   at 225, and if it is elapsed time it moves to roughly 450."
   200)
+
+(def ^:const replay-page
+  "How many persisted blocks one invocation folds on the way back up.
+
+  There has to be a number here at all because a Durable Object's CPU budget
+  is per invocation and the log is unbounded, so `replay the log on boot` is a
+  cost that grows past the budget and then stays past it. See `catchUp`.
+
+  25 is chosen to be obviously under budget rather than to be optimal — a
+  chain at height 500 catches up in twenty ticks, four seconds at `tick-ms`,
+  which is a startup nobody watches. Tuning it upward trades that invisible
+  delay for the failure mode this exists to remove, which is not a trade worth
+  making until something measures the real per-block cost."
+  25)
 
 ;; ── the machine ─────────────────────────────────────────────────────────────
 
@@ -604,29 +618,115 @@
                                       :root-fn st/state-root}}))
                    (set! (.-persisted this) 0)
                    (set! (.-ready this) true)
+                   ;; The log is NOT replayed here.
+                   ;;
+                   ;; It was, in one `.list` with no limit and one `r/replay`
+                   ;; over everything it returned, and that is what took the
+                   ;; deployment down. A Durable Object gets a CPU budget per
+                   ;; invocation; past a few hundred blocks the replay exceeds
+                   ;; it, and Cloudflare's answer to exceeding it is to RESET
+                   ;; the object — which discards the in-memory state, so the
+                   ;; next invocation boots and replays from zero and exceeds
+                   ;; it again, at the same block, forever.
+                   ;;
+                   ;; Measured, not theorised: `wrangler tail` on the live
+                   ;; validator showed 70 `exceeded its CPU time limit and was
+                   ;; reset` and 124 `overloaded — requests queued for too
+                   ;; long` in ninety seconds, every request 500, on a chain
+                   ;; that had reached height ~455.
+                   ;;
+                   ;; The failure is worse than a slow start: it is a crash
+                   ;; loop that CANNOT end on its own, because recovery is the
+                   ;; very work that kills it. Nothing in the object gets to
+                   ;; run, including the route that exists to wipe it.
+                   ;;
+                   ;; So boot leaves the replica at genesis and `catchUp`
+                   ;; folds the log a bounded page at a time, across as many
+                   ;; invocations as it takes. `r/replay` is a `reduce` over
+                   ;; blocks sorted by height, so N pages in ascending order
+                   ;; are exactly one call over all of them.
+                   (set! (.-replayCursor this) "")
+                   (set! (.-caughtUp this) false)
                    ;; RETURNED. This was fired and forgotten, and a Durable
                    ;; Object may be put to sleep as soon as the handler
                    ;; resolves — so the very first alarm was lost and the loop
                    ;; never started. The chain then only moved when something
                    ;; POSTed /step, which looked like the alarm firing and
                    ;; doing nothing rather than never firing at all.
-                   (-> (.list ^js (.-storage do-state) #js {:prefix "blk:"})
-                       (.then (fn [entries]
-                                (let [blocks (keep (fn [raw]
-                                                     (let [[m _] (wire/decode
-                                                                  (js->clj (js/JSON.parse raw)))]
-                                                       (:block m)))
-                                                   (js/Array.from (.values entries)))]
-                                  (when (seq blocks)
-                                    (set! (.-replica this)
-                                          (r/replay (.-replica this) (vec blocks)))
-                                    (set! (.-persisted this)
-                                          (count (:chain (.-replica this)))))
-                                  nil)))
-                       (.then (fn [_] (.put ^js (.-storage do-state) "witness" name)))
+                   (-> (.put ^js (.-storage do-state) "witness" name)
                        (.then (fn [_]
                                 (.setAlarm ^js (.-storage do-state)
                                            (+ (js/Date.now) tick-ms))))))))))
+
+  ;; Delete one bounded page of this object's storage, and say what is left.
+  ;;
+  ;; `.delete` takes at most 128 keys, so a page is 128 keys and one call
+  ;; walks a few pages inside a wall-clock budget well under the limit that
+  ;; resets the object. Keys are re-listed from the front each page because
+  ;; the ones just deleted are gone — no cursor to keep, and nothing to lose
+  ;; if the object is reset between calls.
+  (wipePage [this]
+    (let [deadline (+ (js/Date.now) 2000)
+          step (fn step [n]
+                 (-> (.list ^js (.-storage do-state) #js {:limit 128})
+                     (.then (fn [^js entries]
+                              (let [ks (js/Array.from (.keys entries))]
+                                (if (zero? (alength ks))
+                                  (js/Promise.resolve [n true])
+                                  (-> (.delete ^js (.-storage do-state) ks)
+                                      (.then (fn [_]
+                                               (let [n' (+ n (alength ks))]
+                                                 (if (< (js/Date.now) deadline)
+                                                   (step n')
+                                                   (js/Promise.resolve [n' false]))))))))))))]
+      (-> (step 0)
+          (.then (fn [[n done?]]
+                   (set! (.-ready this) false)
+                   (set! (.-witness this) nil)
+                   (set! (.-persisted this) 0)
+                   (set! (.-replayCursor this) "")
+                   (set! (.-caughtUp this) false)
+                   (json {:ok true :deleted n :drained done?
+                          :note (if done?
+                                  "empty — boots at genesis on the next request"
+                                  "more remains, call /wipe again")}
+                         200))))))
+
+  ;; Fold one bounded page of the persisted log. Resolves true when the
+  ;; replica has caught up to what storage holds.
+  ;;
+  ;; `blk:` keys are the height zero-padded to twelve digits, so lexicographic
+  ;; order IS height order and `startAfter` is a correct cursor. That padding
+  ;; was already there; without it `blk:10` would sort before `blk:2` and
+  ;; paging would fold the chain out of order.
+  ;;
+  ;; A short page means the end: `.list` returns fewer than `limit` only when
+  ;; there is nothing more under the prefix.
+  (catchUp [this]
+    (if (.-caughtUp this)
+      (js/Promise.resolve true)
+      (let [c (or (.-replayCursor this) "")
+            opts (if (seq c)
+                   #js {:prefix "blk:" :limit replay-page :startAfter c}
+                   #js {:prefix "blk:" :limit replay-page})]
+        (-> (.list ^js (.-storage do-state) opts)
+            (.then (fn [^js entries]
+                     (let [ks (js/Array.from (.keys entries))
+                           n (alength ks)
+                           blocks (keep (fn [raw]
+                                          (let [[m _] (wire/decode
+                                                       (js->clj (js/JSON.parse raw)))]
+                                            (:block m)))
+                                        (js/Array.from (.values entries)))]
+                       (when (seq blocks)
+                         (set! (.-replica this)
+                               (r/replay (.-replica this) (vec blocks)))
+                         (set! (.-persisted this)
+                               (count (:chain (.-replica this)))))
+                       (if (< n replay-page)
+                         (do (set! (.-caughtUp this) true) true)
+                         (do (set! (.-replayCursor this) (aget ks (dec n)))
+                             false)))))))))
 
   ;; A synchronous answer from a cache the async fetch fills. Unknown key ->
   ;; false, never "unknown": a verifier that treats "I was not asked about
@@ -898,9 +998,20 @@
                    ;; validator, which is the attack the rest of the system
                    ;; refuses.
                    (js/Promise.reject (js/Error. "alarm before any request")))))
-        (.then (fn [_] (.learnKeys this)))
-        (.then (fn [_] (.round this)))
-        (.then (fn [_] (.persist! this)))
+        ;; Catch up BEFORE voting, and do not vote until caught up.
+        ;;
+        ;; This is a safety rule, not an optimisation. A replica that votes
+        ;; from a partially folded log is voting at heights it has already
+        ;; voted at, with a different machine state — which is equivocation,
+        ;; the one thing this system slashes for, committed by accident
+        ;; against itself. `r/replay` restores `:voted` for exactly that
+        ;; reason; skipping ahead of it would throw the restoration away.
+        (.then (fn [_] (.catchUp this)))
+        (.then (fn [done?]
+                 (when done?
+                   (-> (.learnKeys this)
+                       (.then (fn [_] (.round this)))
+                       (.then (fn [_] (.persist! this)))))))
         ;; The alarm must reschedule even when the tick threw, or one failure
         ;; stops the replica forever and it looks like a network problem.
         (.catch (fn [e] (.note! this e) nil))
@@ -1084,12 +1195,53 @@
     (let [url (js/URL. (.-url request))
           path (.-pathname url)
           w (or (.get (.-searchParams url) "w") "w1")]
-      (-> (.boot this w)
-          (.then (fn [_] (.rearm this)))
-          (.then
-           (fn [_]
-             (case path
-               "/head"
+      (if (= path "/wipe")
+        ;; BEFORE `boot`, deliberately, and this is the whole point of it.
+        ;;
+        ;; `/reset` already wipes a replica back to genesis, and it is behind
+        ;; `boot` — so when boot itself is what fails, the route that exists
+        ;; to repair the object cannot be reached. That is what the CPU crash
+        ;; loop looked like from outside: an object that answered nothing,
+        ;; including "throw yourself away".
+        ;;
+        ;; A recovery route must not depend on the state it repairs. This one
+        ;; touches storage and its own flags and nothing else.
+        ;;
+        ;; PAGED, not `deleteAll`. `deleteAll` is one storage operation over
+        ;; however many keys there are, and Cloudflare resets an object whose
+        ;; storage operation runs too long — so on the storage that actually
+        ;; needed wiping it failed with `storage operation exceeded timeout`
+        ;; after sixteen seconds, which is the same shape of bug as the boot
+        ;; replay it was written to rescue. A recovery path that is itself
+        ;; unbounded is not a recovery path.
+        ;;
+        ;; One call deletes what it can inside a small budget and reports what
+        ;; is left; the caller repeats until `remaining` is zero. Progress is
+        ;; durable because the deletes are, so a reset mid-wipe costs one page
+        ;; rather than the whole thing.
+        (.wipePage this)
+        (-> (.boot this w)
+            (.then (fn [_] (.catchUp this)))
+            (.then
+             (fn [done?]
+               (when-not done?
+                 ;; Honest 503 rather than an answer read off a half-folded
+                 ;; log. A terminal that shows a book from a state which never
+                 ;; existed is worse than one that says it is not ready — the
+                 ;; first invites a trade.
+                 (json {:ok false :catching-up true
+                        :witness (.-witness this)
+                        :at (r/height (.-replica this))
+                        :code-version code-version}
+                       503))))
+            (.then
+             (fn [early]
+               (or early
+                   (-> (.rearm this)
+                       (.then
+                        (fn [_]
+                          (case path
+                            "/head"
                (let [s (.-replica this)]
                  (json {:witness (.-witness this)
                         :pubkey (.-pub this)
@@ -1240,7 +1392,7 @@
                         :resting (bk/resting-count (get-in ex [:books market-id]))})
                      200)
 
-               (json {:ok false :reason "not-found"} 404)))))))
+                            (json {:ok false :reason "not-found"} 404))))))))))))
 
   )
 
