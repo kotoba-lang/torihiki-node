@@ -306,6 +306,7 @@
             [inga.attest :as att]
             [inga.consensus :as c]
             [inga.replica :as r]
+            [inga.sync :as isync]
             [inga.wire :as wire]
             [kotoba.bytes.sha256 :as sha]
             [torihiki.address :as addr]
@@ -362,7 +363,7 @@
                                           2 "==" 3 "=" "")]
                                 #js {:privateKey sk :pub (str std pad)})))))))))
 
-(def ^:const code-version "84")
+(def ^:const code-version "85")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -430,6 +431,13 @@
   object is being reset could be a half-written key, and the older one is what
   makes that survivable rather than fatal."
   2)
+
+(defn- blk-key
+  "The storage key for a block. Zero-padded to twelve digits so lexicographic
+  order IS height order — which is what makes `startAfter`, `start` and `end`
+  usable as height cursors."
+  [h]
+  (str "blk:" (.padStart (str h) 12 "0")))
 
 (defn- ckpt-key [h] (str "snap:" (.padStart (str h) 12 "0")))
 
@@ -906,7 +914,58 @@
 
   (ingest2 [this msgs]
     (-> (.verifyTxs this msgs)
-        (.then (fn [_] (.foldMsgs this msgs)))))
+        (.then (fn [_] (.answerSyncRequests this msgs)))
+        ;; `:sync-request` never reaches the replica: this object answers it
+        ;; and `inga.replica` cannot.
+        (.then (fn [_] (.foldMsgs this (remove #(= :sync-request (:type %)) msgs))))))
+
+  ;; Answer a peer's sync request from STORAGE, not from memory.
+  ;;
+  ;; `inga.replica/handle-sync-request` serves `(:chain state)`, and since
+  ;; `resume` bounds that chain to its last few blocks, a replica booted from a
+  ;; checkpoint can serve almost nothing. Measured: a replica reset to genesis
+  ;; sent 49 sync requests, its peers sent back 115 sync responses, and it
+  ;; stayed at height 0 — every response was empty. **A replica that cannot
+  ;; serve history cannot heal its peers**, and the bounded resume that made
+  ;; restarts cheap is what took that away.
+  ;;
+  ;; The blocks were never lost; they are `blk:` keys in this object's own
+  ;; storage. What was missing is that consensus is a pure library and cannot
+  ;; read them. So the read happens here, where the I/O already lives, and the
+  ;; replica is handed a message type it no longer has to answer.
+  ;;
+  ;; Bounded by `inga.sync`'s own `:max-batch`, which is the same cap the
+  ;; in-memory path applied — an unbounded range from a stranger is a request
+  ;; that costs this object everything it holds.
+  (answerSyncRequests [this msgs]
+    (let [reqs (filter #(= :sync-request (:type %)) msgs)]
+      (if (empty? reqs)
+        (js/Promise.resolve nil)
+        (let [cap (:max-batch isync/default-params)]
+          (-> (js/Promise.all
+               (clj->js
+                (for [{:keys [from to]} reqs
+                      :let [from (max 1 (or from 1))
+                            to (max from (or to from))]]
+                  (-> (.list ^js (.-storage do-state)
+                             #js {:prefix "blk:"
+                                  :start (blk-key from)
+                                  :end (blk-key (inc to))
+                                  :limit cap})
+                      (.then (fn [^js entries]
+                               (vec (keep (fn [raw]
+                                            (let [[m _] (wire/decode
+                                                         (js->clj (js/JSON.parse raw)))]
+                                              (:block m)))
+                                          (js/Array.from (.values entries))))))
+                      (.catch (fn [e] (.note! this e) []))))))
+              (.then (fn [^js batches]
+                       (let [out (for [blocks (js/Array.from batches)
+                                       :when (seq blocks)]
+                                   {:to :all
+                                    :msg {:type :sync-response :blocks blocks}})]
+                         (when (seq out) (.queue! this (vec out)))
+                         nil))))))))
 
   (foldMsgs [this msgs]
     (-> (js/Promise.all
@@ -1003,7 +1062,7 @@
              (clj->js
               (for [b new]
                 (.put ^js (.-storage do-state)
-                      (str "blk:" (.padStart (str (:inga.block/height b)) 12 "0"))
+                      (blk-key (:inga.block/height b))
                       (js/JSON.stringify (clj->js (wire/encode {:type :proposal
                                                                 :block b})))))))
             (.then (fn [_] (set! (.-persisted this) (count chain)) nil))))))
