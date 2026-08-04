@@ -6,12 +6,12 @@
   on my laptop' are different claims and only one of them had been made good.
 
   This is one Worker holding four Durable Objects — w1 to w4 — each running
-  `engi.replica` with `torihiki.state` as its machine, exchanging messages
+  `inga.replica` with `torihiki.state` as its machine, exchanging messages
   across isolate boundaries on Cloudflare's network.
 
   ## Why HTTP between them and not WebSockets
 
-  `engi.replica` is transport-agnostic: `on-message` and `on-tick` return an
+  `inga.replica` is transport-agnostic: `on-message` and `on-tick` return an
   outbox and this posts it. A Durable Object can hold WebSocket connections
   and that would cost less per message, but it adds hibernation, reconnection
   and a socket lifecycle to a thing whose point is to show consensus running
@@ -30,7 +30,7 @@
   problem this does not solve. `/head` says so in its own response.
 
   A vote from a witness whose key is not yet known is DROPPED, not deferred:
-  fail closed, the same rule `engi.attest/lookup-verifier` states.
+  fail closed, the same rule `inga.attest/lookup-verifier` states.
 
   ## Messages are queued and flushed once a tick, not dispatched on arrival
 
@@ -82,7 +82,7 @@
   signature before applying a block rather than making `apply-block` async.
 
   A transaction whose signature was never checked verifies as FALSE, never as
-  unknown. Fail closed, the rule `engi.attest/lookup-verifier` states.
+  unknown. Fail closed, the rule `inga.attest/lookup-verifier` states.
 
   The regression that came with this was not in it. Versions 18 to 21 sat at
   height one exchanging new-views forever, and the cause was in engi: a
@@ -177,7 +177,7 @@
   Wasteful, not fatal, and worth fixing by answering the asker instead of the
   room.
 
-  The one that matters is `below-quorum`: `engi.sync` requires a quorum of
+  The one that matters is `below-quorum`: `inga.sync` requires a quorum of
   VERIFIED signatures on the certificate inside a segment, and a replica that
   cannot verify enough of them is refused the block by the check that exists
   to let it in.
@@ -239,7 +239,7 @@
 
   ## /reset, so catching up can actually be tested
 
-  `engi.sync` decides what a replica that has been away may believe from a
+  `inga.sync` decides what a replica that has been away may believe from a
   peer, and until now nothing had made a deployed replica go away. Every
   untested path in this system has turned out to be a broken one, so there is
   a route that wipes one validator back to genesis and lets it try to rejoin.
@@ -256,7 +256,7 @@
   were for the same decision — three votes, three block hashes, one height.
 
   So every adopted block is written to storage and replayed through
-  `engi.replica/replay` on boot. Not re-verified: re-checking is re-litigating
+  `inga.replica/replay` on boot. Not re-verified: re-checking is re-litigating
   a decision this replica already made and recorded, the same distinction the
   sequencer in this repo draws when it replays its transaction log.
 
@@ -279,7 +279,7 @@
   262 alarms, 786 peer fetches, zero messages sent. The absence was the clue:
   nothing throws when a replica has nothing to say.
 
-  `engi.pacemaker` starts with a deadline of 0 and `on-tick` read that as no
+  `inga.pacemaker` starts with a deadline of 0 and `on-tick` read that as no
   clock yet. A replica that never saw a certificate never got a deadline,
   never timed out, never sent a new-view, and therefore never got a
   certificate. In one process the first certificate forms in a millisecond and
@@ -303,10 +303,10 @@
     sleep as soon as the handler resolves, so a write still in flight is a
     tick that never happens."
   (:require [goog.object :as gobj]
-            [engi.attest :as att]
-            [engi.consensus :as c]
-            [engi.replica :as r]
-            [engi.wire :as wire]
+            [inga.attest :as att]
+            [inga.consensus :as c]
+            [inga.replica :as r]
+            [inga.wire :as wire]
             [kotoba.bytes.sha256 :as sha]
             [torihiki.address :as addr]
             [torihiki.auth :as tauth]
@@ -315,7 +315,14 @@
             [torihiki.clearing :as cl]
             [torihiki.state :as st]))
 
-(def ^:const chain-id "torihiki-engi-devnet-1")
+(def ^:const chain-id
+  "**Not renamed when the consensus layer moved to inga, on purpose.**
+
+  A chain id is domain separation: every vote and every transaction envelope
+  signs over it, so changing the string invalidates every signature already on
+  the chain and splits the replicas from their own history. It names a chain,
+  not a library, and this chain was started under that name."
+  "torihiki-engi-devnet-1")
 (def ^:const pkcs8-ed25519-prefix
   "The 16 bytes PKCS8 puts in front of a raw Ed25519 seed. An Ed25519 private
   key IS its 32-byte seed; this header is what `importKey \"pkcs8\"` expects
@@ -354,7 +361,7 @@
                                           2 "==" 3 "=" "")]
                                 #js {:privateKey sk :pub (str std pad)})))))))))
 
-(def ^:const code-version "78")
+(def ^:const code-version "79")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -481,7 +488,7 @@
   Object
   ;; Boot: the witness name, the signing key, and the replica. Everything is
   ;; in memory — this is a devnet and a validator that is evicted rejoins by
-  ;; catching up, which is what engi.sync is for.
+  ;; catching up, which is what inga.sync is for.
   (boot [this name]
     ;; Re-boots when the name it holds is not the name it is being addressed
     ;; by. A Durable Object keeps running the code and the state it started
@@ -574,10 +581,10 @@
                                       :apply-fn
                                       (fn [ex block]
                                         (-> (st/apply-block
-                                         ex {:height (:engi.block/height block)
-                                             :ts (:engi.block/ts block)
+                                         ex {:height (:inga.block/height block)
+                                             :ts (:inga.block/ts block)
                                              :txs (mapv decode-tx
-                                                        (:engi.block/proposals block))}
+                                                        (:inga.block/proposals block))}
                                          {:chain-id chain-id
                                           :verify-fn
                                           (fn [pk payload sig]
@@ -604,7 +611,7 @@
                                                                            {:level (:level f)
                                                                             :qty (:qty f)
                                                                             :side (:taker-side f)
-                                                                            :h (:engi.block/height block)})
+                                                                            :h (:inga.block/height block)})
                                                                          (bk/fills (get-in ex' [:books market-id])))))))))
                                             ;; apply-block resets :rejected
                                             ;; every block, so a fold ends
@@ -764,7 +771,7 @@
 
   ;; Verify everything in a batch, cache the answers, then fold the batch
   ;; synchronously. The rules stay synchronous and the asynchrony stays at the
-  ;; edge — the shape `engi.attest/pending-checks` exists for.
+  ;; edge — the shape `inga.attest/pending-checks` exists for.
   (ingest [this msgs]
     ;; Learn the keys FIRST. A message that arrived before its sender's key
     ;; was known could not be verified, so it was dropped — and a dropped
@@ -806,7 +813,7 @@
      (clj->js
       (for [m msgs
             :when (= :proposal (:type m))
-            raw (:engi.block/proposals (:block m))
+            raw (:inga.block/proposals (:block m))
             :let [env (try (decode-tx raw) (catch :default _ nil))]
             :when (and env (:pubkey env) (:sig env) (integer? (:account env)))
             ]
@@ -871,7 +878,7 @@
              (clj->js
               (for [b new]
                 (.put ^js (.-storage do-state)
-                      (str "blk:" (.padStart (str (:engi.block/height b)) 12 "0"))
+                      (str "blk:" (.padStart (str (:inga.block/height b)) 12 "0"))
                       (js/JSON.stringify (clj->js (wire/encode {:type :proposal
                                                                 :block b})))))))
             (.then (fn [_] (set! (.-persisted this) (count chain)) nil))))))
@@ -1108,7 +1115,7 @@
       ;; three conditions `propose` checks, and which of them said no.
       (let [st (.-replica this)
             tip (r/tip st)
-            th (:engi.block/height tip)
+            th (:inga.block/height tip)
             next-h (inc th)
             certified? (some? (get (:qcs st) (block-hash (c/canonical-block tip))))
             leader (nth witnesses (mod next-h (count witnesses)))
@@ -1142,7 +1149,7 @@
       ;; second time.
       (let [st (.-replica this)
             tip (r/tip st)
-            h (:engi.block/height tip)
+            h (:inga.block/height tip)
             n (inc (or (.-rounds this) 0))]
         (set! (.-rounds this) n)
         ;; Only the PROPOSER, and only every eighth round.
@@ -1153,7 +1160,7 @@
         ;; rescue. A retransmission that costs more than the message it
         ;; replaces is not a retransmission.
         (when (and (pos? h)
-                   (= (:engi.block/proposer tip) (.-witness this))
+                   (= (:inga.block/proposer tip) (.-witness this))
                    (zero? (mod n 8))
                    (nil? (get (:qcs st) (block-hash (c/canonical-block tip)))))
           (.queue! this [{:to :all :msg {:type :proposal :block tip}}])))
@@ -1285,7 +1292,7 @@
                         ;; any transaction has ever reached a block — one
                         ;; question each, and they fail in different places.
                         :pending (count (:pending (.-replica this)))
-                        :txs-in-chain (reduce + 0 (map #(count (:engi.block/proposals %))
+                        :txs-in-chain (reduce + 0 (map #(count (:inga.block/proposals %))
                                                        (:chain (.-replica this))))
                         :sent-types (js->clj (or (.-outtypes this) #js {}))
                         :last-sync-request (or (.-lastsync this) nil)
@@ -1300,7 +1307,7 @@
                         :last-error (or (.-last-error this) nil)
                         :consensus (str (c/quorum-size (count witnesses))
                                         " of " (count witnesses)
-                                        " — chained HotStuff, engi.replica")
+                                        " — chained HotStuff, inga.replica")
                         :key-distribution "trust-on-first-use — a devnet answer, not a real one"
                         :transport "HTTP between Durable Objects, not WebSockets"
                         :tx-auth "signatures checked by torihiki.auth on every replica; public keys are raw Ed25519, base64"
@@ -1358,7 +1365,7 @@
                "/reset"
                ;; Wipe this replica back to genesis. It should rejoin by
                ;; asking its peers for what it missed — which is what
-               ;; engi.sync is for and what nothing had exercised.
+               ;; inga.sync is for and what nothing had exercised.
                (-> (.deleteAll ^js (.-storage do-state))
                    (.then (fn [_]
                             (set! (.-ready this) false)
