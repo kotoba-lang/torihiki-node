@@ -363,7 +363,7 @@
                                           2 "==" 3 "=" "")]
                                 #js {:privateKey sk :pub (str std pad)})))))))))
 
-(def ^:const code-version "87")
+(def ^:const code-version "88")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -659,7 +659,30 @@
                    (set! (.-kp this) k)
                    (set! (.-pub this) (.-pub k))
                    (set! (.-witness this) name)
-                   (set! (.-keys this) #js {})
+                   ;; Its OWN key belongs in the key map.
+                   ;;
+                   ;; The map is filled from peers, and the loop that fills it
+                   ;; skips self — correctly, since asking yourself for your
+                   ;; own key is a round trip to nowhere. The consequence was
+                   ;; not obvious: `verifyCerts` looks every signature's
+                   ;; witness up HERE, finds nothing for itself, and skips the
+                   ;; check; the synchronous verifier then answers from an
+                   ;; empty cache, which means `false`.
+                   ;;
+                   ;; A replica votes on nearly every block of its own
+                   ;; history, so nearly every certificate it is offered while
+                   ;; catching up carries a signature it alone cannot check.
+                   ;; Measured after `/wipe`: w4 was offered blocks 1..256,
+                   ;; adopted none, `below-quorum` at height 4 with
+                   ;; `per-witness {w1 true, w2 true, w4 false}` — it refused
+                   ;; its own signature. **A replica could not rejoin a chain
+                   ;; it had itself helped certify.**
+                   ;;
+                   ;; This is not the self-trust that was deliberately taken
+                   ;; out of `verify-fn`: the signature is verified, with a
+                   ;; public key, by WebCrypto. It is only that the key was
+                   ;; missing from the place the verifier looks.
+                   (set! (.-keys this) (doto #js {} (aset name (.-pub k))))
                    (set! (.-verified this) #js {})
                    (set! (.-delivery this) #js {})
                    (set! (.-why this) #js {})
