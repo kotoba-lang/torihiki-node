@@ -2,13 +2,23 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         org.clojure/clojurescript {:mvn/version "1.11.132"}
         thheller/shadow-cljs {:mvn/version "2.28.20"}
-        ;; The consensus layer. The validator Worker runs engi.replica with
-        ;; torihiki.state as its machine; the sequencer Worker does not use it
-        ;; and pays nothing for it, since shadow-cljs only compiles what is
-        ;; required.
-        io.github.kotoba-lang/engi
-        {:git/url "https://github.com/kotoba-lang/engi.git"
-         :git/sha "d9c531bd4178453478592a04a58d2e39a705f878"}
+        ;; The consensus layer, which is **inga**, not engi.
+        ;;
+        ;; It moved on 2026-08-03 (engi 1f83b16 / ADR-2608038000 D1) and this
+        ;; kept pinning the commit before the move — a sha that is still an
+        ;; ancestor of engi's main, so nothing broke and nothing said anything.
+        ;; The deployed validator was running a consensus layer that no longer
+        ;; exists at that address, which meant every fix made in inga was
+        ;; invisible here, including the bounded `resume` this pin brings in.
+        ;;
+        ;; The validator Worker runs inga.replica with torihiki.state as its
+        ;; machine; the sequencer Worker does not use it and pays nothing for
+        ;; it, since shadow-cljs only compiles what is required. `inga.replica`
+        ;; requires consensus / pacemaker / quorum / attest / stake / sync /
+        ;; wire and NOT `inga.state`, so arrangement does not reach the bundle.
+        io.github.kotoba-lang/inga
+        {:git/url "https://github.com/kotoba-lang/inga.git"
+         :git/sha "844ad1587001029ca31b374d9c00d7eda3ca262e"}
         io.github.kotoba-lang/torihiki
         {:git/url "https://github.com/kotoba-lang/torihiki.git"
          :git/sha "1a7ff9fc3e5e9879806a012f692fe05ae2e2009f"}}}
