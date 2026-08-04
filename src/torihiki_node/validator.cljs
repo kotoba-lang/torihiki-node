@@ -363,7 +363,7 @@
                                           2 "==" 3 "=" "")]
                                 #js {:privateKey sk :pub (str std pad)})))))))))
 
-(def ^:const code-version "86")
+(def ^:const code-version "87")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -993,7 +993,7 @@
         (let [cap (:max-batch isync/default-params)]
           (-> (js/Promise.all
                (clj->js
-                (for [{:keys [from to]} reqs
+                (for [{:keys [from to witness]} reqs
                       :let [from (max 1 (or from 1))
                             to (max from (or to from))]]
                   (-> (.list ^js (.-storage do-state)
@@ -1002,16 +1002,18 @@
                                   :end (blk-key (inc to))
                                   :limit cap})
                       (.then (fn [^js entries]
-                               (vec (keep (fn [raw]
-                                            (let [[m _] (wire/decode
-                                                         (js->clj (js/JSON.parse raw)))]
-                                              (:block m)))
-                                          (js/Array.from (.values entries))))))
-                      (.catch (fn [e] (.note! this e) []))))))
+                               {:to (or witness :all)
+                                :blocks
+                                (vec (keep (fn [raw]
+                                             (let [[m _] (wire/decode
+                                                          (js->clj (js/JSON.parse raw)))]
+                                               (:block m)))
+                                           (js/Array.from (.values entries))))}))
+                      (.catch (fn [e] (.note! this e) {:to :all :blocks []}))))))
               (.then (fn [^js batches]
-                       (let [out (for [blocks (js/Array.from batches)
+                       (let [out (for [{:keys [to blocks]} (js/Array.from batches)
                                        :when (seq blocks)]
-                                   {:to :all
+                                   {:to to
                                     :msg {:type :sync-response :blocks blocks}})]
                          (when (seq out) (.queue! this (vec out)))
                          nil))))))))
@@ -1143,7 +1145,7 @@
       (js/Promise.resolve nil)
       (-> (js/Promise.all
            (clj->js
-            (for [{:keys [msg]} outbox]
+            (for [{:keys [msg to]} outbox]
               (let [payload (case (:type msg)
                               :vote (att/vote-payload chain-id (:view msg) (:height msg)
                                                       (:block-hash msg) (.-witness this))
@@ -1152,13 +1154,13 @@
                                                               (:high-qc msg))
                               nil)]
                 (if-not payload
-                  (js/Promise.resolve msg)
+                  (js/Promise.resolve {:to to :msg msg})
                   (-> (js/crypto.subtle.sign #js {:name "Ed25519"}
                                              (.-privateKey (.-kp this))
                                              (.encode (js/TextEncoder.) payload))
-                      (.then (fn [s] (assoc msg :sig (b64 s))))))))))
-          (.then (fn [signed]
-                   (set! (.-msgs-out this) (+ (or (.-msgs-out this) 0) (count signed)))
+                      (.then (fn [s] {:to to :msg (assoc msg :sig (b64 s))}))))))))
+          (.then (fn [envs]
+                   (set! (.-msgs-out this) (+ (or (.-msgs-out this) 0) (count envs)))
                    ;; Fold our OWN signed messages back in.
                    ;;
                    ;; The replica folds its vote when it produces it, and here
@@ -1172,7 +1174,7 @@
                    ;; Feeding the signed copy back replaces the record with
                    ;; one a peer can check. It is the same vote — same block,
                    ;; same height, same view — so this is not a second vote.
-                   (doseq [m signed
+                   (doseq [{m :msg} envs
                            :when (and (:sig m) (= :vote (:type m)))]
                      ;; Cache our own signature as verified BEFORE folding.
                      ;;
@@ -1196,15 +1198,38 @@
                            true)
                      (let [[s' _] (r/on-message (.-replica this) m (js/Date.now))]
                        (set! (.-replica this) s')))
-                   (let [body (js/JSON.stringify
-                               (clj->js {:msgs (mapv wire/encode signed)}))]
-                     (js/Promise.all
+                   (js/Promise.all
                       (clj->js
                        ;; Delivery is recorded per peer. A message that was
                        ;; sent and a message that arrived are different
                        ;; facts, and every stall so far has been one of them
                        ;; being mistaken for the other.
-                       (for [w witnesses :when (not= w (.-witness this))]
+                       ;;
+                       ;; ## `:to` decides who gets it
+                       ;;
+                       ;; This used to serialise the whole outbox once and
+                       ;; POST that one body to every peer, so `:to` — which
+                       ;; `inga.replica` has always set — did nothing here.
+                       ;; The effect was invisible for votes and proposals,
+                       ;; which are broadcast anyway, and fatal for sync: a
+                       ;; replica far behind received mostly the ANSWERS TO
+                       ;; OTHER REPLICAS, each starting at a height it could
+                       ;; not reach, and refused them one after another.
+                       ;; Measured: a validator at height 0 offered a segment
+                       ;; beginning at 1276 — the range a caught-up peer had
+                       ;; asked about — reporting `:does-not-attach`.
+                       ;;
+                       ;; It was also the whole chain in one request. Three
+                       ;; peers asking at once put three 256-block segments
+                       ;; in a single body sent to all of them.
+                       (for [w witnesses
+                             :when (not= w (.-witness this))
+                             :let [mine (filterv #(let [t (:to %)]
+                                                    (or (nil? t) (= :all t) (= w t)))
+                                                 envs)]
+                             :when (seq mine)
+                             :let [body (js/JSON.stringify
+                                         (clj->js {:msgs (mapv (comp wire/encode :msg) mine)}))]]
                          (-> (.fetch (.get ^js (.-VALIDATOR env)
                                            (.idFromName ^js (.-VALIDATOR env) (do-name w)))
                                      (js/Request. (str "https://v/msg?w=" w)
@@ -1218,7 +1243,7 @@
                                        (let [k (str w ":throw")]
                                          (aset (.-delivery this) k
                                                (inc (or (aget (.-delivery this) k) 0))))
-                                       nil)))))))))
+                                       nil))))))))
           (.then (fn [_] nil)))))
 
   (note! [this e]
