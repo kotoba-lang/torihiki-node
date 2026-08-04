@@ -363,7 +363,7 @@
                                           2 "==" 3 "=" "")]
                                 #js {:privateKey sk :pub (str std pad)})))))))))
 
-(def ^:const code-version "85")
+(def ^:const code-version "86")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -914,10 +914,59 @@
 
   (ingest2 [this msgs]
     (-> (.verifyTxs this msgs)
+        (.then (fn [_] (.verifyCerts this msgs)))
         (.then (fn [_] (.answerSyncRequests this msgs)))
         ;; `:sync-request` never reaches the replica: this object answers it
         ;; and `inga.replica` cannot.
         (.then (fn [_] (.foldMsgs this (remove #(= :sync-request (:type %)) msgs))))))
+
+  ;; Verify the certificates carried INSIDE a sync response, before the
+  ;; replica is asked whether it may adopt them.
+  ;;
+  ;; The verifier this replica hands `inga` is synchronous — it can only be,
+  ;; because `validate-segment` is a pure function — so it answers out of
+  ;; `.-verified`, a cache filled by the ASYNC WebCrypto verification of votes
+  ;; and new-views as they arrive. A certificate that arrives inside a block
+  ;; from a peer was never seen here as votes, so every signature in it is a
+  ;; cache miss, and a cache miss is `false`.
+  ;;
+  ;; That is why catching up failed with `:below-quorum` on segments that were
+  ;; perfectly good: 256 blocks offered, 0 adopted, and the certificates being
+  ;; refused were ones a quorum had actually signed. `verifyTxs` already
+  ;; solved this exact problem for transactions; certificates needed the same
+  ;; treatment and did not have it.
+  ;;
+  ;; `att/pending-checks` produces the `[witness payload sig]` triples the
+  ;; certificate needs checked, so this does not reimplement the payload
+  ;; format — the same reason `client.cljs` calls `torihiki.auth` rather than
+  ;; spelling the signing payload out by hand.
+  (verifyCerts [this msgs]
+    (set! (.-verified this) (or (.-verified this) #js {}))
+    (let [checks (for [m msgs
+                       :when (= :sync-response (:type m))
+                       b (:blocks m)
+                       :let [j (:inga.block/justify b)]
+                       :when j
+                       [w payload sig] (att/pending-checks j chain-id)
+                       :let [pk (aget (.-keys this) (wire/wire-id w))]
+                       :when (and pk payload sig)]
+                   [w payload sig pk])]
+      (if (empty? checks)
+        (js/Promise.resolve nil)
+        (-> (js/Promise.all
+             (clj->js
+              (for [[w payload sig pk] checks]
+                (-> (js/crypto.subtle.importKey "raw" (b64-> pk) #js {:name "Ed25519"}
+                                                false #js ["verify"])
+                    (.then (fn [k] (js/crypto.subtle.verify
+                                    #js {:name "Ed25519"} k (b64-> sig)
+                                    (.encode (js/TextEncoder.) payload))))
+                    (.then (fn [ok]
+                             (aset (.-verified this) (str (wire/wire-id w) "|" payload "|" sig)
+                                   (true? ok))
+                             nil))
+                    (.catch (fn [_] nil))))))
+            (.then (fn [_] nil))))))
 
   ;; Answer a peer's sync request from STORAGE, not from memory.
   ;;
