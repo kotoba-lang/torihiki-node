@@ -362,7 +362,7 @@
                                           2 "==" 3 "=" "")]
                                 #js {:privateKey sk :pub (str std pad)})))))))))
 
-(def ^:const code-version "80")
+(def ^:const code-version "81")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
