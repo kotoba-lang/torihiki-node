@@ -19,6 +19,11 @@
         io.github.kotoba-lang/inga
         {:git/url "https://github.com/kotoba-lang/inga.git"
          :git/sha "28631ff0fc5f4c672913b27955d88dafe0ea5464"}
+        ;; The candle fold. The terminal draws from the same library, so
+        ;; `/candles` and the chart cannot disagree about what a candle is.
+        io.github.kotoba-lang/torihiki-chart
+        {:git/url "https://github.com/kotoba-lang/torihiki-chart.git"
+         :git/sha "80ab3d78ee3896c40d050c025c229be23450e584"}
         io.github.kotoba-lang/torihiki
         {:git/url "https://github.com/kotoba-lang/torihiki.git"
          :git/sha "4faead84aaf11ec16ec721088719472f9df45941"}}}
