@@ -26,4 +26,4 @@
          :git/sha "80ab3d78ee3896c40d050c025c229be23450e584"}
         io.github.kotoba-lang/torihiki
         {:git/url "https://github.com/kotoba-lang/torihiki.git"
-         :git/sha "7313f4776bd1bef63e78b72b0828021ea12c791a"}}}
+         :git/sha "fa3a8e0cc213c8d2a11f7e521b3e38007749d83c"}}}

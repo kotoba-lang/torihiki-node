@@ -363,7 +363,7 @@
                                           2 "==" 3 "=" "")]
                                 #js {:privateKey sk :pub (str std pad)})))))))))
 
-(def ^:const code-version "91")
+(def ^:const code-version "92")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -474,9 +474,54 @@
          :taker-fee-rate 350000
          :maker-fee-rate 100000))
 
+(def ^:const bridge-name
+  "What the faucet's key is derived from. Part of the derivation, so changing
+  it changes the account and orphans every deposit the old one made."
+  "faucet")
+
+(def ^:const faucet-grant
+  "One grant, in cents. Matches what the terminal's button has always said."
+  10000000)
+
+;; The bridge's account id, resolved once at boot.
+;;
+;; `genesis` has to be synchronous — it is the machine's `:init-fn` — and the
+;; account id is `addr/derive` of a public key that only WebCrypto can produce.
+;; So `boot` resolves it before it builds the replica, and this holds it.
+;;
+;; Every replica derives the SAME key from the chain id and the name above, so
+;; they all reach the same bridge without being told what it is. That is what
+;; keeps this out of consensus: a bridge that had to be configured could be
+;; configured differently on one replica, and that replica would accept
+;; deposits the others refused while agreeing on every block.
+;;
+;; (`defonce` takes no docstring in ClojureScript.)
+(defonce faucet-account (atom nil))
+
 (defn genesis []
   (-> (st/new-exchange {:market market
-                        :book-opts {:n-levels 65536 :cap 16384 :ev-cap 8192}})
+                        :book-opts {:n-levels 65536 :cap 16384 :ev-cap 8192}
+                        ;; Collateral has an issuer.
+                        ;;
+                        ;; Before this it had none: `:bridge-authority` was
+                        ;; nil, so `api/validate` let ANY account deposit ANY
+                        ;; amount to itself. Every balance was minted by
+                        ;; whoever wanted it, and the clearinghouse's
+                        ;; arithmetic — margin, liquidation, the insurance
+                        ;; fund — was exact about a quantity that could be
+                        ;; conjured, which is the kind of wrong where every
+                        ;; individual number is right.
+                        ;;
+                        ;; The owner chose (2026-08-05) the chain's own
+                        ;; certificate over an external asset: the issuer is a
+                        ;; key, the certificate is its signature on the
+                        ;; deposit — already verified by every replica and
+                        ;; already replay-protected by the same strictly
+                        ;; sequential nonce as every other transaction — and
+                        ;; `/faucet` is the only thing that holds it.
+                        :bridge-authority
+                        (or @faucet-account
+                            (throw (js/Error. "genesis before the faucet key")))})
       (st/apply-tx {:tx :oracle :market market-id :price 1000})))
 
 (defn- decode-tx [s]
@@ -598,6 +643,61 @@
                                                                    (:rejected ex'))))))
                                       :root-fn st/state-root}})
 
+  ;; The bridge's keypair, derived and cached.
+  ;;
+  ;; Derived from the chain id and a fixed name, exactly like the witness keys
+  ;; above and for the same reason: every replica needs the same one, and a
+  ;; generated key would make each object a different bridge. The same devnet
+  ;; caveat applies and is written down rather than hidden — anybody who knows
+  ;; the chain id can compute this key and mint. It is a devnet whose
+  ;; collateral is minted on request by design; what changed is that the
+  ;; minting now has ONE issuer whose signature is on every unit, rather than
+  ;; none at all.
+  ;;
+  ;; A real deployment replaces this with a key it does not derive, and
+  ;; nothing else here changes.
+  (faucetKey [this]
+    (if (.-fkp this)
+      (js/Promise.resolve (.-fkp this))
+      (-> (derive-keypair chain-id bridge-name)
+          (.then (fn [^js k]
+                   (set! (.-fkp this) k)
+                   (reset! faucet-account (addr/derive (.-pub k)))
+                   k)))))
+
+  ;; Sign a deposit as the bridge and put it into consensus.
+  ;;
+  ;; The transaction goes through `r/submit` like any other — it is not
+  ;; applied here. A faucet that credited an account locally would be this
+  ;; replica inventing collateral the other three never agreed to, which is
+  ;; the failure the bridge exists to make impossible.
+  (faucetGrant [this account]
+    (-> (.faucetKey this)
+        (.then (fn [^js k]
+                 (let [ex (:machine-state (.-replica this))
+                       bridge @faucet-account
+                       nonce (tauth/expected-nonce ex bridge)
+                       tx {:tx :deposit :account bridge :credit account
+                           :amount faucet-grant}
+                       payload (tauth/signing-payload chain-id bridge nonce tx)]
+                   (-> (js/crypto.subtle.sign #js {:name "Ed25519"}
+                                              (.-privateKey k)
+                                              (.encode (js/TextEncoder.) payload))
+                       (.then (fn [sig]
+                                (let [env {:tx tx :account bridge :nonce nonce
+                                           :pubkey (.-pub k) :sig (b64 sig)}
+                                      body (js/JSON.stringify (clj->js env))]
+                                  ;; Cached as verified for the same reason a
+                                  ;; replica caches its own vote: this Worker
+                                  ;; produced the signature a moment ago with
+                                  ;; the key it derived, and asking WebCrypto
+                                  ;; again would be re-answering a question it
+                                  ;; just answered.
+                                  (aset (or (.-txok this) (set! (.-txok this) #js {}))
+                                        (str (.-pub k) "|" payload "|" (b64 sig)) true)
+                                  (set! (.-replica this) (r/submit (.-replica this) body))
+                                  {:queued true :bridge bridge :nonce nonce}))))))))) 
+
   (boot [this name]
     ;; Re-boots when the name it holds is not the name it is being addressed
     ;; by. A Durable Object keeps running the code and the state it started
@@ -607,7 +707,11 @@
     ;; the mismatch cleared it.
     (if (and (.-ready this) (= (.-witness this) name))
       (js/Promise.resolve nil)
-      (-> (.get ^js (.-storage do-state) "key")
+      (-> (.faucetKey this)
+          ;; BEFORE the storage read, because everything after it can reach
+          ;; `genesis`, and `genesis` throws without the bridge account. A
+          ;; boot order that works by accident is one deploy away from not.
+          (.then (fn [_] (.get ^js (.-storage do-state) "key")))
           (.then (fn [stored]
                    ;; The key is PERSISTED, not regenerated.
                    ;;
@@ -1643,6 +1747,37 @@
                                                           :account (:account env)} 200))
                                                (json {:ok false
                                                       :reason "bad-signature"} 401))))))))))
+
+               ;; Ask the bridge for collateral. The only way to get any.
+               ;;
+               ;; Refused once the account already holds some: a devnet faucet
+               ;; that answers every time is a mint with extra steps, and the
+               ;; point of giving collateral an issuer was to stop that.
+               "/faucet"
+               (if-not (= "POST" (.-method request))
+                 (json {:ok false :reason "method"} 405)
+                 (-> (.text request)
+                     (.then (fn [t]
+                              (let [m (try (js->clj (js/JSON.parse t) :keywordize-keys true)
+                                           (catch :default _ nil))
+                                    acct (:account m)
+                                    ex (:machine-state (.-replica this))]
+                                (cond
+                                  (not (integer? acct))
+                                  (js/Promise.resolve
+                                   (json {:ok false :reason "bad-account"} 400))
+
+                                  (pos? (get-in ex [:clearing :accounts acct :collateral] 0))
+                                  (js/Promise.resolve
+                                   (json {:ok false :reason "already-funded"
+                                          :note "the bridge grants once per account"} 409))
+
+                                  :else
+                                  (-> (.faucetGrant this acct)
+                                      (.then (fn [r]
+                                               (json (merge {:ok true :account acct
+                                                             :amount faucet-grant} r)
+                                                     200))))))))))
 
                "/account"
                (let [ex (:machine-state (.-replica this))
