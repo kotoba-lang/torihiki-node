@@ -379,7 +379,7 @@
 ;; the validator set, and a dead one in the file is a live one after the next
 ;; refactor that "restores a fallback".
 
-(def ^:const code-version "97")
+(def ^:const code-version "98")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -1295,11 +1295,30 @@
   ;; spelling the signing payload out by hand.
   (verifyCerts [this msgs]
     (set! (.-verified this) (or (.-verified this) #js {}))
-    (let [checks (for [m msgs
-                       :when (= :sync-response (:type m))
-                       b (:blocks m)
-                       :let [j (:inga.block/justify b)]
-                       :when j
+    (let [;; Every certificate that ARRIVES inside a message, from either
+          ;; place it can arrive.
+          ;;
+          ;; `:sync-response` was fixed first, and the same hole was left in
+          ;; `:new-view` — where it is worse. `inga.replica/handle-new-view`
+          ;; verifies the `high-qc` a new-view carries, with this same
+          ;; synchronous cache, and REJECTS the whole message when it does not
+          ;; verify. A replica that just restarted has seen none of the votes
+          ;; in that certificate, so every check is a cache miss, so every
+          ;; new-view is dropped — and `sync-view`, the thing that exists to
+          ;; pull a drifted replica back, is only reached by a new-view that
+          ;; was accepted.
+          ;;
+          ;; Measured: w4 restarted, received 212 new-views, verified 216
+          ;; signatures, and sat at view 16 while its peers passed 92 —
+          ;; advancing one view per timeout, alone, forever. It was the leader,
+          ;; so the chain stopped at height 2. That is the shape of every halt
+          ;; recorded in S14; this is why they happened.
+          certs (concat
+                 (for [m msgs :when (= :sync-response (:type m))
+                       b (:blocks m) :let [j (:inga.block/justify b)] :when j] j)
+                 (for [m msgs :when (= :new-view (:type m))
+                       :let [j (:high-qc m)] :when j] j))
+          checks (for [j certs
                        [w payload sig] (att/pending-checks j chain-id)
                        :let [pk (aget (.-keys this) (wire/wire-id w))]
                        :when (and pk payload sig)]
