@@ -48,8 +48,13 @@
   expensive way: twice in one session a fix was deployed, verified present in
   the bundle, and then contradicted by the live endpoint, which was still
   running the previous build. Without a marker there is nothing to check."
-  "9")
+  "10")
 (def ^:const market-id 1)
+
+(def ^:const tape-size
+  "Recent fills kept for `/trades`. A view, not history — `/candles` is where
+  history lives."
+  200)
 
 (def ^:const candle-retention
   "How many BLOCK CANDLES the sequencer keeps.
@@ -139,7 +144,13 @@
 
 (deftype Sequencer [^js do-state ^js env]
   Object
-  ;; One block, at most one candle.
+  ;; Both views of the fills — the tape and the candles — from ONE place.
+  ;;
+  ;; They were not: the tape was built in `submit` only, so a cold start
+  ;; replayed the log, rebuilt the candles, and left `/trades` EMPTY while
+  ;; `/candles` showed history. Observed on the first deploy of `/candles`:
+  ;; height 57, eight candles, zero trades. Two endpoints reading the same
+  ;; fills disagreed about whether any had happened.
   ;;
   ;; The fold itself is `torihiki-chart.candle/absorb` — deliberately NOT
   ;; reimplemented here. The terminal draws candles from the same library, and
@@ -148,6 +159,18 @@
   (noteFills [this ex h]
     (let [fills (bk/fills (get-in ex [:books market-id]))]
       (when (seq fills)
+        ;; The tape: a bounded ring of recent fills. The engine's event buffer
+        ;; is reset every block, so a terminal that wanted a tape had nowhere
+        ;; to read one — and replaying the log on every poll would make a read
+        ;; cost what a cold start costs. A view, not history.
+        (set! (.-tape this)
+              (into (vec (take-last tape-size
+                                    (concat (or (.-tape this) [])
+                                            (map (fn [f] {:level (:level f) :qty (:qty f)
+                                                          :side (:taker-side f) :h h})
+                                                 fills))))
+                    []))
+        ;; One block, at most one candle.
         (let [c (reduce (fn [c f]
                           (cndl/absorb c {:level (:level f) :qty (:qty f)
                                           :side (cndl/normalize-side (:taker-side f))}))
@@ -243,23 +266,6 @@
                        (set! (.-ex this) ex')
                        (set! (.-height this) h)
                        (.noteFills this ex' h)
-                       ;; A bounded ring of recent fills. The engine's event
-                       ;; buffer is reset every block, so a terminal that
-                       ;; wanted a tape had nowhere to read one — and the
-                       ;; alternative, replaying the log on every poll, would
-                       ;; make a read cost what a cold start costs. Bounded on
-                       ;; purpose: this is a view, not history. History is the
-                       ;; log, and a client that needs it replays.
-                       (set! (.-tape this)
-                             (into (vec (take-last 200
-                                          (concat (or (.-tape this) [])
-                                                  (map (fn [f]
-                                                         {:level (:level f)
-                                                          :qty (:qty f)
-                                                          :side (:taker-side f)
-                                                          :h h})
-                                                       (bk/fills (get-in ex' [:books market-id]))))))
-                                   []))
                        (-> (.put ^js (.-storage do-state)
                                  (str "tx:" (.padStart (str h) 12 "0"))
                                  (js/JSON.stringify (clj->js entry)))
@@ -328,7 +334,20 @@
                      :retained-from (when (seq arr) (:h (first arr)))
                      :retained-blocks (count arr)
                      :retention candle-retention
-                     :truncated (boolean (and floor (> (:h (first arr)) floor)))}))
+                     ;; True when the window asked for starts before anything
+                     ;; this node can see. WHY it cannot see further is a
+                     ;; different fact and is reported separately — a full
+                     ;; ring means retention dropped the rest, a short one
+                     ;; means there was never more to drop (a young node, or
+                     ;; one whose log does not reach back that far). One
+                     ;; boolean covering both reads as data loss every time a
+                     ;; fresh node is asked a wide question.
+                     :truncated (boolean (and floor (> (:h (first arr)) floor)))
+                     :truncated-because
+                     (when (and floor (> (:h (first arr)) floor))
+                       (if (>= (count arr) candle-retention)
+                         "retention"
+                         "no-older-blocks"))}))
                  "/head" (json-response
                           {:chain-id chain-id
                            :code-version code-version
