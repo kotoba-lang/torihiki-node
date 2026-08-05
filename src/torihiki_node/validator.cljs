@@ -335,37 +335,51 @@
   #js [0x30 0x2e 0x02 0x01 0x00 0x30 0x05 0x06 0x03 0x2b 0x65 0x70
        0x04 0x22 0x04 0x20])
 
-(defn- derive-keypair
-  "The keypair `witness` has on `chain`, the same one every time.
+(defn- keypair-from-seed
+  "A keypair from a 32-byte Ed25519 seed (base64). Returns a promise of
+  `#js {:privateKey k :pub b64}`.
 
-  See the call site for why this is derived rather than generated. Returns a
-  promise of `#js {:privateKey k :pub b64}`."
-  [chain witness]
-  (let [seed-src (.encode (js/TextEncoder.) (str chain "|" witness "|ed25519"))]
-    (-> (js/crypto.subtle.digest "SHA-256" seed-src)
-        (.then (fn [d]
-                 (let [seed (js/Uint8Array. d)
-                       pk (js/Uint8Array. 48)]
-                   (.set pk (js/Uint8Array.from pkcs8-ed25519-prefix) 0)
-                   (.set pk seed 16)
-                   (js/crypto.subtle.importKey "pkcs8" pk #js {:name "Ed25519"}
-                                               true #js ["sign"]))))
+  Replaces `derive-keypair`, which built the seed by hashing the chain id and
+  a witness name. That function is GONE rather than kept as a fallback: a
+  fallback to a publicly computable key is the same hole with a condition in
+  front of it, and the condition — a missing secret — is the state a fresh
+  deployment is in."
+  [seed-b64]
+  (let [bin (js/atob seed-b64)
+        seed (js/Uint8Array. (.-length bin))
+        _ (dotimes [i (.-length bin)] (aset seed i (.charCodeAt bin i)))
+        pk (js/Uint8Array. 48)]
+    (when (not= 32 (.-length seed))
+      (throw (js/Error. "seed is not 32 bytes")))
+    (.set pk (js/Uint8Array.from pkcs8-ed25519-prefix) 0)
+    (.set pk seed 16)
+    (-> (js/crypto.subtle.importKey "pkcs8" pk #js {:name "Ed25519"} true #js ["sign"])
         (.then (fn [sk]
-                 ;; The public half is not derivable from the private key
-                 ;; through WebCrypto, so it is carried by jwk round trip:
-                 ;; export the private key as jwk, and its "x" member IS the
-                 ;; public key, base64url. Converted to the standard base64
-                 ;; every peer already exchanges.
                  (-> (js/crypto.subtle.exportKey "jwk" sk)
                      (.then (fn [^js j]
                               (let [x (aget j "x")
                                     std (-> x (.replace (js/RegExp. "-" "g") "+")
                                             (.replace (js/RegExp. "_" "g") "/"))
-                                    pad (case (mod (.-length std) 4)
-                                          2 "==" 3 "=" "")]
+                                    pad (case (mod (.-length std) 4) 2 "==" 3 "=" "")]
                                 #js {:privateKey sk :pub (str std pad)})))))))))
 
-(def ^:const code-version "96")
+(defn- secret-keypair
+  "The keypair whose seed is in `<NAME>_KEY`. Refuses rather than falls back."
+  [^js env name]
+  (let [v (aget env (str (.toUpperCase name) "_KEY"))]
+    (if (and (string? v) (pos? (.-length v)))
+      (keypair-from-seed v)
+      (js/Promise.reject
+       (js/Error. (str "no secret for " name " — set " (.toUpperCase name) "_KEY"))))))
+
+
+;; `derive-keypair` used to live here: it hashed the chain id and a witness
+;; name into a seed. It is DELETED, not disabled. The chain id is printed by
+;; `/head`, so that function was a public constructor for every private key in
+;; the validator set, and a dead one in the file is a live one after the next
+;; refactor that "restores a fallback".
+
+(def ^:const code-version "97")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -414,6 +428,34 @@
   ;; does not run. The engi measurement stands; this deployment keeps four
   ;; until the three silent replicas are explained.
   ["w1" "w2" "w3" "w4"])
+
+(def validator-keys
+  "The public half of the validator set, and of the bridge. **Genesis data.**
+
+  Before this, every key was DERIVED from the chain id and a name — and the
+  chain id is printed by `/head`. Demonstrated against the live deployment:
+  deriving from public information reproduced all four validators' published
+  public keys exactly, which means anybody could compute all four PRIVATE
+  keys, forge four votes, and manufacture a certificate. The BFT guarantee was
+  zero, and the page said `4 replicas, agreeing`.
+
+  The private halves are now Worker secrets (`W1_KEY` … `BRIDGE_KEY`, each the
+  32-byte Ed25519 seed, base64). Nothing derives them and nothing prints them.
+
+  ## Why the public keys live HERE and not in a first-use exchange
+
+  Peers used to learn each other's keys from `/head` — trust on first use,
+  which is fine when the key was derivable anyway (there was nothing to
+  impersonate) and is the weak point the moment keys are real: whoever answers
+  first is believed. A validator set is exactly the thing a chain must know
+  before it starts, so it is genesis data, in the source, reviewed with it."
+  {"w1" "futt80Tbbqc50hej5X7xqWjG0oFLy3yrBAHDrOA0td0="
+   "w2" "K8ZA5PssVguLJcRZjzHzZ+vCQQJoLl5VRJ76gbxTqCk="
+   "w3" "iRNrRiAbOb8+HoTkDF63Xp6B1zFB1QApNiSPzb5P/gQ="
+   "w4" "GD3mDeP0zFMnyzCQpz+09+LWcoQcrdL4EvcV9jpZFqM="})
+
+(def ^:const bridge-pubkey
+  "jmBeKHD9Pb6GYmlFUfnFwfoci+pSE5rZ+ALlAfnP00o=")
 (def ^:const checkpoint-every
   "Write a checkpoint every N committed blocks.
 
@@ -764,10 +806,11 @@
   (faucetKey [this]
     (if (.-fkp this)
       (js/Promise.resolve (.-fkp this))
-      (-> (derive-keypair chain-id bridge-name)
+      (-> (secret-keypair env bridge-name)
           (.then (fn [^js k]
+                   (when (not= bridge-pubkey (.-pub k))
+                     (throw (js/Error. "bridge key mismatch — the secret is not the one in genesis")))
                    (set! (.-fkp this) k)
-                   (reset! faucet-account (addr/derive (.-pub k)))
                    k)))))
 
   ;; Every witness's account id, computed locally.
@@ -777,14 +820,15 @@
   ;; to have heard would not be. It is the same derivation each object already
   ;; runs for its own key.
   (publisherSet [this]
-    (if (seq @publisher-accounts)
-      (js/Promise.resolve @publisher-accounts)
-      (-> (js/Promise.all
-           (clj->js (for [w witnesses] (derive-keypair chain-id w))))
-          (.then (fn [^js ks]
-                   (reset! publisher-accounts
-                           (set (map #(addr/derive (.-pub ^js %))
-                                     (js/Array.from ks))))))))) 
+    ;; No crypto and no promise: the public keys are genesis data, so the
+    ;; accounts are a pure function of the source every replica compiles.
+    ;; They used to be derived, which meant four key imports at every boot to
+    ;; recompute something that was already a constant.
+    (js/Promise.resolve
+     (do (reset! publisher-accounts
+                 (set (map (fn [w] (addr/derive (get validator-keys w))) witnesses)))
+         (reset! faucet-account (addr/derive bridge-pubkey))
+         @publisher-accounts))) 
 
   ;; Sign a deposit as the bridge and put it into consensus.
   ;;
@@ -850,12 +894,12 @@
     ;; the mismatch cleared it.
     (if (and (.-ready this) (= (.-witness this) name))
       (js/Promise.resolve nil)
-      (-> (.faucetKey this)
+      (-> (.publisherSet this)
           ;; BEFORE the storage read, because everything after it can reach
           ;; `genesis`, and `genesis` throws without the bridge account and
           ;; the publisher set. A boot order that works by accident is one
           ;; deploy away from not.
-          (.then (fn [_] (.publisherSet this)))
+          (.then (fn [_] (.faucetKey this)))
           (.then (fn [_] (.get ^js (.-storage do-state) "key")))
           (.then (fn [stored]
                    ;; The key is PERSISTED, not regenerated.
@@ -903,8 +947,22 @@
                    ;; written down rather than hidden because the deployment
                    ;; is a devnet with mintable collateral and the alternative
                    ;; is a chain that cannot agree at all.
-                   (derive-keypair chain-id name)))
+                   ;; NOW: the seed comes from a Worker secret, and the
+                   ;; public half is in `validator-keys` where the review that
+                   ;; approves a validator set can see it. Derivation is gone
+                   ;; — see `keypair-from-seed` for why it is not kept as a
+                   ;; fallback.
+                   (secret-keypair env name)))
           (.then (fn [^js k]
+                   (when-let [expect (get validator-keys name)]
+                     (when (not= expect (.-pub k))
+                       ;; The secret and the genesis set disagree. Refusing is
+                       ;; the only safe answer: this object would sign as a
+                       ;; witness its peers will not recognise, and every vote
+                       ;; it sent would be dropped as `did-not-verify` — the
+                       ;; failure that reads as a network problem and is not.
+                       (throw (js/Error. (str "key mismatch for " name
+                                              " — the secret is not the one in genesis")))))
                    (set! (.-kp this) k)
                    (set! (.-pub this) (.-pub k))
                    (set! (.-witness this) name)
@@ -931,7 +989,14 @@
                    ;; out of `verify-fn`: the signature is verified, with a
                    ;; public key, by WebCrypto. It is only that the key was
                    ;; missing from the place the verifier looks.
-                   (set! (.-keys this) (doto #js {} (aset name (.-pub k))))
+                   ;; Every validator's key, from genesis — not from
+                   ;; whoever answered `/head` first. Trust-on-first-use was
+                   ;; harmless while keys were derivable (there was nothing to
+                   ;; impersonate) and is the weak point the moment they are
+                   ;; real.
+                   (set! (.-keys this)
+                         (reduce (fn [o [w pub]] (doto o (aset w pub)))
+                                 #js {} validator-keys))
                    (set! (.-verified this) #js {})
                    (set! (.-delivery this) #js {})
                    (set! (.-why this) #js {})
@@ -1134,6 +1199,11 @@
       ;; A key that is wrong is still indistinguishable from a peer that is
       ;; silent, and re-asking is still the answer — but from the tick, on a
       ;; schedule, not from the path that runs once per message.
+      ;; Nothing to ask for any more: `validator-keys` has them. Kept as a
+      ;; loop over an empty set rather than deleted, because the SHAPE of
+      ;; "learn the keys you do not have" is what a real validator set update
+      ;; would use, and because deleting the field would hide that the map is
+      ;; now filled at boot.
       (for [w witnesses :when (and (not= w (.-witness this))
                                    (not (aget (.-keys this) w)))]
         (-> (.fetch (.get ^js (.-VALIDATOR env)
