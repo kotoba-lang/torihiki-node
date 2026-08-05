@@ -33,7 +33,8 @@
             [torihiki.auth :as auth]
             [torihiki.api :as api]
             [torihiki.address :as addr]
-            [torihiki.book :as bk]))
+            [torihiki.book :as bk]
+            [torihiki-chart.candle :as cndl]))
 
 (def ^:const chain-id "torihiki-devnet-1")
 
@@ -47,8 +48,29 @@
   expensive way: twice in one session a fix was deployed, verified present in
   the bundle, and then contradicted by the live endpoint, which was still
   running the previous build. Without a marker there is nothing to check."
-  "8")
+  "9")
 (def ^:const market-id 1)
+
+(def ^:const candle-retention
+  "How many BLOCK CANDLES the sequencer keeps.
+
+  Only blocks that traded produce one, so this is a count of active blocks,
+  not of height. At the devnet's rate it is hours of trading; on a quiet
+  market it is much longer.
+
+  ## Why they are not written to storage
+
+  This file's own docstring says of the exchange: *replaying the log IS the
+  state, so there is no second encoding to keep in sync.* Candles are a fold
+  of the same log, and persisting them would be exactly that second encoding
+  — one that can disagree with the log after a bad deploy, and that has to be
+  migrated whenever the fold changes. Rebuilt on the cold start that already
+  replays the log, they cannot disagree with it.
+
+  What that costs, stated rather than hidden: an eviction loses candles older
+  than the log's own horizon, and `/candles` says how far back it can actually
+  see rather than implying it sees everything."
+  10000)
 
 (def market
   (assoc (cl/market {:id market-id :max-leverage 40 :tick 10 :lot 1})
@@ -117,6 +139,24 @@
 
 (deftype Sequencer [^js do-state ^js env]
   Object
+  ;; One block, at most one candle.
+  ;;
+  ;; The fold itself is `torihiki-chart.candle/absorb` — deliberately NOT
+  ;; reimplemented here. The terminal draws candles from the same library, and
+  ;; two folds that are supposed to agree eventually will not: when the chart
+  ;; and the endpoint disagree there is no way to say which one is lying.
+  (noteFills [this ex h]
+    (let [fills (bk/fills (get-in ex [:books market-id]))]
+      (when (seq fills)
+        (let [c (reduce (fn [c f]
+                          (cndl/absorb c {:level (:level f) :qty (:qty f)
+                                          :side (cndl/normalize-side (:taker-side f))}))
+                        nil fills)
+              arr (or (.-candles this) (array))]
+          (.push arr (assoc c :h h))
+          (when (> (.-length arr) candle-retention) (.shift arr))
+          (set! (.-candles this) arr)))))
+
   (ensureLoaded [this]
     (if (.-loaded this)
       (js/Promise.resolve nil)
@@ -139,12 +179,16 @@
                    ;; injected verifier accepts: these signatures were already
                    ;; verified when they were accepted.
                    [ex h] (reduce (fn [[e h] entry]
-                                    (let [h (inc h)]
-                                      [(st/apply-block e {:height h :ts (* h 1000)
-                                                          :txs [entry]}
-                                                       {:chain-id chain-id
-                                                        :verify-fn (constantly true)})
-                                       h]))
+                                    (let [h (inc h)
+                                          e' (st/apply-block e {:height h :ts (* h 1000)
+                                                                :txs [entry]}
+                                                             {:chain-id chain-id
+                                                              :verify-fn (constantly true)})]
+                                      ;; Candles are rebuilt HERE rather than
+                                      ;; read back from storage — see
+                                      ;; `candle-retention`.
+                                      (.noteFills this e' h)
+                                      [e' h]))
                                   [(genesis) 0]
                                   txs)]
                (set! (.-ex this) ex)
@@ -198,6 +242,7 @@
                      (do
                        (set! (.-ex this) ex')
                        (set! (.-height this) h)
+                       (.noteFills this ex' h)
                        ;; A bounded ring of recent fills. The engine's event
                        ;; buffer is reset every block, so a terminal that
                        ;; wanted a tape had nowhere to read one — and the
@@ -249,6 +294,41 @@
                              :trades (vec (reverse (take-last
                                                     (js/parseInt (or (q "n") "20"))
                                                     (or (.-tape this) []))))})
+                 ;; Block candles. `span` is in BLOCKS, and the response says
+                 ;; so — the engine has no wall clock (`torihiki`'s README:
+                 ;; logical time arrives in the block header), so a minute
+                 ;; candle would have to be manufactured from a truth that
+                 ;; does not exist here.
+                 ;;
+                 ;; Stored at one-block granularity and folded up on request,
+                 ;; so the span is chosen by the caller rather than frozen at
+                 ;; write time. `rebucket`'s boundaries are absolute, so this
+                 ;; returns what folding the raw tape would have returned.
+                 "/candles"
+                 (let [span (max 1 (or (js/parseInt (or (q "span") "10")) 1))
+                       n (max 1 (min 1000 (or (js/parseInt (or (q "n") "200")) 200)))
+                       arr (vec (or (.-candles this) []))
+                       floor (when (seq arr)
+                               (- (cndl/bucket span (:h (peek arr)))
+                                  (* span (dec n))))
+                       ;; Only the tail the caller asked for is folded. The
+                       ;; cut is on a bucket boundary, so the oldest candle
+                       ;; returned is whole rather than a fragment of one.
+                       window (if floor (filterv #(>= (:h %) floor) arr) [])
+                       cs (cndl/rebucket span window)]
+                   (json-response
+                    {:market market-id
+                     :span span
+                     :unit "blocks"
+                     :candles cs
+                     ;; What this node can actually see. Candles live in
+                     ;; memory and are rebuilt by the cold-start replay, so
+                     ;; the horizon is real and stating it is the difference
+                     ;; between a gap and a lie.
+                     :retained-from (when (seq arr) (:h (first arr)))
+                     :retained-blocks (count arr)
+                     :retention candle-retention
+                     :truncated (boolean (and floor (> (:h (first arr)) floor)))}))
                  "/head" (json-response
                           {:chain-id chain-id
                            :code-version code-version
