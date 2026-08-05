@@ -49,7 +49,7 @@
   expensive way: twice in one session a fix was deployed, verified present in
   the bundle, and then contradicted by the live endpoint, which was still
   running the previous build. Without a marker there is nothing to check."
-  "11")
+  "12")
 (def ^:const market-id 1)
 
 (def ^:const tape-size
