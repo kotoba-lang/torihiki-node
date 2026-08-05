@@ -34,6 +34,7 @@
             [torihiki.api :as api]
             [torihiki.address :as addr]
             [torihiki.book :as bk]
+            [torihiki.commit :as cm]
             [torihiki-chart.candle :as cndl]))
 
 (def ^:const chain-id "torihiki-devnet-1")
@@ -48,7 +49,7 @@
   expensive way: twice in one session a fix was deployed, verified present in
   the bundle, and then contradicted by the live endpoint, which was still
   running the previous build. Without a marker there is nothing to check."
-  "10")
+  "11")
 (def ^:const market-id 1)
 
 (def ^:const tape-size
@@ -348,6 +349,41 @@
                        (if (>= (count arr) candle-retention)
                          "retention"
                          "no-older-blocks"))}))
+                 ;; An inclusion proof for one account's balance.
+                 ;;
+                 ;; The endpoint is the point. `torihiki.commit` can produce
+                 ;; the proof, but until something serves it, "a light client
+                 ;; can verify one balance without replaying the chain" is a
+                 ;; property of a library rather than of this chain.
+                 ;;
+                 ;; The response carries the leaf BYTES, not just its hash: a
+                 ;; verifier handed a hash proves that some preimage is in the
+                 ;; tree, which is not the question anyone is asking. It also
+                 ;; carries the root this node believes — not to be trusted,
+                 ;; but so the client can see what it is disagreeing with when
+                 ;; its own trusted root differs.
+                 "/proof"
+                 (let [a (js/parseInt (or (q "account") "-1"))
+                       p (cm/proof (st/canonical-leaves ex) (cm/account-leaf-id a))]
+                   (if p
+                     (json-response
+                      {:account a
+                       :height (.-height this)
+                       :leaf-id (:id p)
+                       :leaf-bytes (:bytes p)
+                       :proof (:proof p)
+                       :state-root (:root p)
+                       ;; The pre-tree digest, for anyone holding one from
+                       ;; before the tree landed.
+                       :flat-root (st/flat-root ex)})
+                     ;; Absence is reported, not proved. A sorted-tree
+                     ;; construction could prove non-membership; this is not
+                     ;; one, and saying "no such account" as though it were a
+                     ;; proof would be the more dangerous answer.
+                     (json-response {:account a :proof nil
+                                     :reason "no-such-account"
+                                     :note "absence is reported, not proved"}
+                                    404)))
                  "/head" (json-response
                           {:chain-id chain-id
                            :code-version code-version
