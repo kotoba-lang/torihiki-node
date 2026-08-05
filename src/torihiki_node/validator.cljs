@@ -310,6 +310,8 @@
             [inga.wire :as wire]
             [kotoba.bytes.sha256 :as sha]
             [torihiki.address :as addr]
+            [torihiki.commit :as cm]
+            [torihiki-chart.candle :as cndl]
             [torihiki.auth :as tauth]
             [torihiki.api :as api]
             [torihiki.book :as bk]
@@ -363,7 +365,7 @@
                                           2 "==" 3 "=" "")]
                                 #js {:privateKey sk :pub (str std pad)})))))))))
 
-(def ^:const code-version "92")
+(def ^:const code-version "93")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -478,6 +480,14 @@
   "What the faucet's key is derived from. Part of the derivation, so changing
   it changes the account and orphans every deposit the old one made."
   "faucet")
+
+(def ^:const candle-retention
+  "Block candles kept in the machine. Only blocks that traded make one.
+
+  Bounded because this lives in the machine state, which every replica holds
+  in memory and writes into every checkpoint — an unbounded index would grow
+  the thing the bounded resume exists to keep small."
+  4000)
 
 (def ^:const faucet-grant
   "One grant, in cents. Matches what the terminal's button has always said."
@@ -618,6 +628,52 @@
                                             ;; engine, which is fine when
                                             ;; there is one writer and would
                                             ;; be four different tapes here.
+                                            ;; Candles, in the machine for the
+                                            ;; same reason the tape is: every
+                                            ;; replica must derive the same
+                                            ;; ones from the same blocks. Kept
+                                            ;; beside it rather than folded
+                                            ;; from it, because the tape is
+                                            ;; bounded by COUNT — 200 fills is
+                                            ;; a few dozen blocks on a busy
+                                            ;; book, and a chart drawn from it
+                                            ;; cannot see further back than
+                                            ;; that no matter what it asks for.
+                                            ;;
+                                            ;; The fold is
+                                            ;; `torihiki-chart.candle/absorb`,
+                                            ;; the same call the terminal
+                                            ;; draws with. Two folds that are
+                                            ;; supposed to agree eventually
+                                            ;; will not, and when the chart
+                                            ;; and the chain disagree there is
+                                            ;; no way to say which is lying.
+                                            ;;
+                                            ;; NOT in the state root: like the
+                                            ;; tape, this is a view over the
+                                            ;; fills the root already commits
+                                            ;; to, and putting a derived index
+                                            ;; under the hash would make every
+                                            ;; change to how it is derived a
+                                            ;; change to the chain's identity.
+                                            (as-> ex'
+                                                  (let [fills (bk/fills (get-in ex' [:books market-id]))]
+                                                    (if (empty? fills)
+                                                      ex'
+                                                      (update ex' :candles
+                                                              (fn [cs]
+                                                                (let [c (reduce
+                                                                         (fn [c f]
+                                                                           (cndl/absorb
+                                                                            c {:level (:level f) :qty (:qty f)
+                                                                               :side (cndl/normalize-side
+                                                                                      (:taker-side f))}))
+                                                                         nil fills)]
+                                                                  (into []
+                                                                        (take-last
+                                                                         candle-retention
+                                                                         (conj (or cs [])
+                                                                               (assoc c :h (:inga.block/height block)))))))))))
                                             (as-> ex'
                                                   (update ex' :tape
                                                           (fn [t]
@@ -1778,6 +1834,64 @@
                                                (json (merge {:ok true :account acct
                                                              :amount faucet-grant} r)
                                                      200))))))))))
+
+               ;; Block candles, from the machine — so they are the four
+               ;; replicas' agreed fills rather than one replica's view.
+               ;;
+               ;; This existed on the single sequencer and not here, which is
+               ;; the chain the terminal actually reads. The endpoint worked
+               ;; and served nobody: the chart stayed inside the tape's
+               ;; 200-fill window on the only chain a user ever sees.
+               "/candles"
+               (let [ex (:machine-state (.-replica this))
+                     span (max 1 (or (js/parseInt (or (.get (.-searchParams url) "span") "10")) 1))
+                     n (max 1 (min 1000 (or (js/parseInt (or (.get (.-searchParams url) "n") "200")) 200)))
+                     arr (vec (:candles ex))
+                     floor (when (seq arr)
+                             (- (cndl/bucket span (:h (peek arr))) (* span (dec n))))
+                     window (if floor (filterv #(>= (:h %) floor) arr) [])]
+                 (json {:market market-id
+                        :span span
+                        :unit "blocks"
+                        :candles (cndl/rebucket span window)
+                        :retained-from (when (seq arr) (:h (first arr)))
+                        :retained-blocks (count arr)
+                        :retention candle-retention
+                        :truncated (boolean (and floor (> (:h (first arr)) floor)))
+                        :truncated-because
+                        (when (and floor (> (:h (first arr)) floor))
+                          (if (>= (count arr) candle-retention) "retention" "no-older-blocks"))}
+                       200))
+
+               ;; An inclusion proof for one balance, against the root this
+               ;; replica reports at `/head`.
+               ;;
+               ;; Also sequencer-only until now, and it mattered more here:
+               ;; the point of a proof is not to trust the server, and there
+               ;; is nothing to distrust about a chain of one writer that
+               ;; already tells you it is a sequencer. Against four replicas
+               ;; that vote, a proof a client checks itself is the difference
+               ;; between believing a quorum and checking one.
+               "/proof"
+               (let [ex (:machine-state (.-replica this))
+                     a (js/parseInt (or (.get (.-searchParams url) "account") "-1"))
+                     p (cm/proof (st/canonical-leaves ex) (cm/account-leaf-id a))]
+                 (if p
+                   (json {:account a
+                          :height (r/height (.-replica this))
+                          :leaf-id (:id p)
+                          :leaf-bytes (:bytes p)
+                          :proof (:proof p)
+                          :state-root (:root p)
+                          :flat-root (st/flat-root ex)}
+                         200)
+                   ;; Absence is reported, not proved. A sorted-tree
+                   ;; construction could prove non-membership; this is not
+                   ;; one, and saying "no such account" as though it were a
+                   ;; proof would be the more dangerous answer.
+                   (json {:account a :proof nil :reason "no-such-account"
+                          :note "absence is reported, not proved"}
+                         404)))
 
                "/account"
                (let [ex (:machine-state (.-replica this))
