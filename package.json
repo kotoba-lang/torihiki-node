@@ -9,5 +9,8 @@
   "devDependencies": {
     "shadow-cljs": "2.28.20",
     "wrangler": "^4.0.0"
+  },
+  "dependencies": {
+    "@noble/hashes": "^2.2.0"
   }
 }
