@@ -365,7 +365,7 @@
                                           2 "==" 3 "=" "")]
                                 #js {:privateKey sk :pub (str std pad)})))))))))
 
-(def ^:const code-version "93")
+(def ^:const code-version "94")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -481,6 +481,20 @@
   it changes the account and orphans every deposit the old one made."
   "faucet")
 
+(def ^:const checkpointed-candles
+  "How many block candles ride along in a checkpoint.
+
+  Fewer than `candle-retention`, because a Durable Object storage value has a
+  hard size ceiling and the checkpoint is already carrying the whole exchange.
+  A checkpoint that grew past it would fail to write — and `checkpoint!`
+  catches its own errors, so the failure would be silent and the replica would
+  fall back to replaying from further and further back.
+
+  What is lost past this bound is HISTORY, not state: `/candles` reports its
+  own horizon in `retained-from`, so a shorter chart after a restart is
+  visible rather than implied."
+  600)
+
 (def ^:const candle-retention
   "Block candles kept in the machine. Only blocks that traded make one.
 
@@ -488,6 +502,10 @@
   in memory and writes into every checkpoint — an unbounded index would grow
   the thing the bounded resume exists to keep small."
   4000)
+
+(def ^:const faucet-nonce-lead
+  "How many grants may be in flight ahead of the committed bridge nonce."
+  8)
 
 (def ^:const faucet-grant
   "One grant, in cents. Matches what the terminal's button has always said."
@@ -732,7 +750,28 @@
         (.then (fn [^js k]
                  (let [ex (:machine-state (.-replica this))
                        bridge @faucet-account
-                       nonce (tauth/expected-nonce ex bridge)
+                       ;; The chain's next nonce, or the one after the last we
+                       ;; issued — whichever is further along.
+                       ;;
+                       ;; `expected-nonce` reads COMMITTED state, and a grant
+                       ;; takes a block to commit. Two requests a second apart
+                       ;; both read the same number, both sign it, and the
+                       ;; second is refused `bad-nonce`. Measured on the
+                       ;; deployed chain: `refused {bad-nonce 1}` after two
+                       ;; faucet calls issued back to back.
+                       ;;
+                       ;; The bound is what stops this from becoming
+                       ;; permanent. If a grant is lost rather than delayed,
+                       ;; the chain's nonce never catches up, and issuing
+                       ;; `(inc last)` forever would mean every future grant
+                       ;; carries a nonce that can never be accepted — a
+                       ;; faucet that is broken in exactly the way it was
+                       ;; trying to avoid. Past the bound it stops issuing and
+                       ;; says so, which is recoverable; the caller retries
+                       ;; once blocks catch up.
+                       committed (tauth/expected-nonce ex bridge)
+                       last-issued (or (.-lastFaucetNonce this) 0)
+                       nonce (max committed (inc last-issued))
                        tx {:tx :deposit :account bridge :credit account
                            :amount faucet-grant}
                        payload (tauth/signing-payload chain-id bridge nonce tx)]
@@ -752,6 +791,7 @@
                                   (aset (or (.-txok this) (set! (.-txok this) #js {}))
                                         (str (.-pub k) "|" payload "|" (b64 sig)) true)
                                   (set! (.-replica this) (r/submit (.-replica this) body))
+                                  (set! (.-lastFaucetNonce this) nonce)
                                   {:queued true :bridge bridge :nonce nonce}))))))))) 
 
   (boot [this name]
@@ -924,7 +964,18 @@
                        (let [restored
                              (try
                                (let [snap (tsnap/read-string* (aget vals i))
-                                     snap (update snap :machine-state tsnap/restore)]
+                                     views (:views snap)
+                                     snap (-> snap
+                                              (update :machine-state tsnap/restore)
+                                              ;; `merge` and not `assoc`: a
+                                              ;; checkpoint written before
+                                              ;; `:views` existed has none,
+                                              ;; and restoring nil over a
+                                              ;; freshly built machine would
+                                              ;; be the same loss with an
+                                              ;; extra step.
+                                              (cond-> views
+                                                (update :machine-state merge views)))]
                                  (r/resume (.replicaOpts this (.-witness this)) snap))
                                (catch :default e (.note! this e) nil))]
                          (if restored
@@ -1262,7 +1313,29 @@
               (pos? (mod h checkpoint-every))
               (= h (or (.-lastCkpt this) -1)))
         (js/Promise.resolve nil)
-        (let [snap (-> (r/snapshot s) (update :machine-state tsnap/capture))]
+        (let [ms (:machine-state s)
+              ;; The tape and the candles ride BESIDE the engine snapshot.
+              ;;
+              ;; `torihiki.snapshot/capture` takes the engine's canonical
+              ;; state, which these are not — they are views the validator's
+              ;; apply-fn folds alongside it. So they were dropped, and a
+              ;; replica that restarted came back with an empty tape and no
+              ;; candles, rebuilding only from blocks after the restart.
+              ;;
+              ;; Measured: three of four replicas served zero trades and zero
+              ;; candles while the fourth served fourteen and twelve, on the
+              ;; same chain, at the same height. The page reads w1 and w1
+              ;; happened to be the one that had not restarted — the chart
+              ;; worked by luck, and any eviction would have emptied it.
+              ;;
+              ;; Beside rather than inside: putting a view into the engine's
+              ;; snapshot would make the engine's serialisation depend on what
+              ;; a UI wanted to draw.
+              snap (-> (r/snapshot s)
+                       (update :machine-state tsnap/capture)
+                       (assoc :views {:tape (vec (:tape ms))
+                                      :candles (vec (take-last checkpointed-candles
+                                                               (:candles ms)))}))]
           (-> (.put ^js (.-storage do-state) (ckpt-key h) (tsnap/write-string snap))
               (.then (fn [_]
                        (set! (.-lastCkpt this) h)
@@ -1827,6 +1900,18 @@
                                   (js/Promise.resolve
                                    (json {:ok false :reason "already-funded"
                                           :note "the bridge grants once per account"} 409))
+
+                                  ;; Issued far ahead of what has committed:
+                                  ;; grants are outrunning blocks, or one was
+                                  ;; lost. Either way the next nonce would be
+                                  ;; a guess, and a wrong guess is permanent.
+                                  (> (- (or (.-lastFaucetNonce this) 0)
+                                        (tauth/expected-nonce ex @faucet-account))
+                                     faucet-nonce-lead)
+                                  (js/Promise.resolve
+                                   (json {:ok false :reason "bridge-behind"
+                                          :note "grants are ahead of committed blocks — retry shortly"}
+                                         503))
 
                                   :else
                                   (-> (.faucetGrant this acct)
