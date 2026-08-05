@@ -18,7 +18,7 @@
         ;; wire and NOT `inga.state`, so arrangement does not reach the bundle.
         io.github.kotoba-lang/inga
         {:git/url "https://github.com/kotoba-lang/inga.git"
-         :git/sha "e7e40ebcc64243be83fafde80ec4ddeb85ace09a"}
+         :git/sha "28631ff0fc5f4c672913b27955d88dafe0ea5464"}
         io.github.kotoba-lang/torihiki
         {:git/url "https://github.com/kotoba-lang/torihiki.git"
          :git/sha "4faead84aaf11ec16ec721088719472f9df45941"}}}
