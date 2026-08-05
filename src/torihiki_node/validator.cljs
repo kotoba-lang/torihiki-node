@@ -381,7 +381,7 @@
 ;; the validator set, and a dead one in the file is a live one after the next
 ;; refactor that "restores a fallback".
 
-(def ^:const code-version "99")
+(def ^:const code-version "100")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -2016,10 +2016,14 @@
                         ;; that does not extend the tip is refused with no
                         ;; message and no error, which is correct and gives
                         ;; you nothing to read.
-                        :genesis-hash (block-hash (c/canonical-block
-                                                   (first (:chain (.-replica this)))))
-                        :tip-hash (block-hash (c/canonical-block
-                                               (r/tip (.-replica this))))
+                        ;; The CID, which is what consensus uses. These were
+                        ;; computed here with `block-hash` while the replica
+                        ;; identified blocks by `block-cid` — two definitions
+                        ;; of what a block IS, in one file, disagreeing. The
+                        ;; symptom was a `/head` reporting hex while every
+                        ;; parent link in the chain was a CID.
+                        :genesis-hash (block-cid (first (:chain (.-replica this))))
+                        :tip-hash (block-cid (r/tip (.-replica this)))
                         :seen-types (js->clj (or (.-types this) #js {}))
                         ;; The mempool, and what has come out of it.
                         ;;
