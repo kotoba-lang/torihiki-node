@@ -365,7 +365,7 @@
                                           2 "==" 3 "=" "")]
                                 #js {:privateKey sk :pub (str std pad)})))))))))
 
-(def ^:const code-version "95")
+(def ^:const code-version "96")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -526,6 +526,25 @@
 ;; (`defonce` takes no docstring in ClojureScript.)
 (defonce faucet-account (atom nil))
 
+;; The accounts allowed to publish a price, resolved at boot like the bridge.
+;;
+;; Empty, `torihiki.api` leaves the DIRECT setter open — and this deployment
+;; configured none, so any account could set the oracle. Demonstrated against
+;; the live chain: an account created seconds earlier, holding no collateral
+;; and named nowhere, moved the oracle from 1000 to 1001 and the mark followed
+;; it. Margin and liquidation read the mark, so the same transaction with a
+;; larger number liquidates everybody.
+;;
+;; The mechanism was already right — `api/validate` closes the direct setter
+;; as soon as publishers exist, and says so — it was the CONFIGURATION that
+;; left both doors open. This is the configuration.
+;;
+;; The four validators are the publishers. On this devnet their keys are
+;; derivable from the chain id, so this restricts the door rather than locking
+;; it; the lock is real keys, which is a separate change. Restricting it still
+;; removes the case where a stranger needs nothing at all.
+(defonce publisher-accounts (atom #{}))
+
 (defn genesis []
   (-> (st/new-exchange {:market market
                         :book-opts {:n-levels 65536 :cap 16384 :ev-cap 8192}
@@ -549,7 +568,19 @@
                         ;; `/faucet` is the only thing that holds it.
                         :bridge-authority
                         (or @faucet-account
-                            (throw (js/Error. "genesis before the faucet key")))})
+                            (throw (js/Error. "genesis before the faucet key")))
+                        ;; Closing this door does NOT freeze the market. With
+                        ;; publishers configured and none of them submitting,
+                        ;; `:oracle` keeps its genesis value and
+                        ;; `:oracle-stale` is only recomputed when a
+                        ;; submission arrives — so the price simply stops
+                        ;; moving, which is what it already did. The devnet
+                        ;; has no price feed; what it had was a door.
+                        :oracle-publishers
+                        (let [ps @publisher-accounts]
+                          (if (seq ps)
+                            ps
+                            (throw (js/Error. "genesis before the publisher set"))))})
       (st/apply-tx {:tx :oracle :market market-id :price 1000})))
 
 (defn- decode-tx [s]
@@ -739,6 +770,22 @@
                    (reset! faucet-account (addr/derive (.-pub k)))
                    k)))))
 
+  ;; Every witness's account id, computed locally.
+  ;;
+  ;; Each replica derives all four rather than asking, because genesis must be
+  ;; identical on all of them and a set assembled from what a replica happened
+  ;; to have heard would not be. It is the same derivation each object already
+  ;; runs for its own key.
+  (publisherSet [this]
+    (if (seq @publisher-accounts)
+      (js/Promise.resolve @publisher-accounts)
+      (-> (js/Promise.all
+           (clj->js (for [w witnesses] (derive-keypair chain-id w))))
+          (.then (fn [^js ks]
+                   (reset! publisher-accounts
+                           (set (map #(addr/derive (.-pub ^js %))
+                                     (js/Array.from ks))))))))) 
+
   ;; Sign a deposit as the bridge and put it into consensus.
   ;;
   ;; The transaction goes through `r/submit` like any other — it is not
@@ -805,8 +852,10 @@
       (js/Promise.resolve nil)
       (-> (.faucetKey this)
           ;; BEFORE the storage read, because everything after it can reach
-          ;; `genesis`, and `genesis` throws without the bridge account. A
-          ;; boot order that works by accident is one deploy away from not.
+          ;; `genesis`, and `genesis` throws without the bridge account and
+          ;; the publisher set. A boot order that works by accident is one
+          ;; deploy away from not.
+          (.then (fn [_] (.publisherSet this)))
           (.then (fn [_] (.get ^js (.-storage do-state) "key")))
           (.then (fn [stored]
                    ;; The key is PERSISTED, not regenerated.
@@ -1713,10 +1762,39 @@
         (.then (fn [a] (if a (- a (js/Date.now)) nil)))
         (.catch (fn [_] :unknown))))
 
+  ;; Is this request allowed to destroy a replica?
+  ;;
+  ;; `/wipe` and `/reset` delete everything an object holds. They were open to
+  ;; the internet: a `curl -X POST .../wipe?w=w1` from anywhere emptied a
+  ;; validator, and emptying the one that leads halts the chain until every
+  ;; replica is reset (see S14). They were written as operator tools and
+  ;; deployed as public ones.
+  ;;
+  ;; A shared secret in `ADMIN_TOKEN`, compared in constant time. Absent from
+  ;; the environment, the routes are refused rather than opened — a missing
+  ;; secret is the state a fresh deployment is in, and defaulting that to
+  ;; "allow" is how this was public in the first place.
+  (adminOk [this ^js request]
+    (let [want (.-ADMIN_TOKEN env)
+          got (or (.get (.-headers request) "x-admin-token") "")]
+      (and (string? want) (pos? (.-length want))
+           ;; Constant time in the length that matters: comparing with `=`
+           ;; leaks how many leading characters were right, which is a few
+           ;; thousand requests rather than a search.
+           (= (.-length want) (.-length got))
+           (zero? (reduce (fn [acc i]
+                            (bit-or acc (bit-xor (.charCodeAt want i)
+                                                 (.charCodeAt got i))))
+                          0 (range (.-length want)))))))
+
   (handle [this ^js request]
     (let [url (js/URL. (.-url request))
           path (.-pathname url)
           w (or (.get (.-searchParams url) "w") "w1")]
+      (if (and (#{"/wipe" "/reset"} path) (not (.adminOk this request)))
+        (js/Promise.resolve
+         (json {:ok false :reason "forbidden"
+                :note "administrative route — x-admin-token required"} 403))
       (if (= path "/wipe")
         ;; BEFORE `boot`, deliberately, and this is the whole point of it.
         ;;
@@ -2022,7 +2100,7 @@
 
                             (json {:ok false :reason "not-found"} 404))))))))))))
 
-  )
+  ))
 
 
 ;; ── the alarm, attached by its literal name ─────────────────────────────────
