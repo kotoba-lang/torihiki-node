@@ -311,6 +311,8 @@
             [kotoba.bytes.sha256 :as sha]
             [torihiki.address :as addr]
             [torihiki.commit :as cm]
+            [ipld.core :as ipld]
+            [ipld.link :as ilink]
             [torihiki-chart.candle :as cndl]
             [torihiki.auth :as tauth]
             [torihiki.api :as api]
@@ -379,7 +381,7 @@
 ;; the validator set, and a dead one in the file is a live one after the next
 ;; refactor that "restores a fallback".
 
-(def ^:const code-version "98")
+(def ^:const code-version "99")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -640,6 +642,52 @@
     (dotimes [i n] (aset out i (.charCodeAt bin i)))
     out))
 
+(defn block-node
+  "A block as an IPLD node — the DAG-CBOR shape its CID addresses.
+
+  ## Why the chain has a CID at all now
+
+  `inga` has a whole content-addressed layer (`inga.ref`, `inga.head`,
+  `inga.retrieval`) built on `kotobase.storage`, and `inga.ref`'s idea is the
+  one ADR-2608038000 names as the replacement for a single vendor's
+  conditional write: **a 2f+1 quorum certificate IS a conditional write.**
+  None of it was reachable from here — `inga.replica` requires consensus,
+  pacemaker, quorum, attest, stake, sync and wire, and nothing else — and a
+  head record in that layer names a `cid`, which this chain did not have. Its
+  blocks were identified by a bare SHA-256 hex string.
+
+  So this is the first wire, and the order matters: a store addressed by CID
+  is pointless while the thing being stored has no CID.
+
+  ## The fields are exactly what the hash already covered
+
+  `inga.consensus/canonical-block` commits to height, parent, proposals,
+  proposer and ts — and NOT to the justify QC, which is a claim about the
+  parent rather than about this block. Committing to more here would change
+  what a block hash MEANS, not just how it is spelled.
+
+  ## The parent is a LINK, not a string
+
+  Tag 42. That is the difference between a chain whose blocks happen to
+  contain a hash and a DAG that any IPLD tool can walk: `ipld.core/decode`
+  hands back a `Link`, and following it is a lookup rather than a convention
+  somebody has to know. Genesis has no parent and carries nil rather than the
+  string `\"genesis\"` — a sentinel that is not a CID would have to be special
+  cased by every reader."
+  [{:keys [inga.block/height inga.block/parent-hash inga.block/proposals
+           inga.block/proposer inga.block/ts]}]
+  {"height" height
+   "parent" (when (and parent-hash (not= "genesis" parent-hash))
+              (ilink/link parent-hash))
+   "proposals" (vec proposals)
+   "proposer" proposer
+   "ts" ts})
+
+(defn block-cid
+  "CIDv1, dag-cbor, sha2-256 — the block's identity."
+  [b]
+  (ipld/cid (ipld/encode (block-node b))))
+
 (defn- block-hash
   "SHA-256 of the canonical block string, synchronously.
 
@@ -678,7 +726,11 @@
                          {:witness name
                                      :witnesses witnesses
                                      :quorum (c/quorum-size (count witnesses))
-                                     :hash-fn (fn [b] (block-hash (c/canonical-block b)))
+                                     ;; Identity is a CID. `block-hash` is
+                                     ;; kept for the one thing it still does
+                                     ;; — see its docstring — and no longer
+                                     ;; decides what a block IS.
+                                     :hash-fn block-cid
                                      :chain-id chain-id
                                      ;; No special case for our own witness.
                                      ;; Trusting itself let the UNSIGNED copy
@@ -2144,6 +2196,29 @@
                    (json {:account a :proof nil :reason "no-such-account"
                           :note "absence is reported, not proved"}
                          404)))
+
+               ;; A block, addressed. `cid` is its identity and `dag-cbor` is
+               ;; the bytes that hash to it, base64 — so a client recomputes
+               ;; the CID itself rather than believing this node's word for
+               ;; it, and decodes the same bytes to read the block.
+               ;;
+               ;; By height rather than by CID because there is no cid→height
+               ;; index yet; adding one costs a storage write per block and is
+               ;; the next step, not this one. Stated rather than implied.
+               "/block"
+               (let [h (js/parseInt (or (.get (.-searchParams url) "height") "-1"))
+                     s* (.-replica this)
+                     b (first (filter #(= h (:inga.block/height %)) (:chain s*)))]
+                 (if-not b
+                   (json {:ok false :reason "not-held"
+                          :note "this replica does not hold that block in memory"} 404)
+                   (let [bytes (ipld/encode (block-node b))]
+                     (json {:height h
+                            :cid (ipld/cid bytes)
+                            :codec "dag-cbor"
+                            :dag-cbor (js/btoa (.apply js/String.fromCharCode nil
+                                                       (js/Uint8Array.from bytes)))}
+                           200))))
 
                "/account"
                (let [ex (:machine-state (.-replica this))
