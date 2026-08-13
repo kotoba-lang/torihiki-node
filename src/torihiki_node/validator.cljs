@@ -1518,6 +1518,7 @@
                    ;; Queued, not sent. See the namespace docstring: sending
                    ;; from here is what turned one message into nine.
                    (.queue! this out)
+                   (.notify! this)
                    (.persist! this))))))
 
   ;; Persistence was turned OFF here for one deploy, to test whether writing a
@@ -1737,6 +1738,40 @@
     (set! (.-last-error this) (str (or (.-message e) e)))
     nil)
 
+  ;; ── telling subscribers a block committed ─────────────────────────────────
+  ;;
+  ;; The terminal polled every 1500 ms, so the average wait between a block
+  ;; committing and the page knowing was 750 ms — measured against an
+  ;; end-to-end of about 2600 ms, it was the single largest term, and the only
+  ;; one that costs nothing structural to remove. Blocks land ~336 ms apart,
+  ;; so the poll was slower than the chain by a factor of four.
+  ;;
+  ;; This pushes a NOTIFICATION, not the state. The page still fetches what it
+  ;; wants after being woken, which keeps one definition of every endpoint
+  ;; instead of a second copy of `/head`, `/book` and `/trades` inlined into a
+  ;; socket frame that would then have to be kept in agreement with them
+  ;; forever. What the socket removes is the WAITING, which is all it was
+  ;; costing.
+  ;;
+  ;; Hibernatable (`acceptWebSocket` rather than `accept`): a Durable Object
+  ;; holding an ordinary socket cannot be evicted, and this object is one
+  ;; whose eviction is routine and load-bearing — `witnesses` explains what
+  ;; four replicas with a quorum of three do under churn. A subscriber must
+  ;; not be able to pin a validator in memory by opening a tab.
+  (notify! [this]
+    (let [h (r/committed-height (.-replica this))]
+      (when (not= h (.-notifiedAt this))
+        (set! (.-notifiedAt this) h)
+        (let [msg (js/JSON.stringify
+                   #js {"height" h
+                        "state-root" (r/state-root (.-replica this))
+                        "witness" (.-witness this)})]
+          (doseq [ws (array-seq (.getWebSockets ^js do-state))]
+            ;; One dead socket must not stop the others being told. Cloudflare
+            ;; drops closed sockets itself, so there is nothing to clean up
+            ;; here — only something not to throw out of.
+            (try (.send ^js ws msg) (catch :default _ nil)))))))
+
   (tickNow [this]
     (when-not (.-bootAt this) (set! (.-bootAt this) (js/Date.now)))
     (-> (if (.-witness this)
@@ -1852,6 +1887,10 @@
       (let [[s' out] (r/on-tick (.-replica this) now)]
         (set! (.-replica this) s')
         (.queue! this out))
+      ;; Both paths advance the chain, so both have to tell anybody listening.
+      ;; `notify!` compares the committed height itself, so calling it when
+      ;; nothing moved is a comparison and nothing else.
+      (.notify! this)
       ;; Why this replica did NOT propose.
       ;;
       ;; Every counter here says what happened. A stall is the absence of
@@ -2023,6 +2062,19 @@
                        (.then
                         (fn [_]
                           (case path
+                            ;; A socket that says only "a block committed".
+                            ;; See `notify!` for why it carries a notification
+                            ;; rather than the state.
+                            "/subscribe"
+                            (if-not (= "websocket"
+                                       (some-> (.get (.-headers request) "Upgrade")
+                                               (.toLowerCase)))
+                              (json {:ok false :reason "expected-websocket-upgrade"} 426)
+                              (let [pair (js/WebSocketPair.)]
+                                (.acceptWebSocket ^js do-state (aget pair "1"))
+                                (js/Response. nil #js {:status 101
+                                                       :webSocket (aget pair "0")})))
+
                             "/head"
                (let [s (.-replica this)]
                  (json {:witness (.-witness this)
@@ -2328,6 +2380,20 @@
 ;; anywhere — the fix compiled away as thoroughly as the bug did.
 (gobj/set (.-prototype Validator) "alarm"
           (fn [] (this-as this (.tickNow ^js this))))
+
+;; The hibernation API calls these by name on the object, so they are attached
+;; the same way and for the same reason `alarm` is — a `deftype` method named
+;; `webSocketMessage` is renamed by the advanced compiler and the runtime then
+;; looks for something that is not there.
+;;
+;; Both are deliberately empty. `/subscribe` is one-way: the page is told that
+;; a block committed and asks for what it wants over HTTP, so a subscriber has
+;; nothing to say back. Defining them anyway is what keeps a client that sends
+;; something — a stray ping, a reconnect probe — from being an unhandled call
+;; on the object.
+(gobj/set (.-prototype Validator) "webSocketMessage" (fn [_ws _msg] nil))
+(gobj/set (.-prototype Validator) "webSocketClose" (fn [_ws _code _reason _clean] nil))
+(gobj/set (.-prototype Validator) "webSocketError" (fn [_ws _err] nil))
 
 (def handler
   #js {:fetch
