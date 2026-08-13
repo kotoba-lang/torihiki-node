@@ -401,7 +401,7 @@
   idle enough to be evicted. **Deployed and running are different facts** —
   ADR-2608020330 says so, and this constant is what makes the difference
   visible instead of assumed."
-  "120")
+  "122")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -1799,12 +1799,32 @@
       (catch :default e (.note! this e) (js/Promise.resolve nil))))
 
   (ingest2 [this msgs]
-    (-> (.verifyTxs this msgs)
-        (.then (fn [_] (.verifyCerts this msgs)))
-        (.then (fn [_] (.answerSyncRequests this msgs)))
-        ;; `:sync-request` never reaches the replica: this object answers it
-        ;; and `inga.replica` cannot.
-        (.then (fn [_] (.foldMsgs this (remove #(= :sync-request (:type %)) msgs))))))
+    ;; Timed per phase, because the hop is where the median block time is.
+    ;;
+    ;; The tick was decomposed and cleared: its work is capped at 40 ms and
+    ;; the transport under it is 2-4 ms. Flushing per batch instead of per
+    ;; tick took the block-time TAIL from 3443 ms to 392 and left the median
+    ;; at ~250. `propose-refusal` never once said `too-soon`, so the 100 ms
+    ;; block interval is not it either. That leaves what a replica does with
+    ;; a message after it arrives, which nothing had ever timed.
+    (let [t0 (js/Date.now) mark (volatile! [])
+          phase (fn [nm] (fn [x] (vswap! mark conj [nm (- (js/Date.now) t0)]) x))]
+      (-> (.verifyTxs this msgs)
+          (.then (phase "verifyTxs"))
+          (.then (fn [_] (.verifyCerts this msgs)))
+          (.then (phase "verifyCerts"))
+          (.then (fn [_] (.answerSyncRequests this msgs)))
+          (.then (phase "answerSync"))
+          ;; `:sync-request` never reaches the replica: this object answers it
+          ;; and `inga.replica` cannot.
+          (.then (fn [_] (.foldMsgs this (remove #(= :sync-request (:type %)) msgs))))
+          (.then (phase "foldMsgs"))
+          (.then (fn [r]
+                   (set! (.-ingestPhases this) (clj->js @mark))
+                   (set! (.-ingestMs this)
+                         (let [a (or (.-ingestMs this) #js [])]
+                           (.slice (.concat a (- (js/Date.now) t0)) -64)))
+                   r)))))
 
   ;; Verify the certificates carried INSIDE a sync response, before the
   ;; replica is asked whether it may adopt them.
@@ -1955,10 +1975,35 @@
                                        (set! (.-replica this) s')
                                        (into acc o)))
                                    [] msgs)]
-                   ;; Queued, not sent. See the namespace docstring: sending
-                   ;; from here is what turned one message into nine.
+                   ;; Sent at the END of the batch, once, and not awaited.
+                   ;;
+                   ;; This queued and let the tick send, which cost a tick
+                   ;; wait on EVERY hop: a proposal waited for the receiver's
+                   ;; alarm before its vote left, and the vote waited again
+                   ;; before the certificate could turn into the next
+                   ;; proposal. Two waits a block, at a measured tick gap of
+                   ;; 33-43 ms with a tail past a second — against a round
+                   ;; trip between replicas of 2-4 ms.
+                   ;;
+                   ;; The namespace docstring is right about what went wrong
+                   ;; before and this is not that. Dispatching PER MESSAGE
+                   ;; amplified — one in, three out, each of which produced
+                   ;; three more inside the same invocation — until it hit the
+                   ;; subrequest limit and the chain stopped after a dozen
+                   ;; blocks. Here the whole batch is folded first and flushed
+                   ;; once, so an invocation makes at most one POST per peer,
+                   ;; exactly what a tick made. What changes is when, not how
+                   ;; many.
+                   ;;
+                   ;; Not awaited, for the reason a tick no longer awaits it
+                   ;; either: waiting on a peer to answer is how a replica
+                   ;; hands its clock to the slowest one, and here it would
+                   ;; also let two objects wait on each other.
                    (.queue! this out)
                    (.notify! this)
+                   (let [sends (js/Promise.resolve (.flush! this))]
+                     (when (fn? (.-waitUntil do-state)) (.waitUntil do-state sends))
+                     (.catch sends (fn [_] nil)))
                    (.persist! this))))))
 
   ;; Persistence was turned OFF here for one deploy, to test whether writing a
@@ -2942,6 +2987,8 @@
                                    :tick-work-ms (q (.-tickWork this))
                                    :block-ms (q (.-blockGaps this))
                                    :deliver-ms (q (.-deliverMs this))
+                                   :ingest-ms (q (.-ingestMs this))
+                                   :ingest-phases (js->clj (or (.-ingestPhases this) #js []))
                                    :colo (.-colo this)})
                         ;; Why the tip has no vote on it.
                         ;;
