@@ -2808,6 +2808,24 @@
                                        (sort (keys (:markets ex))))}
                        200)))
 
+               ;; An account's delegated keys, so a client can see what it has
+               ;; authorised and when each one dies. Public: an agent public
+               ;; key is public by construction, and hiding which keys may act
+               ;; would hide it from the owner too.
+               "/agents"
+               (let [ex (:machine-state (.-replica this))
+                     want (some-> (.get (.-searchParams url) "account") js/parseInt)]
+                 (json {:account want
+                        :height (r/height (.-replica this))
+                        :owner-key (get-in ex [:account-keys want])
+                        :agents (mapv (fn [[k v]]
+                                        {:agent k :expires (:expires v)
+                                         :live (or (nil? (:expires v))
+                                                   (> (:expires v) (:height ex 0)))})
+                                      (get-in ex [:agents want] {}))
+                        :may-not (mapv name (sort tauth/agent-forbidden))}
+                       200))
+
                "/reserves"
                (let [ex (:machine-state (.-replica this))
                      leaves (st/canonical-leaves ex)
