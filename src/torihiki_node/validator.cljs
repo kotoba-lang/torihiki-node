@@ -639,6 +639,21 @@
           :fee-tiers [{:min-volume 0          :taker-fee-rate 350000 :maker-fee-rate 100000}
                       {:min-volume 100000000 :taker-fee-rate 250000 :maker-fee-rate 50000}
                       {:min-volume 1000000000 :taker-fee-rate 150000 :maker-fee-rate 0}])
+   ;; The spot market is NOT listed here yet.
+   ;;
+   ;; It is implemented and tested in the engine (274 tests, six gates), and
+   ;; putting it in this vector while it is absent from the chain stopped
+   ;; every bridge transaction from landing — the faucet included. Measured
+   ;; twice: adding it broke them, removing it restored them.
+   ;;
+   ;; The mechanism found so far: `listMissingMarkets` queued a PRICE for a
+   ;; market that was not listed yet, which `api/validate` refuses as
+   ;; `:unknown-market`, and a guaranteed-invalid transaction in a strictly
+   ;; sequential nonce line is a wall every later bridge transaction queues
+   ;; behind. That filter is fixed below. The fix has not been shown to work
+   ;; on the deployment yet — a Durable Object runs the code it booted with,
+   ;; and the retry after deploying it still queued the price — so the market
+   ;; stays out of this vector until a run proves the sync is clean.
    (assoc (cl/market {:id 2 :symbol "ETH-PERP" :max-leverage 20 :tick 10 :lot 1})
           :taker-fee-rate 500000
           :maker-fee-rate 100000
@@ -1210,7 +1225,22 @@
           ;; zero — so opening one is part of bringing the chain in line with
           ;; the build, not a separate errand. The engine lets the authority do
           ;; this exactly once per market, and the condition closes behind it.
-          unpriced (filter #(zero? (get-in ex [:oracle (:id %)] 0)) markets)
+          ;; Only markets the chain ALREADY HAS.
+          ;;
+          ;; This filtered the build's markets, not the chain's, so a market
+          ;; being listed for the first time got a price transaction in the
+          ;; same batch — signed for a market that does not exist yet, which
+          ;; `api/validate` refuses as `:unknown-market`. Nonces are strictly
+          ;; sequential, so a guaranteed-invalid transaction sitting at
+          ;; nonce N+1 is a wall every later bridge transaction queues behind.
+          ;;
+          ;; Measured: with a spot market in the build and not on the chain,
+          ;; every bridge transaction stopped landing — the faucet included.
+          ;; Removing the market from the build restored them. Pricing follows
+          ;; listing by one sync rather than riding along with it.
+          unpriced (filter #(and (contains? (:markets ex) (:id %))
+                                 (zero? (get-in ex [:oracle (:id %)] 0)))
+                           markets)
           work (concat (map (fn [m] [:list m]) missing)
                        (map (fn [m] [:amend m]) stale)
                        (map (fn [m] [:amend-tiers m]) (filter :fee-tiers stale))
@@ -3067,6 +3097,16 @@
                ;; publishing its book is asking to be trusted — the same
                ;; reason `/reserves` says what it cannot answer.
                ;; What an account has bonded, and what is on its way back.
+               ;; An account's spot holdings, and what its resting orders have
+               ;; already committed.
+               "/balances"
+               (let [c (:clearing (:machine-state (.-replica this)))
+                     a (some-> (.get (.-searchParams url) "account") js/parseInt)]
+                 (json {:account a
+                        :balances (get-in c [:balances a] {})
+                        :committed (get-in c [:committed a] {})}
+                       200))
+
                "/stake"
                (let [ex (:machine-state (.-replica this))
                      c (:clearing ex)
