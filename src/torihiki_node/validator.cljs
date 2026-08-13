@@ -656,6 +656,19 @@
   visible rather than implied."
   600)
 
+(def ^:const tape-retention
+  "Prints kept in the machine, across all markets.
+
+  200 while there was one market and one reader. It is now the only place a
+  per-account fill history can come from, and it is shared by every market, so
+  a busy book would evict another market's prints in a few blocks. 2000 is
+  bounded for the same reason 200 was — this rides in every checkpoint — and
+  is roughly ten times the window it replaces.
+
+  What is lost past it is HISTORY, not state: `/fills` reports the height it
+  can see back to, so a short answer is visible rather than implied."
+  2000)
+
 (def ^:const candle-retention
   "Block candles kept in the machine. Only blocks that traded make one.
 
@@ -959,32 +972,66 @@
                                                       ex'
                                                       (update ex' :candles
                                                               (fn [cs]
-                                                                (let [c (reduce
-                                                                         (fn [c f]
-                                                                           (cndl/absorb
-                                                                            c {:level (:level f) :qty (:qty f)
-                                                                               :side (cndl/normalize-side
-                                                                                      (:taker-side f))}))
-                                                                         nil fills)]
-                                                                  (into []
-                                                                        (take-last
-                                                                         candle-retention
-                                                                         (conj (or cs [])
-                                                                               (assoc c :h (:inga.block/height block)))))))))))
+                                                                ;; Per market. This folded one book's
+                                                                ;; fills into one vector, which was
+                                                                ;; right while there was one market
+                                                                ;; and silently gave every later
+                                                                ;; market an empty chart forever.
+                                                                ;;
+                                                                ;; A vector here is a checkpoint from
+                                                                ;; before the split; it is market 1's,
+                                                                ;; because market 1 is what it could
+                                                                ;; have been about.
+                                                                (let [cs (if (vector? cs) {market-id cs} (or cs {}))]
+                                                                  (reduce
+                                                                   (fn [acc m]
+                                                                     (let [fs (bk/fills (get-in ex' [:books m]))]
+                                                                       (if (empty? fs)
+                                                                         acc
+                                                                         (let [c (reduce
+                                                                                  (fn [c f]
+                                                                                    (cndl/absorb
+                                                                                     c {:level (:level f) :qty (:qty f)
+                                                                                        :side (cndl/normalize-side
+                                                                                               (:taker-side f))}))
+                                                                                  nil fs)]
+                                                                           (update acc m
+                                                                                   (fn [v]
+                                                                                     (into []
+                                                                                           (take-last
+                                                                                            candle-retention
+                                                                                            (conj (or v [])
+                                                                                                  (assoc c :h (:inga.block/height block)))))))))))
+                                                                   cs
+                                                                   (sort (keys (:books ex'))))))))))
                                             (as-> ex'
                                                   (update ex' :tape
                                                           (fn [t]
+                                                            ;; Every market, and WHO traded.
+                                                            ;;
+                                                            ;; It read one book, so a second market's
+                                                            ;; prints never existed. And it kept only
+                                                            ;; price, size and side — so `/fills` for
+                                                            ;; an account could not be answered from
+                                                            ;; it at all, which is the first thing a
+                                                            ;; trader asks for.
                                                             (into []
                                                                   (take-last
-                                                                   200
+                                                                   tape-retention
                                                                    (concat
                                                                     (or t [])
-                                                                    (map (fn [f]
-                                                                           {:level (:level f)
-                                                                            :qty (:qty f)
-                                                                            :side (:taker-side f)
-                                                                            :h (:inga.block/height block)})
-                                                                         (bk/fills (get-in ex' [:books market-id])))))))))
+                                                                    (mapcat
+                                                                     (fn [m]
+                                                                       (map (fn [f]
+                                                                              {:m m
+                                                                               :level (:level f)
+                                                                               :qty (:qty f)
+                                                                               :side (:taker-side f)
+                                                                               :taker (:taker-owner f)
+                                                                               :maker (:maker-owner f)
+                                                                               :h (:inga.block/height block)})
+                                                                            (bk/fills (get-in ex' [:books m]))))
+                                                                     (sort (keys (:books ex'))))))))))
                                             ;; apply-block resets :rejected
                                             ;; every block, so a fold ends
                                             ;; holding only the last one's —
@@ -2645,7 +2692,11 @@
                (let [ex (:machine-state (.-replica this))
                      span (max 1 (or (js/parseInt (or (.get (.-searchParams url) "span") "10")) 1))
                      n (max 1 (min 1000 (or (js/parseInt (or (.get (.-searchParams url) "n") "200")) 200)))
-                     arr (vec (:candles ex))
+                     ;; A vector is a checkpoint from before candles were
+                     ;; per market; it is market 1's.
+                     cs (:candles ex)
+                     arr (vec (if (vector? cs) (when (= (market-param url) market-id) cs)
+                                  (get cs (market-param url))))
                      floor (when (seq arr)
                              (- (cndl/bucket span (:h (peek arr))) (* span (dec n))))
                      window (if floor (filterv #(>= (:h %) floor) arr) [])]
@@ -2746,9 +2797,51 @@
 
                "/trades"
                (let [ex (:machine-state (.-replica this))
-                     n (js/parseInt (or (.get (.-searchParams url) "n") "20"))]
-                 (json {:market market-id
-                        :trades (vec (reverse (take-last n (:tape ex []))))} 200))
+                     m (market-param url)
+                     n (js/parseInt (or (.get (.-searchParams url) "n") "20"))
+                     ;; A print with no market is from before the tape carried
+                     ;; one, and market 1 is what it could have been about.
+                     mine (filter #(= m (:m % market-id)) (:tape ex []))]
+                 (json {:market m
+                        :trades (vec (reverse (take-last n mine)))} 200))
+
+               ;; One account's fills, newest first.
+               ;;
+               ;; The first thing a trader asks for and the thing this could
+               ;; not answer: the tape kept price, size and side and threw the
+               ;; owners away, so there was nothing to filter by.
+               ;;
+               ;; `:side` is from THIS account's point of view — a maker on the
+               ;; other side of a buy sold. Reporting the taker's side to both
+               ;; parties would tell one of them the opposite of what happened.
+               "/fills"
+               (let [ex (:machine-state (.-replica this))
+                     want (some-> (.get (.-searchParams url) "account") js/parseInt)
+                     n (max 1 (min 500 (or (js/parseInt (or (.get (.-searchParams url) "n") "100")) 100)))
+                     tape (:tape ex [])
+                     mine (when want
+                            (for [f tape
+                                  :let [taker? (= want (:taker f))
+                                        maker? (= want (:maker f))]
+                                  :when (or taker? maker?)]
+                              {:m (:m f market-id)
+                               :h (:h f)
+                               :level (:level f)
+                               :qty (:qty f)
+                               :role (if taker? "taker" "maker")
+                               ;; `side` on a print is the TAKER's. A maker is
+                               ;; on the other side of it by construction.
+                               :side (if taker?
+                                       (:side f)
+                                       (if (zero? (:side f)) 1 0))}))]
+                 (json {:account want
+                        :fills (vec (reverse (take-last n (vec mine))))
+                        ;; How far back this can see. A short history is a fact
+                        ;; about the window, and an unstated one reads as
+                        ;; "you have not traded".
+                        :retained-from (:h (first tape))
+                        :retention tape-retention}
+                       200))
 
                "/book"
                (json (let [ex (:machine-state (.-replica this))]
