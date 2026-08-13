@@ -66,6 +66,7 @@
             [torihiki.auth :as auth]
             [torihiki.clearing :as cl]
             [torihiki.evm :as evm]
+            [torihiki.snapshot :as tsnap]
             [torihiki.thorchain :as tc]
             [torihiki.state :as st]))
 
@@ -203,8 +204,8 @@
 
 ;; ── the node ────────────────────────────────────────────────────────────────
 
-(defonce state
-  (atom (r/replica {:witness me
+(defn- replica-opts []
+  {:witness me
                     :witnesses witnesses
                     :quorum (c/quorum-size (count witnesses))
                     ;; hex of SHA-256 over the canonical block.
@@ -225,7 +226,15 @@
                     :chain-id chain-id
                     :sign-fn (sign-as me)
                     :verify-fn verify-fn
-                    :machine machine})))
+                    :machine machine})
+
+;; One definition of what this replica IS. `resume` needs exactly the options
+;; `replica` took — the injected seams are functions and a snapshot cannot
+;; carry them, so the caller puts them back. Two copies of this map would be
+;; two definitions: a different hash-fn or machine on the resume path is a
+;; replica that agrees on the order and disagrees on the result, which every
+;; number about it would hide.
+(defonce state (atom (r/replica (replica-opts))))
 
 (defonce registry (atom {}))
 (defonce out-node (atom nil))
@@ -457,6 +466,81 @@
               "\n"))
         (reset! persisted (count chain))))))
 
+(def ^:const checkpoint-every
+  "How many blocks between checkpoints. **500.**
+
+  The log alone is enough to come back, and it is the wrong thing to come back
+  with once it is long: replay is O(chain), and a startup that grows without
+  bound is a restart that eventually does not finish. On the Worker that is
+  not a slow boot but a killed one — a Durable Object exceeding its CPU budget
+  is RESET, so it boots, replays, exceeds it again, and never starts."
+  500)
+
+(def ^:const checkpoints-kept
+  "How many to keep. **8**, and the number is not for redundancy.
+
+  A replica repairing itself from peers needs a height it and they both hold,
+  and a replica far enough behind to need repairing is exactly the one whose
+  window has stopped overlapping. Two was measured to be too few on the
+  deployment: the one replica that needed the state was the reason nobody
+  could give it any."
+  8)
+
+(defonce last-ckpt (atom -1))
+
+(defn- ckpt-path [h]
+  (str data-dir "/snap-" (.padStart (str h) 12 "0") ".edn"))
+
+(defn- checkpoint!
+  "The replica as data, so a restart does not have to fold the whole log.
+
+  TWO snapshots compose here and each covers what the other cannot.
+  `inga.replica/snapshot` bounds the consensus state — a tail of the chain,
+  the certificates naming it, the pacemaker, and the `:voted-below` watermark
+  that keeps a resumed replica from voting twice. Its `:machine-state` it
+  carries whole, and this machine is an exchange holding `Book` records backed
+  by typed arrays, which is not data and does not serialise.
+  `torihiki.snapshot/capture` turns that into plain data whose
+  `canonical-bytes` are byte-identical on restore — the only equality that
+  matters here, because two states can be `=` and encode differently, and it
+  is the encoding a validator signs."
+  []
+  (let [s @state
+        h (r/height s)]
+    (when (and (pos? h) (zero? (mod h checkpoint-every)) (not= h @last-ckpt))
+      (try
+        (fs/writeFileSync (ckpt-path h)
+                          (tsnap/write-string
+                           (update (r/snapshot s) :machine-state tsnap/capture)))
+        (reset! last-ckpt h)
+        (doseq [f (drop checkpoints-kept
+                        (sort (fn [a b] (compare b a))
+                              (filter #(str/starts-with? % "snap-")
+                                      (array-seq (fs/readdirSync data-dir)))))]
+          (fs/unlinkSync (str data-dir "/" f)))
+        (catch :default _
+          ;; A checkpoint that fails is a slower restart, not a broken
+          ;; replica. It must never take the tick with it.
+          nil)))))
+
+(defn- newest-checkpoint
+  "The most recent checkpoint on disk, as `[height snapshot]`, or nil.
+
+  Newest FIRST and the first one that reads wins. A checkpoint that will not
+  parse is skipped rather than fatal — it is one slower start, and the older
+  ones behind it are exactly what `checkpoints-kept` is for."
+  []
+  (when (fs/existsSync data-dir)
+    (some (fn [f]
+            (try
+              (let [h (js/parseInt (subs f 5 (- (count f) 4)) 10)
+                    snap (tsnap/read-string* (fs/readFileSync (str data-dir "/" f) "utf8"))]
+                [h (update snap :machine-state tsnap/restore)])
+              (catch :default _ nil)))
+          (sort (fn [a b] (compare b a))
+                (filter #(str/starts-with? % "snap-")
+                        (array-seq (fs/readdirSync data-dir)))))))
+
 (defn- restore!
   "Replay the log into the replica.
 
@@ -473,18 +557,34 @@
   chain this replica never agreed to out of the pieces of one it did."
   []
   (fs/mkdirSync data-dir #js {:recursive true})
-  (when (fs/existsSync log-path)
-    (let [lines (remove str/blank? (str/split (fs/readFileSync log-path "utf8") #"\n"))
-          blocks (reduce (fn [acc l]
-                           (let [[msg] (wire/decode (js->clj (js/JSON.parse l)))]
-                             (if-let [b (:block msg)]
-                               (conj acc b)
-                               (reduced acc))))
-                         [] lines)]
-      (when (seq blocks)
-        (swap! state r/replay blocks)
-        (reset! persisted (count (:chain @state)))
-        (println (str "  restored " (count blocks) " blocks, height "
+  ;; The checkpoint first, then only the log ABOVE it.
+  ;;
+  ;; Replaying from zero is correct and gets slower every block; the point of
+  ;; a checkpoint is that everything at or below it is already folded in.
+  ;; `resume` also leaves the `:voted-below` watermark, which refuses at least
+  ;; as much as the folded set did — refusing more costs a vote at a height
+  ;; already decided, refusing less is equivocation.
+  (let [[ck snap] (newest-checkpoint)]
+    (when snap
+      (swap! state (fn [_] (r/resume (replica-opts) snap)))
+      (reset! last-ckpt ck)
+      (println (str "  resumed from checkpoint " ck)))
+    (when (fs/existsSync log-path)
+      (let [lines (remove str/blank? (str/split (fs/readFileSync log-path "utf8") #"\n"))
+            blocks (reduce (fn [acc l]
+                             (let [[msg] (wire/decode (js->clj (js/JSON.parse l)))]
+                               (if-let [b (:block msg)]
+                                 (conj acc b)
+                                 (reduced acc))))
+                           [] lines)
+            above (filterv #(> (:inga.block/height %) (or ck 0)) blocks)]
+        (when (seq above)
+          (swap! state r/replay above))
+        ;; `persisted` counts LINES already written, not blocks folded — the
+        ;; log still holds everything below the checkpoint and appending from
+        ;; the chain's count would write those heights a second time.
+        (reset! persisted (count blocks))
+        (println (str "  restored " (count above) " blocks above it, height "
                       (r/height @state)))))))
 
 ;; ── the escrow watcher ──────────────────────────────────────────────────────
@@ -580,7 +680,8 @@
          (reset! state s')
          (note-height! (r/height s'))
          (ship! out)
-         (persist!)))
+         (persist!)
+         (checkpoint!)))
      tick-ms)
     (watch-thorchain!)
     (println (str "torihiki " me " · peers " port " · http " (env "HTTP_PORT" "8801")
