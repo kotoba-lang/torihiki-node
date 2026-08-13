@@ -430,6 +430,13 @@
                                                         :next-in (when (:next-attempt v)
                                                                    (- (:next-attempt v) (now)))}]))
                       :block-ms (quantiles (:blocks @stats))
+                      ;; Why a segment was refused, from `inga.replica` itself.
+                      ;; A replica that is behind and not catching up looks
+                      ;; exactly like one that is behind and being ignored;
+                      ;; this is the difference.
+                      :last-sync (:last-sync s)
+                      :last-proposal (:last-proposal s)
+                      :propose-refusal (:propose-refusal s)
                       :substrate "process"})
 
       ;; The block hash at a given height, which is how two replicas are
