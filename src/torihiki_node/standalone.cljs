@@ -686,16 +686,38 @@
   namespace docstring gives — the part that needs a network to run is the part
   that cannot be tested, so it holds as little as possible.
 
-  Off unless `THOR_VAULT` is set. A watcher with no vault to watch would poll
+  Off unless `THOR_CHAIN` is set. A watcher with no chain to watch would poll
   a public endpoint forever and attest nothing, which is a cost with no
-  answer."
+  answer.
+
+  ## The vault is FETCHED, and it moves
+
+  It was an env var. THORChain rotates its asgard every few days, so a pinned
+  address stops being the vault — and a watcher holding one would go on polling
+  and simply stop crediting deposits, saying nothing, while the venue kept
+  running. `/thorchain/inbound_addresses` is asked every poll for the chain we
+  serve, and every address it has ever named is REMEMBERED: a deposit sent to
+  the outgoing vault minutes before a rotation is still a real deposit.
+
+  `THOR_VAULT` still pins one, for a test that must not depend on the network."
   []
-  (when-let [vault (env "THOR_VAULT" nil)]
+  (when-let [chain (env "THOR_CHAIN" nil)]
     (let [base (env "THOR_URL" "https://thornode.ninerealms.com")
-          every (js/parseInt (env "THOR_POLL_MS" "6000") 10)]
-      (println (str "  escrow: watching " vault " via " base))
+          every (js/parseInt (env "THOR_POLL_MS" "6000") 10)
+          vaults (atom (if-let [v (env "THOR_VAULT" nil)] #{v} #{}))
+          refresh! (fn []
+                     (-> (js/fetch (str base "/thorchain/inbound_addresses"))
+                         (.then #(.json %))
+                         (.then (fn [j]
+                                  (doseq [e (array-seq j)]
+                                    (when (= chain (aget e "chain"))
+                                      (when-let [a (aget e "address")]
+                                        (swap! vaults conj a))))))
+                         (.catch (fn [_] nil))))]
+      (println (str "  escrow: watching " chain " via " base))
       (js/setInterval
        (fn []
+         (refresh!)
          (-> (js/fetch (str base "/thorchain/lastblock"))
              (.then #(.json %))
              (.then (fn [j]
@@ -707,7 +729,7 @@
                                      (let [os (js->clj obs)]
                                        (doseq [tx (tc/deposits-in
                                                    (derive-account (pub-of me))
-                                                   vault tip os)]
+                                                   @vaults tip os)]
                                          (attest! tx))
                                        (doseq [tx (tc/payouts-in
                                                    (derive-account (pub-of me))
