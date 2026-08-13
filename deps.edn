@@ -59,4 +59,4 @@
         ;; rather than by a keeper, and cancel-all / amend.
         io.github.kotoba-lang/torihiki
         {:git/url "https://github.com/kotoba-lang/torihiki.git"
-         :git/sha "bf5d93847967b2bbc1491f797d7cb76f6c432b82"}}}
+         :git/sha "1752fb0e042944d48b23f346c7d3dfc3eec8b656"}}}
