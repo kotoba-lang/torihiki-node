@@ -10,7 +10,11 @@
   ;; test runs is a contract nobody can call.
   (or (some-> js/process .-env .-TORIHIKI_BASE)
       "https://torihiki-validator-v2.04-feasts-minded.workers.dev"))
-(def chain-id "torihiki-engi-devnet-1")
+(def chain-id
+  ;; The standalone's default. A chain id that does not match the node's is a
+  ;; signature over a different payload, which comes back as `bad-signature`
+  ;; and reads as a key problem.
+  (or (some-> js/process .-env .-CHAIN_ID) "torihiki-standalone-1"))
 (defn b64 [b] (.toString b "base64"))
 (defn derive-account [pub]
   (let [d (sha256 (js/Buffer.from pub "base64"))]

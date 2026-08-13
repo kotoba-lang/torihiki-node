@@ -745,8 +745,8 @@
   The first attempt to test this did not diverge at all: two clusters run
   separately produced the SAME chain, because a block here is a pure function
   of its parent — same genesis, same leader order, and `:ts` from the block
-  interval rather than a wall clock. That determinism is why "bring another
-  cluster's history" is not a test, and why breaking one block is.
+  interval rather than a wall clock. That determinism is why bringing another
+  cluster history is not a test, and why breaking one block is.
 
   Triggered by NOT MOVING, not by a reason string.
 
