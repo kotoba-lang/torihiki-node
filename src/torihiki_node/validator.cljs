@@ -401,7 +401,7 @@
   idle enough to be evicted. **Deployed and running are different facts** —
   ADR-2608020330 says so, and this constant is what makes the difference
   visible instead of assumed."
-  "105")
+  "109")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -981,10 +981,16 @@
                                      ;; commit rule is not something to change
                                      ;; under a chain that cannot be given the
                                      ;; code that changes it.
-                                     ;; REVERTED to three-chain. See the
-                                     ;; commit that reverts it: two-chain
-                                     ;; passes inga's socket harness and
-                                     ;; stalled this deployment.
+                                     ;; Two-chain on the v2 genesis set.
+                                     ;;
+                                     ;; It stalled this chain once, and the
+                                     ;; stall was the DEPLOY, not the rule: a
+                                     ;; restart brought four replicas back
+                                     ;; from checkpoints 100 apart, 2 against
+                                     ;; 2, and nothing after the split could
+                                     ;; ever be certified. `/reset` on all four
+                                     ;; recovered it. Retried here with that
+                                     ;; recovery path in hand.
                                      :commit-rule :three-chain
                                      :chain-id chain-id
                                      ;; No special case for our own witness.
@@ -1215,13 +1221,20 @@
                        ;; trying to avoid. Past the bound it stops issuing and
                        ;; says so, which is recoverable; the caller retries
                        ;; once blocks catch up.
-                       ;; The chain's expected nonce, not a guess past it.
-                       ;; See `listMissingMarkets` for the failure: a tx that
-                       ;; fails authentication never consumes its nonce, so a
-                       ;; counter that advances on SUBMIT runs permanently
-                       ;; ahead of a chain that is still waiting for the one
-                       ;; that failed — and nonces are strictly sequential, so
-                       ;; nothing after the gap can ever apply.
+                       ;; The chain's expected nonce.
+                       ;;
+                       ;; Counting from what was last SUBMITTED runs
+                       ;; permanently ahead when a transaction fails
+                       ;; authentication — it never consumes its nonce, and
+                       ;; nonces are strictly sequential, so nothing after the
+                       ;; gap can apply. Measured: every bridge transaction
+                       ;; stopped landing, faucet included.
+                       ;;
+                       ;; The cost is that two grants asked for within a block
+                       ;; both see this number and one is refused as
+                       ;; `bad-nonce`. A caller that wants two waits for the
+                       ;; first. Combining the two rules was tried and made it
+                       ;; worse — see the commit that reverted it.
                        nonce (tauth/expected-nonce ex bridge)
                        tx {:tx :deposit :account bridge :credit account
                            :amount faucet-grant}
