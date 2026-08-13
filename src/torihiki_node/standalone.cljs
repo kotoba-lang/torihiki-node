@@ -53,6 +53,7 @@
 (ns torihiki-node.standalone
   (:require ["ws" :as ws]
             ["node:crypto" :as nc]
+            ["node:fs" :as fs]
             ["node:http" :as http]
             ["@noble/hashes/sha2.js" :refer [sha256]]
             [clojure.string :as str]
@@ -422,6 +423,70 @@
 
 ;; ── start ───────────────────────────────────────────────────────────────────
 
+;; ── the log ─────────────────────────────────────────────────────────────────
+
+(def data-dir (env "DATA_DIR" (str ".torihiki/" me)))
+
+(def ^:private log-path (str data-dir "/chain.jsonl"))
+
+(defonce persisted (atom 0))
+
+(defn- persist!
+  "Append every block adopted since the last write.
+
+  Cheap because the chain only grows: a block already in the log is a block
+  this replica already decided to keep. The encoding is the Worker's — a
+  `wire`-encoded proposal, one JSON object per line — so the two deployments
+  write the same bytes for the same block and a log written by one can be read
+  by the other.
+
+  Synchronous. The volume is one small line per block and the ordering is the
+  whole point: an append that lands out of order is a log that replays into a
+  different chain. An async writer would need its own queue to promise what
+  `appendFileSync` promises for free."
+  []
+  (let [chain (:chain @state)
+        from @persisted]
+    (when (< from (count chain))
+      (let [new (subvec chain (min from (count chain)))]
+        (fs/appendFileSync
+         log-path
+         (str (str/join "\n" (for [b new]
+                                (js/JSON.stringify
+                                 (clj->js (wire/encode {:type :proposal :block b})))))
+              "\n"))
+        (reset! persisted (count chain))))))
+
+(defn- restore!
+  "Replay the log into the replica.
+
+  `r/replay` is what restores the chain, the certificates and the heights this
+  replica already voted at — and, since the fix that closed the deploy-stall,
+  the VIEW its own tip was proposed in. Without the log a restarted replica
+  comes back at genesis and, if it leads, proposes a fresh block for a height
+  it has already voted at. That is equivocation committed by accident against
+  itself, and it is what four validators on Cloudflare did before they had
+  one.
+
+  A line that will not decode stops the replay rather than being skipped. The
+  blocks after a hole do not attach to anything, so continuing would build a
+  chain this replica never agreed to out of the pieces of one it did."
+  []
+  (fs/mkdirSync data-dir #js {:recursive true})
+  (when (fs/existsSync log-path)
+    (let [lines (remove str/blank? (str/split (fs/readFileSync log-path "utf8") #"\n"))
+          blocks (reduce (fn [acc l]
+                           (let [[msg] (wire/decode (js->clj (js/JSON.parse l)))]
+                             (if-let [b (:block msg)]
+                               (conj acc b)
+                               (reduced acc))))
+                         [] lines)]
+      (when (seq blocks)
+        (swap! state r/replay blocks)
+        (reset! persisted (count (:chain @state)))
+        (println (str "  restored " (count blocks) " blocks, height "
+                      (r/height @state)))))))
+
 ;; ── the escrow watcher ──────────────────────────────────────────────────────
 
 (defonce watcher-nonce (atom 0))
@@ -490,6 +555,10 @@
                                      {:add-listener (fn [s ev f] (.on s ev f))
                                       :on-message (fn [_ m] (feed! m))})]
              (swap! registry update peer merge handle))))
+    ;; BEFORE dialling. A replica that starts talking at genesis while its own
+    ;; history is still on disk is a replica proposing against a chain it is
+    ;; about to discover it already has.
+    (restore!)
     (reset! out-node
             (nws/make-node {:peers (vec (remove #{me} witnesses))
                             :url-of peer-url
@@ -510,7 +579,8 @@
        (let [[s' out] (r/on-tick @state (now))]
          (reset! state s')
          (note-height! (r/height s'))
-         (ship! out)))
+         (ship! out)
+         (persist!)))
      tick-ms)
     (watch-thorchain!)
     (println (str "torihiki " me " · peers " port " · http " (env "HTTP_PORT" "8801")
