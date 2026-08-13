@@ -6,7 +6,14 @@
             [torihiki.address :as addr]
             [promesa.core :as p]))
 
-(def base "https://torihiki-validator.04-feasts-minded.workers.dev")
+(def base
+  ;; v2 by default. These pointed at the FIRST deployment, which has been
+  ;; stuck on `code-version 100` since deploys stopped reaching it — so a
+  ;; failure here was a fact about a chain nobody can fix rather than about
+  ;; the code under test. `TORIHIKI_BASE` overrides for the rare case where
+  ;; the old chain IS the subject.
+  (or (some-> js/process .-env .-TORIHIKI_BASE)
+      "https://torihiki-validator-v2.04-feasts-minded.workers.dev"))
 (def chain-id "torihiki-engi-devnet-1")
 
 (defn b64 [buf] (js/btoa (.apply js/String.fromCharCode nil (js/Uint8Array. buf))))

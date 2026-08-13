@@ -4,7 +4,14 @@
 ;; the thing in dispute.
 (ns snapshot-quorum-check
   (:require [torihiki.snapshot :as tsnap] [torihiki.state :as st] [promesa.core :as p]))
-(def base "https://torihiki-validator.04-feasts-minded.workers.dev")
+(def base
+  ;; v2 by default. These pointed at the FIRST deployment, which has been
+  ;; stuck on `code-version 100` since deploys stopped reaching it — so a
+  ;; failure here was a fact about a chain nobody can fix rather than about
+  ;; the code under test. `TORIHIKI_BASE` overrides for the rare case where
+  ;; the old chain IS the subject.
+  (or (some-> js/process .-env .-TORIHIKI_BASE)
+      "https://torihiki-validator-v2.04-feasts-minded.workers.dev"))
 (defn GET [p*] (p/let [r (js/fetch (str base p*)) j (.json r)] (js->clj j :keywordize-keys true)))
 (p/let [rs (p/all (for [w ["w1" "w2" "w3" "w4"]] (GET (str "/snapshot?w=" w "&h=1274600"))))
         scored (doall
