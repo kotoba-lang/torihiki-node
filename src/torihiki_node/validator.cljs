@@ -3033,6 +3033,20 @@
                ;; authorised and when each one dies. Public: an agent public
                ;; key is public by construction, and hiding which keys may act
                ;; would hide it from the owner too.
+               ;; Working TWAPs, so a trader can see what is still to be
+               ;; executed on their behalf and cancel it.
+               "/twaps"
+               (let [ex (:machine-state (.-replica this))
+                     want (some-> (.get (.-searchParams url) "account") js/parseInt)]
+                 (json {:account want
+                        :height (r/height (.-replica this))
+                        :twaps (vec (for [[id t] (sort (:twaps ex {}))
+                                          :when (or (nil? want) (= want (:account t)))]
+                                      (assoc (select-keys t [:market :side :remaining
+                                                             :slices-left :every :next-at])
+                                             :id id)))}
+                       200))
+
                "/agents"
                (let [ex (:machine-state (.-replica this))
                      want (some-> (.get (.-searchParams url) "account") js/parseInt)]
