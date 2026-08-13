@@ -1758,12 +1758,31 @@
   ;; whose eviction is routine and load-bearing — `witnesses` explains what
   ;; four replicas with a quorum of three do under churn. A subscriber must
   ;; not be able to pin a validator in memory by opening a tab.
+  ;; ## Woken by the TIP, not by the commit
+  ;;
+  ;; This fired on `committed-height` first, and an A/B against the poll it
+  ;; replaced measured it arriving 625 ms LATE at the median — the poll it was
+  ;; supposed to beat was winning every single height.
+  ;;
+  ;; Chained HotStuff commits three rounds behind, so `committed` runs about
+  ;; two blocks behind `height`, and `height` is what `/head` reports and what
+  ;; the terminal puts on screen. Waking on the commit meant waking the page
+  ;; two blocks after the number it displays had already changed.
+  ;;
+  ;; The tip is the right trigger because the page re-fetches everything when
+  ;; woken: it gets the newest label AND the newest committed data in the same
+  ;; pass. Waking more often than the data strictly changes costs one fetch;
+  ;; waking later than the display changes costs the whole point.
+  ;;
+  ;; Both numbers ride along, so a subscriber that cares about finality rather
+  ;; than about the tip does not have to ask a second time to tell them apart.
   (notify! [this]
-    (let [h (r/committed-height (.-replica this))]
+    (let [h (r/height (.-replica this))]
       (when (not= h (.-notifiedAt this))
         (set! (.-notifiedAt this) h)
         (let [msg (js/JSON.stringify
                    #js {"height" h
+                        "committed" (r/committed-height (.-replica this))
                         "state-root" (r/state-root (.-replica this))
                         "witness" (.-witness this)})]
           (doseq [ws (array-seq (.getWebSockets ^js do-state))]
