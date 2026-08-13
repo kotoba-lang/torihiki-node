@@ -44,4 +44,4 @@
         ;; chain.
         io.github.kotoba-lang/torihiki
         {:git/url "https://github.com/kotoba-lang/torihiki.git"
-         :git/sha "89b7f1742e056e1c0753682185214294ea33efef"}}}
+         :git/sha "61cb5b6c26cf3d20d0be761f03c44b83edcc3b26"}}}

@@ -1,0 +1,52 @@
+;; cancel-all and amend against the DEPLOYED chain, signed here.
+(ns order-mgmt-e2e
+  (:require [torihiki.auth :as auth] [torihiki.address :as addr] [promesa.core :as p]))
+(def base "https://torihiki-validator.04-feasts-minded.workers.dev")
+(def chain-id "torihiki-engi-devnet-1")
+(defn b64 [b] (js/btoa (.apply js/String.fromCharCode nil (js/Uint8Array. b))))
+(defn GET [pth] (p/let [r (js/fetch (str base pth)) j (.json r)] (js->clj j :keywordize-keys true)))
+(defn POST [pth b] (p/let [r (js/fetch (str base pth) #js {:method "POST" :body (js/JSON.stringify (clj->js b))}) j (.json r)] (js->clj j :keywordize-keys true)))
+(defn tx [{:keys [sk pub acct]} nonce t]
+  (p/let [pay (auth/signing-payload chain-id acct nonce t)
+          sig (js/crypto.subtle.sign #js {:name "Ed25519"} sk (.encode (js/TextEncoder.) pay))]
+    (POST "/tx?w=w1" {:tx t :account acct :nonce nonce :pubkey pub :sig (b64 sig)})))
+(defn wait [ms] (p/create (fn [r _] (js/setTimeout r ms))))
+(defn mk [] (p/let [kp (js/crypto.subtle.generateKey #js {:name "Ed25519"} true #js ["sign" "verify"])
+                    raw (js/crypto.subtle.exportKey "raw" (.-publicKey kp)) pub (b64 raw)]
+              {:sk (.-privateKey kp) :pub pub :acct (addr/derive pub)}))
+(defn mine [o a] (->> (:orders o) (filter #(= a (:owner %))) (sort-by :level)))
+
+(p/let [m (mk) other (mk)
+        _ (println "maker" (:acct m))
+        _ (tx m 1 {:tx :deposit :account (:acct m) :amount 1000000000})
+        _ (tx other 1 {:tx :deposit :account (:acct other) :amount 1000000000})
+        _ (wait 6000)
+        _ (tx m 2 {:tx :order :account (:acct m) :market 1 :side 0 :level 40 :qty 5 :flags 0})
+        _ (tx m 3 {:tx :order :account (:acct m) :market 1 :side 0 :level 41 :qty 5 :flags 0})
+        _ (tx m 4 {:tx :order :account (:acct m) :market 1 :side 0 :level 42 :qty 5 :flags 0})
+        _ (tx other 2 {:tx :order :account (:acct other) :market 1 :side 0 :level 43 :qty 5 :flags 0})
+        _ (wait 8000)
+        o1 (GET "/orders?w=w1")
+        placed (mine o1 (:acct m))
+        _ (println "resting after 3 orders:" (count placed) (mapv :level placed))
+        ;; amend the middle one down: must keep its id (in-place reduction)
+        target (second placed)
+        _ (tx m 5 {:tx :amend :account (:acct m) :market 1
+                   :oid (:oid target) :level (:level target) :qty 2})
+        _ (wait 8000)
+        o2 (GET "/orders?w=w1")
+        amended (first (filter #(= (:oid target) (:oid %)) (:orders o2)))
+        _ (println "amended:" (pr-str (select-keys amended [:oid :level :qty])))
+        _ (tx m 6 {:tx :cancel-all :account (:acct m) :market 1})
+        _ (wait 8000)
+        o3 (GET "/orders?w=w1")
+        left (mine o3 (:acct m))
+        others (mine o3 (:acct other))]
+  (println)
+  (cond
+    (not= 3 (count placed)) (println "INCONCLUSIVE — the maker never got 3 resting orders")
+    (nil? amended) (println "FAIL — amend removed the order instead of resizing it")
+    (not= 2 (:qty amended)) (println "FAIL — amend did not resize; qty is" (:qty amended))
+    (seq left) (println "FAIL — cancel-all left" (count left) "orders")
+    (empty? others) (println "FAIL — cancel-all also removed somebody else's order")
+    :else (println "PASS — amend resized in place (same oid), cancel-all took only the maker out")))
