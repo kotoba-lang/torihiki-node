@@ -611,10 +611,29 @@
   once per view precisely so this cannot become a flood — and at two thousand
   views past the height, once per view IS a flood.
 
-  Nothing here is a fix. It is written down because the shape is specific and
-  the next person to look will otherwise start from `votes-for-tip 1`, which
-  says a vote is missing and not that it was outnumbered nine to one by the
-  machinery meant to help it."
+  ## And then the actual answer, which was not the flood
+
+  Putting a floor under the asking changed the traffic and not the stall. What
+  the stall WAS, read off the tips:
+
+      w1  …kxfj5wffcpw4   height 40853
+      w3  …qbam4z2uc3hy   height 40853
+      w4  …qbam4z2uc3hy   height 40853
+      w2  …trbp5zyxuc2m   height 40842
+
+  **Three chains among four replicas.** Not a missing vote — no side can reach
+  three. w2\'s own repair says so in one line:
+
+      adopt-check {ok false, reason "no-quorum-agreed-on-a-state", height 40700}
+
+  which is the correct answer: there is no quorum state to adopt, so it
+  refuses to invent one. A four-replica chain where no three agree does not
+  come back on its own, by design. `/reset` is the only exit, and it costs the
+  history.
+
+  Both readings above — `votes-for-tip 1` and the 9:1 traffic — were true and
+  neither was the cause. The tips were the cause, and it took splitting
+  `:uncertified` from `:does-not-link` to be able to see it."
   :documented)
 
 (def ^:const tick-ms
