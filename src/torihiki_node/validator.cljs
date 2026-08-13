@@ -624,10 +624,10 @@
 
   Each market costs a book slab, so the ladder is deliberately small here —
   4096 ticks is plenty for a devnet and the memory is per market."
-  [(assoc (cl/market {:id 1 :max-leverage 40 :tick 10 :lot 1})
+  [(assoc (cl/market {:id 1 :symbol "BTC-PERP" :max-leverage 40 :tick 10 :lot 1})
           :taker-fee-rate 350000
           :maker-fee-rate 100000)
-   (assoc (cl/market {:id 2 :max-leverage 20 :tick 10 :lot 1})
+   (assoc (cl/market {:id 2 :symbol "ETH-PERP" :max-leverage 20 :tick 10 :lot 1})
           :taker-fee-rate 500000
           :maker-fee-rate 100000)])
 
@@ -1106,10 +1106,36 @@
   ;; listed is refused by the engine. Same shape as `/faucet`: an open door
   ;; onto a bounded, reviewed action.
   (listMissingMarkets [this]
+    ;; Bring the chain's markets in line with this build: list what is absent,
+    ;; and amend what is present and different.
+    ;;
+    ;; The amend half exists because the first version only listed. Market 1
+    ;; and 2 were on the chain from before markets had names, so `/markets`
+    ;; answered `symbol: null` while the build said `BTC-PERP` — config in the
+    ;; source is not state on the chain, which is the same lesson listing
+    ;; itself was added for.
+    ;;
+    ;; `:tick` and `:lot` are refused by the engine, so an amend cannot
+    ;; reprice a resting order however wrong this build's opinion of them is.
     (let [ex (:machine-state (.-replica this))
-          missing (remove #(contains? (:markets ex) (:id %)) markets)]
-      (if (empty? missing)
-        (js/Promise.resolve {:listed [] :note "every market in this build is already on the chain"})
+          on-chain (:markets ex)
+          missing (remove #(contains? on-chain (:id %)) markets)
+          stale (filter (fn [m]
+                          (when-let [cur (get on-chain (:id m))]
+                            (not= (dissoc (assoc m :id (:id m)) :tick :lot)
+                                  (select-keys cur (keys (dissoc m :tick :lot))))))
+                        markets)
+          ;; A market with no price can be traded and never margined — mark
+          ;; zero — so opening one is part of bringing the chain in line with
+          ;; the build, not a separate errand. The engine lets the authority do
+          ;; this exactly once per market, and the condition closes behind it.
+          unpriced (filter #(zero? (get-in ex [:oracle (:id %)] 0)) markets)
+          work (concat (map (fn [m] [:list m]) missing)
+                       (map (fn [m] [:amend m]) stale)
+                       (map (fn [m] [:price m]) unpriced))]
+      (if (empty? work)
+        (js/Promise.resolve {:listed [] :amended []
+                             :note "the chain already matches this build"})
         (-> (.faucetKey this)
             (.then
              (fn [^js k]
@@ -1119,14 +1145,20 @@
                  (-> (js/Promise.all
                       (clj->js
                        (map-indexed
-                        (fn [i m]
+                        (fn [i [kind m]]
                           (let [nonce (+ start i)
-                                tx {:tx :list-market :account bridge :market (:id m)
-                                    :spec (dissoc m :id)
-                                    ;; Small on purpose: a book costs its slab,
-                                    ;; and a devnet market does not need the
-                                    ;; ladder the first one was given.
-                                    :book-opts {:n-levels 4096 :cap 65536 :ev-cap 65536}}
+                                tx (case kind
+                                     :list {:tx :list-market :account bridge :market (:id m)
+                                            :spec (dissoc m :id)
+                                            :book-opts {:n-levels 4096 :cap 65536 :ev-cap 65536}}
+                                     :amend {:tx :amend-market :account bridge :market (:id m)
+                                             :spec (dissoc m :id :tick :lot)}
+                                     ;; The same number genesis gives the first
+                                     ;; market: a devnet has no feed, and two
+                                     ;; markets opening at different prices
+                                     ;; would imply one.
+                                     :price {:tx :oracle :account bridge
+                                             :market (:id m) :price 1000})
                                 payload (tauth/signing-payload chain-id bridge nonce tx)]
                             (-> (js/crypto.subtle.sign #js {:name "Ed25519"}
                                                        (.-privateKey k)
@@ -1140,9 +1172,14 @@
                                                  (r/submit (.-replica this)
                                                            (js/JSON.stringify (clj->js env))))
                                            (set! (.-lastFaucetNonce this) nonce)
-                                           {:market (:id m) :nonce nonce}))))))
-                        missing)))
-                     (.then (fn [rs] {:listed (vec (array-seq rs)) :bridge bridge})))))))))) 
+                                           {:kind kind :market (:id m) :nonce nonce}))))))
+                        work)))
+                     (.then (fn [rs]
+                              (let [rs (vec (array-seq rs))]
+                                {:listed (filterv #(= "list" (name (:kind %))) rs)
+                                 :amended (filterv #(= "amend" (name (:kind %))) rs)
+                                 :opened (filterv #(= "price" (name (:kind %))) rs)
+                                 :bridge bridge})))))))))))
 
   (boot [this name]
     ;; Re-boots when the name it holds is not the name it is being addressed
