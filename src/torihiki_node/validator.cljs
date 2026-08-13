@@ -626,10 +626,25 @@
   4096 ticks is plenty for a devnet and the memory is per market."
   [(assoc (cl/market {:id 1 :symbol "BTC-PERP" :max-leverage 40 :tick 10 :lot 1})
           :taker-fee-rate 350000
-          :maker-fee-rate 100000)
+          :maker-fee-rate 100000
+          ;; Volume tiers. The first is the base, so an account with no
+          ;; history pays exactly what it paid before tiers existed — the
+          ;; schedule adds a discount, it does not reprice the floor.
+          ;;
+          ;; The window is `torihiki.clearing/volume-epoch-blocks` wide in
+          ;; blocks, not days: the engine has no clock. At the cadence this
+          ;; chain runs it is a few hours, which is a devnet number and not a
+          ;; policy — a real schedule would be set by whoever prices the
+          ;; venue.
+          :fee-tiers [{:min-volume 0          :taker-fee-rate 350000 :maker-fee-rate 100000}
+                      {:min-volume 100000000 :taker-fee-rate 250000 :maker-fee-rate 50000}
+                      {:min-volume 1000000000 :taker-fee-rate 150000 :maker-fee-rate 0}])
    (assoc (cl/market {:id 2 :symbol "ETH-PERP" :max-leverage 20 :tick 10 :lot 1})
           :taker-fee-rate 500000
-          :maker-fee-rate 100000)])
+          :maker-fee-rate 100000
+          :fee-tiers [{:min-volume 0          :taker-fee-rate 500000 :maker-fee-rate 100000}
+                      {:min-volume 100000000 :taker-fee-rate 350000 :maker-fee-rate 50000}
+                      {:min-volume 1000000000 :taker-fee-rate 200000 :maker-fee-rate 0}])])
 
 (def market
   "The first market. Kept because the read routes default to a market when the
@@ -1201,8 +1216,23 @@
             (.then
              (fn [^js k]
                (let [bridge @faucet-account
-                     start (max (tauth/expected-nonce (:machine-state (.-replica this)) bridge)
-                                (inc (or (.-lastFaucetNonce this) 0)))]
+                     ;; The chain's expected nonce, and nothing else.
+                     ;;
+                     ;; This took `max` with the last nonce SUBMITTED, and that
+                     ;; is only right while every submission lands. A tx that
+                     ;; fails authentication never consumes its nonce — so the
+                     ;; four amends that came back `bad-signature` left the
+                     ;; chain at 13 while this counter had moved to 14, and
+                     ;; every later batch was signed for a nonce the chain
+                     ;; would never reach. Nonces are strictly sequential, so
+                     ;; the gap is permanent: measured live, 15 and 16 sat
+                     ;; unappliable while the chain waited for 13.
+                     ;;
+                     ;; Resubmitting a nonce is safe and is the point — a
+                     ;; nonce is single-use, so a duplicate either lands once
+                     ;; or is refused as `bad-nonce`. Guessing ahead is what
+                     ;; is not safe, and the faucet's own docstring says so.
+                     start (tauth/expected-nonce (:machine-state (.-replica this)) bridge)]
                  (-> (js/Promise.all
                       (clj->js
                        (map-indexed
