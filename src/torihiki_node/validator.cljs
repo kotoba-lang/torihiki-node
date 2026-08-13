@@ -401,7 +401,7 @@
   idle enough to be evicted. **Deployed and running are different facts** —
   ADR-2608020330 says so, and this constant is what makes the difference
   visible instead of assumed."
-  "101")
+  "105")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -969,6 +969,23 @@
                                      ;; — see its docstring — and no longer
                                      ;; decides what a block IS.
                                      :hash-fn block-cid
+                                     ;; Two-chain on the v2 genesis set only.
+                                     ;;
+                                     ;; It is safe because a proposal may not
+                                     ;; claim a round further than one past its
+                                     ;; parent's without a quorum of new-views
+                                     ;; — measured on inga's socket harness
+                                     ;; with a Byzantine validator and a forger
+                                     ;; inside the set. The first deployment
+                                     ;; keeps the three-chain rule because a
+                                     ;; commit rule is not something to change
+                                     ;; under a chain that cannot be given the
+                                     ;; code that changes it.
+                                     ;; REVERTED to three-chain. See the
+                                     ;; commit that reverts it: two-chain
+                                     ;; passes inga's socket harness and
+                                     ;; stalled this deployment.
+                                     :commit-rule :three-chain
                                      :chain-id chain-id
                                      ;; No special case for our own witness.
                                      ;; Trusting itself let the UNSIGNED copy
