@@ -734,6 +734,20 @@
 (defn- repair!
   "Take the state the quorum agrees on, when our own chain cannot be extended.
 
+  **Measured firing**, on a replica given a genuinely divergent history: one
+  block in its log had its timestamp nudged, so its hash differed from the
+  one the quorum holds and every block after it stopped attaching.
+
+      restored 79 blocks above it, height 40
+      repaired from the quorum at height 193
+      → height 861 beside 859 / 861 / 863, and the same block hash at 450
+
+  The first attempt to test this did not diverge at all: two clusters run
+  separately produced the SAME chain, because a block here is a pure function
+  of its parent — same genesis, same leader order, and `:ts` from the block
+  interval rather than a wall clock. That determinism is why "bring another
+  cluster's history" is not a test, and why breaking one block is.
+
   Triggered by NOT MOVING, not by a reason string.
 
   `:does-not-link` names the situation exactly and is the wrong trigger: a
