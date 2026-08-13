@@ -3061,6 +3061,24 @@
                ;; would hide it from the owner too.
                ;; Working TWAPs, so a trader can see what is still to be
                ;; executed on their behalf and cancel it.
+               ;; A vault: what it holds, and who holds it.
+               ;;
+               ;; Public because a vault asking for outside money and not
+               ;; publishing its book is asking to be trusted — the same
+               ;; reason `/reserves` says what it cannot answer.
+               "/vault"
+               (let [ex (:machine-state (.-replica this))
+                     v (some-> (.get (.-searchParams url) "id") js/parseInt)
+                     c (:clearing ex)]
+                 (json {:vault v
+                        :collateral (get-in c [:accounts v :collateral] 0)
+                        :free (when v (cl/free-collateral c v (:marks ex) (:markets ex)))
+                        :total-shares (get-in c [:vaults v :total-shares] 0)
+                        :holders (vec (for [[a n] (sort (get-in c [:vaults v :shares] {}))]
+                                        {:account a :shares n}))
+                        :positions (get-in c [:accounts v :positions] {})}
+                       200))
+
                "/twaps"
                (let [ex (:machine-state (.-replica this))
                      want (some-> (.get (.-searchParams url) "account") js/parseInt)]
