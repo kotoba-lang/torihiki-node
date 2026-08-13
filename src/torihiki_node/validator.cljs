@@ -420,8 +420,13 @@
   377 with nothing being evicted — and the deployment is the case where things
   ARE being evicted, which is where the trade pays.
 
-  Keys are derived from the witness name, so adding three costs nothing but
-  this line; there is no key to distribute for w5, w6 or w7."
+  Adding a witness is NOT this line any more. It used to be — keys were
+  derived from the witness name, so w5 through w7 needed nothing distributed —
+  and that is the hole the real keys closed. A new witness now needs a
+  generated seed, its public half reviewed into `validator-keys`, and its
+  private half set as a Worker secret; a replica whose secret is missing or
+  disagrees with the pin refuses to start, which is the loud failure and the
+  right one. Editing this vector alone gets a witness that cannot boot."
   ;; REVERTED to four. Seven was deployed and the chain stopped at height two
   ;; with four votes against a quorum of five — three of the seven never voted
   ;; at all, where four witnesses had reached 139 in half the time. Whatever
@@ -458,6 +463,42 @@
 
 (def ^:const bridge-pubkey
   "jmBeKHD9Pb6GYmlFUfnFwfoci+pSE5rZ+ALlAfnP00o=")
+
+(defn key-distribution
+  "What `/head` says about where the validator set's public keys came from —
+  READ OFF `validator-keys`, not asserted.
+
+  It used to be the constant string `trust-on-first-use — a devnet answer, not
+  a real one`, and it outlived the thing it described by eleven days. The
+  commit that pinned these keys deleted derivation, put the public halves in
+  `validator-keys` and the private halves in Worker secrets; this line went on
+  saying the opposite, and the live endpoint said it too.
+
+  The error pointed at a stronger system than the deployment was, which is the
+  harmless direction and still a false self-report — and `/head` is the one
+  thing here that has to be true. Two ADRs already turn on that: the sequencer
+  answers `consensus: none` about itself because a service that stays quiet
+  about its posture is assumed to be the other kind, and `code-version` exists
+  because a Durable Object runs the code it booted with, so a deploy is not a
+  fact about what is running. A hand-written claim in `/head` has the same
+  defect as a hand-written version: it is a second copy of something already
+  known, and the copy is the one that goes stale.
+
+  So this is derived. A witness with no pinned key is precisely one the
+  boot-time fill leaves empty, and that is the case where `catchUp` asks a
+  peer for the key and believes whichever object answers — so the sentence and
+  the behaviour can only change together."
+  []
+  (let [missing (vec (remove #(get validator-keys %) witnesses))]
+    (if (seq missing)
+      (str "trust-on-first-use for " (apply str (interpose "," missing))
+           " — " (count missing) " of " (count witnesses)
+           " witnesses have no genesis key, and their keys are learned from"
+           " whichever peer answers first")
+      (str "genesis — " (count witnesses) " public keys pinned in source,"
+           " private halves are Worker secrets; a replica whose secret"
+           " disagrees with the pin refuses to start"))))
+
 (def ^:const checkpoint-every
   "Write a checkpoint every N committed blocks.
 
@@ -2051,7 +2092,7 @@
                         :consensus (str (c/quorum-size (count witnesses))
                                         " of " (count witnesses)
                                         " — chained HotStuff, inga.replica")
-                        :key-distribution "trust-on-first-use — a devnet answer, not a real one"
+                        :key-distribution (key-distribution)
                         :transport "HTTP between Durable Objects, not WebSockets"
                         :tx-auth "signatures checked by torihiki.auth on every replica; public keys are raw Ed25519, base64"
                         :refused (frequencies
