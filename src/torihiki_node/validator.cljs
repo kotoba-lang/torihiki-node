@@ -382,7 +382,17 @@
 ;; the validator set, and a dead one in the file is a live one after the next
 ;; refactor that "restores a fallback".
 
-(def ^:const code-version "100")
+(def ^:const code-version
+  "Bumped on every deploy, because it is the only way to tell whether one took.
+
+  Measured 2026-08-13: after `wrangler deploy` reported a new Version ID, all
+  four replicas went on reporting the PREVIOUS value for as long as they were
+  sampled. A Durable Object runs the code it booted with until it is evicted,
+  and these fire an alarm every few tens of milliseconds, so they never go
+  idle enough to be evicted. **Deployed and running are different facts** —
+  ADR-2608020330 says so, and this constant is what makes the difference
+  visible instead of assumed."
+  "101")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
