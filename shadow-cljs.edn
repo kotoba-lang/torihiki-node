@@ -7,6 +7,16 @@
    :modules {:worker {:exports {default torihiki-node.worker/handler
                                 Sequencer torihiki-node.worker/Sequencer}}}
    :compiler-options {:infer-externs :auto}}
+  ;; The v2 build: same code, second genesis validator set. See
+  ;; `torihiki-node.validator/genesis-set`.
+  :validator-v2
+  {:target :esm
+   :output-dir "dist-validator-v2"
+   :runtime :custom
+   :closure-defines {torihiki-node.validator/genesis-set "v2"}
+   :modules {:worker {:exports {default torihiki-node.validator/handler
+                                ValidatorV2 torihiki-node.validator/ValidatorV2}}}
+   :compiler-options {:infer-externs :auto}}
   :validator
   {:target :esm
    :output-dir "dist-validator"
