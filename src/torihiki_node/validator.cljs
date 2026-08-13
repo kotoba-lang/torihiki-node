@@ -302,7 +302,8 @@
   - **`setAlarm` was fired and not returned.** A Durable Object may be put to
     sleep as soon as the handler resolves, so a write still in flight is a
     tick that never happens."
-  (:require [goog.object :as gobj]
+  (:require [clojure.set :as set]
+            [goog.object :as gobj]
             [inga.attest :as att]
             [inga.consensus :as c]
             [inga.replica :as r]
@@ -514,10 +515,26 @@
   100)
 
 (def ^:const checkpoints-kept
-  "How many checkpoints to keep. Two, not one: a checkpoint written while the
-  object is being reset could be a half-written key, and the older one is what
-  makes that survivable rather than fatal."
-  2)
+  "How many checkpoints to keep.
+
+  Two, originally, and for one reason: a checkpoint written while the object is
+  being reset could be a half-written key, and the older one is what makes that
+  survivable rather than fatal. That reason still holds and two satisfied it.
+
+  Eight, because a second reader appeared. `adoptIfOutvoted` compares this
+  replica's state against a quorum's AT THE SAME HEIGHT, so it needs a
+  checkpoint height this replica and every peer all hold. Checkpoints land
+  every hundred blocks at roughly two and a half blocks a second, so two of
+  them is about eighty seconds of history — and four replicas that restart at
+  different moments do not reliably overlap inside eighty seconds. Measured:
+  the check ran, answered `no-shared-checkpoint-height`, and the divergent
+  replica stayed divergent.
+
+  Eight is about five minutes, and a checkpoint is roughly 22 KB, so the whole
+  window is under 200 KB per replica. The cost of being wrong in this
+  direction is disk; the cost of being wrong in the other is a replica that
+  cannot be repaired."
+  8)
 
 (defn- blk-key
   "The storage key for a block. Zero-padded to twelve digits so lexicographic
@@ -587,6 +604,14 @@
   in memory and writes into every checkpoint — an unbounded index would grow
   the thing the bounded resume exists to keep small."
   4000)
+
+(def ^:const adopt-check-ms
+  "How often a replica asks whether it has been outvoted on state.
+
+  Three fetches and a restore, so not every tick. Sixty seconds is far shorter
+  than the hours the last divergence ran undetected and far longer than the
+  question costs."
+  60000)
 
 (def ^:const faucet-nonce-lead
   "How many grants may be in flight ahead of the committed bridge nonce."
@@ -1600,6 +1625,169 @@
                         (.note! this e)
                         nil)))))))
 
+  ;; ── state transfer ────────────────────────────────────────────────────────
+  ;;
+  ;; A replica whose EXECUTED state has diverged cannot be repaired by
+  ;; consensus. `inga.sync` carries blocks, and blocks are what this replica
+  ;; already agreed to — the disagreement is about what applying them produced.
+  ;; Its own checkpoints are the divergent state written down. So the only
+  ;; thing that fixes it is a state the others hold, and until now there was no
+  ;; way to hand one over.
+  ;;
+  ;; Measured on the deployed chain: w1 disagreed with w2, w3 and w4 in 16 of
+  ;; 16 strict same-height comparisons, holding a resting order at a price the
+  ;; other three did not have. It kept voting and its votes kept counting —
+  ;; consensus orders blocks and never asked what anybody computed — so the
+  ;; chain ran on exactly the quorum, with the redundancy that quorum is for
+  ;; already spent.
+  ;;
+  ;; ## Why a quorum and not a peer
+  ;;
+  ;; Adopting one peer's state makes that peer able to rewrite this one. The
+  ;; snapshots are fetched from every other witness, each is RESTORED HERE and
+  ;; its state root computed locally, and a group of them is adopted only if it
+  ;; is at least `quorum-size` strong. That is the same 2f+1 the chain uses to
+  ;; decide anything else, applied to a question consensus does not ask.
+  ;;
+  ;; The root is computed rather than believed: a peer reporting its own root
+  ;; would be trusted about exactly the thing in dispute.
+  ;; The manual override. Same evidence, same action; it just does not wait
+  ;; for the interval.
+  (adoptFromPeers [this]
+    (-> (.adoptIfOutvoted this)
+        (.then (fn [res] (json res (if (:ok res) 200 409))))
+        (.catch (fn [e] (.note! this e)
+                  (json {:ok false :reason (str (or (.-message e) e))} 500)))))
+
+  ;; Notice, without being told.
+  ;;
+  ;; `/adopt` is a button, and a chain whose repair needs somebody to press a
+  ;; button is a chain that stays broken for as long as nobody is looking. The
+  ;; divergence this exists for ran for hours while the terminal displayed
+  ;; `4 replicas, agreeing`.
+  ;;
+  ;; So the tick asks, at an interval: is there a checkpoint height I share
+  ;; with every peer, do a quorum of them agree on a state root there, and is
+  ;; mine different? Three yeses is the same evidence `/adopt` demands, reached
+  ;; without anybody deciding to look.
+  ;;
+  ;; Rate-limited because the question costs three fetches and a restore, and
+  ;; because a replica that is merely BEHIND will answer it wrongly for a
+  ;; moment — it has no checkpoint at the shared height yet, which reads as
+  ;; nothing to compare rather than as a disagreement, so the interval is what
+  ;; keeps that from being asked hundreds of times a minute.
+  (maybeAdopt! [this]
+    (let [now (js/Date.now)
+          due (or (.-nextAdoptCheck this) 0)]
+      (if (< now due)
+        (js/Promise.resolve nil)
+        (do
+          (set! (.-nextAdoptCheck this) (+ now adopt-check-ms))
+          (-> (.adoptIfOutvoted this)
+              ;; EVERY answer is recorded, not only the ones that adopt.
+              ;;
+              ;; The first version stored successes and dropped the rest, so a
+              ;; check that ran twice and refused twice was indistinguishable
+              ;; from a check that never ran — which is the same shape as the
+              ;; divergence it exists to catch, written into the thing catching
+              ;; it. `/head` reports why it did not act, which is the only
+              ;; question anybody asks of a repair that has not happened.
+              (.then (fn [res]
+                       (set! (.-adoptCheck this) (clj->js (or res {:ok false :reason "nil"})))
+                       (when (:ok res)
+                         (set! (.-adopted this) (clj->js res)))
+                       res))
+              (.catch (fn [e]
+                        (.note! this e)
+                        (set! (.-adoptCheck this)
+                              #js {"ok" false "reason" (str "threw: " (or (.-message e) e))})
+                        nil)))))))
+
+  ;; The comparison, and the adoption if it is warranted. Returns a description
+  ;; rather than a Response so both the tick and `/adopt` can use it — one
+  ;; definition of what being outvoted means.
+  (adoptIfOutvoted [this]
+    (let [me (.-witness this)
+          peers (remove #(= me %) witnesses)
+          q (c/quorum-size (count witnesses))
+          ask (fn [w suffix]
+                (-> (.fetch (.get ^js (.-VALIDATOR env)
+                                  (.idFromName ^js (.-VALIDATOR env) (do-name w)))
+                            (str "https://v/snapshot?w=" w suffix))
+                    (.then #(.json %))
+                    (.then (fn [^js j] {:witness w :ok (aget j "ok")
+                                        :heights (vec (array-seq (or (aget j "heights") #js [])))
+                                        :edn (aget j "edn")}))
+                    (.catch (fn [_] nil))))
+          root-of (fn [edn]
+                    (try (st/state-root (tsnap/restore (:machine-state (tsnap/read-string* edn))))
+                         (catch :default _ nil)))]
+      (-> (js/Promise.all (clj->js (for [w peers] (ask w ""))))
+          (.then
+           (fn [rs]
+             (let [rs (remove nil? (array-seq rs))]
+               (if (not= (count rs) (count peers))
+                 (js/Promise.resolve {:ok false :reason "a-peer-did-not-answer"})
+                 ;; Only heights this replica also holds: the comparison needs
+                 ;; OUR root at the same height, and without one there is
+                 ;; nothing to be outvoted about.
+                 (-> (.list ^js (.-storage do-state)
+                            #js {:prefix "snap:" :reverse true :limit checkpoints-kept})
+                     (.then
+                      (fn [^js mine]
+                        (let [mk (js/Array.from (.keys mine))
+                              mv (js/Array.from (.values mine))
+                              my-h (mapv #(js/parseInt (subs % (count "snap:")) 10)
+                                         (array-seq mk))
+                              common (apply set/intersection (set my-h)
+                                            (map (comp set :heights) rs))
+                              h (when (seq common) (apply max common))]
+                          (if (nil? h)
+                            (js/Promise.resolve {:ok false :reason "no-shared-checkpoint-height"})
+                            (let [i (first (keep-indexed #(when (= h %2) %1) my-h))
+                                  my-root (root-of (aget mv i))]
+                              (-> (js/Promise.all (clj->js (for [w peers] (ask w (str "&h=" h)))))
+                                  (.then
+                                   (fn [rs2]
+                                     (let [scored (keep (fn [r]
+                                                          (when (:ok r)
+                                                            (when-let [rt (root-of (:edn r))]
+                                                              (assoc r :root rt))))
+                                                        (remove nil? (array-seq rs2)))
+                                           [root g] (last (sort-by (comp count val)
+                                                                   (group-by :root scored)))]
+                                       (cond
+                                         (or (nil? g) (< (count g) q))
+                                         {:ok false :reason "no-quorum-agreed-on-a-state"
+                                          :height h :quorum q
+                                          :offered (mapv #(select-keys % [:witness :root]) scored)}
+
+                                         (= root my-root)
+                                         {:ok false :reason "already-agrees" :height h :root root}
+
+                                         :else
+                                         (let [edn (:edn (first g))
+                                               snap (tsnap/read-string* edn)
+                                               views (:views snap)
+                                               snap (-> snap
+                                                        (update :machine-state tsnap/restore)
+                                                        (cond-> views (update :machine-state merge views)))
+                                               resumed (r/resume (.replicaOpts this me) snap)]
+                                           (set! (.-replica this) resumed)
+                                           (set! (.-notifiedAt this) nil)
+                                           (set! (.-adopted this)
+                                                 #js {"height" h "from" (clj->js (mapv :witness g))
+                                                      "was" my-root "now" root})
+                                           (-> (.put ^js (.-storage do-state) (ckpt-key h) edn)
+                                               (.then (fn [_]
+                                                        (set! (.-lastCkpt this) h)
+                                                        (set! (.-bootedFromCkpt this) true)
+                                                        (set! (.-replayCursor this) (blk-key h))
+                                                        (set! (.-persisted this) (count (:chain resumed)))
+                                                        {:ok true :height h
+                                                         :adopted-from (mapv :witness g)
+                                                         :root-was my-root :root-now root}))))))))))))))))))))))
+
   (persist! [this]
     ;; Everything adopted since the last write. Cheap because the chain only
     ;; grows: a block that is in storage is a block this replica already
@@ -1922,6 +2110,9 @@
       ;; `notify!` compares the committed height itself, so calling it when
       ;; nothing moved is a comparison and nothing else.
       (.notify! this)
+      ;; Rate-limited inside. See `maybeAdopt!` for why this is on the tick
+      ;; rather than behind the admin route it shares its evidence with.
+      (.maybeAdopt! this)
       ;; Why this replica did NOT propose.
       ;;
       ;; Every counter here says what happened. A stall is the absence of
@@ -2043,7 +2234,7 @@
     (let [url (js/URL. (.-url request))
           path (.-pathname url)
           w (or (.get (.-searchParams url) "w") "w1")]
-      (if (and (#{"/wipe" "/reset"} path) (not (.adminOk this request)))
+      (if (and (#{"/wipe" "/reset" "/adopt"} path) (not (.adminOk this request)))
         (js/Promise.resolve
          (json {:ok false :reason "forbidden"
                 :note "administrative route — x-admin-token required"} 403))
@@ -2105,6 +2296,9 @@
                                 (.acceptWebSocket ^js do-state (aget pair "1"))
                                 (js/Response. nil #js {:status 101
                                                        :webSocket (aget pair "0")})))
+
+                            "/adopt"
+                            (.adoptFromPeers this)
 
                             "/head"
                (let [s (.-replica this)]
@@ -2176,6 +2370,13 @@
                                         " of " (count witnesses)
                                         " — chained HotStuff, inga.replica")
                         :key-distribution (key-distribution)
+                        ;; The last time this replica took a state from a
+                        ;; quorum, or nil. A silent repair is the same problem
+                        ;; as a silent divergence.
+                        :adopted (js->clj (or (.-adopted this) nil))
+                        :adopt-check (js->clj (or (.-adoptCheck this) nil))
+                        :next-adopt-check-in-ms (max 0 (- (or (.-nextAdoptCheck this) 0)
+                                                          (js/Date.now)))
                         :transport "HTTP between Durable Objects, not WebSockets"
                         :tx-auth "signatures checked by torihiki.auth on every replica; public keys are raw Ed25519, base64"
                         :refused (frequencies
@@ -2406,6 +2607,46 @@
                ;; Walks the occupied levels rather than the whole ladder, so it
                ;; costs what the book HOLDS — the same property `state-root`
                ;; and the snapshot already have, and for the same reason.
+               ;; This replica's newest checkpoint, verbatim. Public because
+               ;; it is state a client could rebuild by replaying the chain —
+               ;; serving it saves the replay, it does not reveal anything.
+               ;; This replica's checkpoints. Public because it is state a
+               ;; client could rebuild by replaying the chain — serving it
+               ;; saves the replay, it does not reveal anything.
+               ;;
+               ;; `?h=` asks for one particular height. Without it the newest
+               ;; is served, and `:heights` says what else is on offer — which
+               ;; is what makes a comparison possible at all: replicas write
+               ;; checkpoints at the same heights but not at the same moments,
+               ;; so asking three peers for "the newest" gets three different
+               ;; heights and nothing to compare.
+               "/snapshot"
+               (-> (.list ^js (.-storage do-state)
+                          #js {:prefix "snap:" :reverse true :limit checkpoints-kept})
+                   (.then (fn [^js entries]
+                            (let [vals (js/Array.from (.values entries))
+                                  ks (js/Array.from (.keys entries))
+                                  hs (mapv #(js/parseInt (subs % (count "snap:")) 10)
+                                           (array-seq ks))
+                                  want (some-> (.get (.-searchParams url) "h")
+                                               (js/parseInt 10))
+                                  i (if want
+                                      (first (keep-indexed #(when (= want %2) %1) hs))
+                                      (when (pos? (alength vals)) 0))]
+                              (if (nil? i)
+                                (json {:ok false :reason "no-such-checkpoint"
+                                       :heights hs} 404)
+                                (json {:ok true
+                                       :witness (.-witness this)
+                                       :height (nth hs i)
+                                       :heights hs
+                                       ;; No root here on purpose: whoever
+                                       ;; adopts computes it, because a peer
+                                       ;; reporting its own root would be
+                                       ;; trusted about the thing in dispute.
+                                       :edn (aget vals i)}
+                                      200))))))
+
                "/orders"
                (let [ex (:machine-state (.-replica this))
                      book (get-in ex [:books market-id])
