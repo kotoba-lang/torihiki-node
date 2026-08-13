@@ -404,7 +404,12 @@
   already abandoned."
   [w]
   w)
-(def ^:const market-id 1)
+(def ^:const market-id
+  "The market a read route answers about when the caller does not say.
+
+  Not `the` market any more — see `markets`. It is the default so that every
+  existing client keeps working unchanged, and every read route takes `?m=`."
+  1)
 (def witnesses
   "Seven, not four.
   
@@ -601,10 +606,36 @@
 
 ;; ── the machine ─────────────────────────────────────────────────────────────
 
+(def markets
+  "The markets this chain runs.
+
+  One, until now, and the engine's multi-market shape had never been built on
+  — `:books` has always been a map keyed by market id and every transaction
+  has always named its market, so the claim was structure without evidence.
+
+  A second market is what turns that into a fact, and it is also where the
+  per-market seams get tested by something other than a unit test: each market
+  has its own book, its own oracle, its own mark, its own funding accumulator
+  and its own liquidation sweep. A bug in any of those reads as `market 2 is
+  quiet`, which is why the e2e trades on 2 rather than only reading it.
+
+  Ids are stable and never reused: an id is what a transaction names, so
+  renumbering markets would silently re-aim orders already signed.
+
+  Each market costs a book slab, so the ladder is deliberately small here —
+  4096 ticks is plenty for a devnet and the memory is per market."
+  [(assoc (cl/market {:id 1 :max-leverage 40 :tick 10 :lot 1})
+          :taker-fee-rate 350000
+          :maker-fee-rate 100000)
+   (assoc (cl/market {:id 2 :max-leverage 20 :tick 10 :lot 1})
+          :taker-fee-rate 500000
+          :maker-fee-rate 100000)])
+
 (def market
-  (assoc (cl/market {:id market-id :max-leverage 40 :tick 10 :lot 1})
-         :taker-fee-rate 350000
-         :maker-fee-rate 100000))
+  "The first market. Kept because the read routes default to a market when the
+  caller does not name one, and because a terminal that has always shown one
+  book must keep showing that one."
+  (first markets))
 
 (def ^:const bridge-name
   "What the faucet's key is derived from. Part of the derivation, so changing
@@ -684,7 +715,7 @@
 (defonce publisher-accounts (atom #{}))
 
 (defn genesis []
-  (-> (st/new-exchange {:market market
+  (-> (st/new-exchange {:markets markets
                         :book-opts {:n-levels 65536 :cap 16384 :ev-cap 8192}
                         ;; Collateral has an issuer.
                         ;;
@@ -719,7 +750,13 @@
                           (if (seq ps)
                             ps
                             (throw (js/Error. "genesis before the publisher set"))))})
-      (st/apply-tx {:tx :oracle :market market-id :price 1000})))
+      (as-> ex (reduce (fn [e m]
+                         ;; Every market needs a price before anything can be
+                         ;; margined on it. Same genesis number for both: a
+                         ;; devnet has no feed, and two markets that start at
+                         ;; different prices would imply one.
+                         (st/apply-tx e {:tx :oracle :market (:id m) :price 1000}))
+                       ex markets))))
 
 (defn- decode-tx [s]
   (let [m (js->clj (js/JSON.parse s) :keywordize-keys true)]
@@ -808,6 +845,17 @@
   [book side]
   (loop [l (bk/best book side) acc []]
     (if (neg? l) acc (recur (bk/next-occupied book side l) (conj acc l)))))
+
+(defn- market-param
+  "The market a read route is about: `?m=`, or `market-id` when unsaid.
+
+  Unknown ids fall back to the default rather than erroring, because these are
+  read routes and a 404 on a market that simply has not been listed yet is a
+  worse answer than the book the caller almost certainly wanted. `/markets`
+  is what says which ids exist."
+  [^js url]
+  (let [m (some-> (.get (.-searchParams url) "m") (js/parseInt 10))]
+    (if (and m (some #(= m (:id %)) markets)) m market-id)))
 
 (defn- json [x status]
   (js/Response. (js/JSON.stringify (clj->js x))
@@ -1042,6 +1090,59 @@
                                   (set! (.-replica this) (r/submit (.-replica this) body))
                                   (set! (.-lastFaucetNonce this) nonce)
                                   {:queued true :bridge bridge :nonce nonce}))))))))) 
+
+  ;; List every market this build knows about that the chain does not yet
+  ;; have, signed by the bridge.
+  ;;
+  ;; Markets used to be genesis data, and a replica restores from a checkpoint
+  ;; — so adding one to `markets` added it to a chain nobody was running. It
+  ;; has to arrive as a transaction (`torihiki.state/apply-tx :list-market`),
+  ;; and the only key here that the chain recognises as an authority is the
+  ;; bridge's, which is also the right one: whoever may list may price, and
+  ;; pricing is what margin reads.
+  ;;
+  ;; Anyone may ASK. What they cannot do is invent a market — the listable set
+  ;; is `markets`, which is reviewed with the code, and a market already
+  ;; listed is refused by the engine. Same shape as `/faucet`: an open door
+  ;; onto a bounded, reviewed action.
+  (listMissingMarkets [this]
+    (let [ex (:machine-state (.-replica this))
+          missing (remove #(contains? (:markets ex) (:id %)) markets)]
+      (if (empty? missing)
+        (js/Promise.resolve {:listed [] :note "every market in this build is already on the chain"})
+        (-> (.faucetKey this)
+            (.then
+             (fn [^js k]
+               (let [bridge @faucet-account
+                     start (max (tauth/expected-nonce (:machine-state (.-replica this)) bridge)
+                                (inc (or (.-lastFaucetNonce this) 0)))]
+                 (-> (js/Promise.all
+                      (clj->js
+                       (map-indexed
+                        (fn [i m]
+                          (let [nonce (+ start i)
+                                tx {:tx :list-market :account bridge :market (:id m)
+                                    :spec (dissoc m :id)
+                                    ;; Small on purpose: a book costs its slab,
+                                    ;; and a devnet market does not need the
+                                    ;; ladder the first one was given.
+                                    :book-opts {:n-levels 4096 :cap 65536 :ev-cap 65536}}
+                                payload (tauth/signing-payload chain-id bridge nonce tx)]
+                            (-> (js/crypto.subtle.sign #js {:name "Ed25519"}
+                                                       (.-privateKey k)
+                                                       (.encode (js/TextEncoder.) payload))
+                                (.then (fn [sig]
+                                         (let [env {:tx tx :account bridge :nonce nonce
+                                                    :pubkey (.-pub k) :sig (b64 sig)}]
+                                           (aset (or (.-txok this) (set! (.-txok this) #js {}))
+                                                 (str (.-pub k) "|" payload "|" (b64 sig)) true)
+                                           (set! (.-replica this)
+                                                 (r/submit (.-replica this)
+                                                           (js/JSON.stringify (clj->js env))))
+                                           (set! (.-lastFaucetNonce this) nonce)
+                                           {:market (:id m) :nonce nonce}))))))
+                        missing)))
+                     (.then (fn [rs] {:listed (vec (array-seq rs)) :bridge bridge})))))))))) 
 
   (boot [this name]
     ;; Re-boots when the name it holds is not the name it is being addressed
@@ -2603,7 +2704,8 @@
                                              :alarm-in-ms in-ms} 200))))
 
                "/market"
-               (json (api/market-info (:machine-state (.-replica this)) market-id) 200)
+               (json (api/market-info (:machine-state (.-replica this))
+                                      (market-param url)) 200)
 
                "/trades"
                (let [ex (:machine-state (.-replica this))
@@ -2613,10 +2715,11 @@
 
                "/book"
                (json (let [ex (:machine-state (.-replica this))]
-                       {:market market-id
-                        :bids (:bids (api/book-snapshot ex market-id 12))
-                        :asks (:asks (api/book-snapshot ex market-id 12))
-                        :resting (bk/resting-count (get-in ex [:books market-id]))})
+                       (let [m (market-param url)]
+                         {:market m
+                          :bids (:bids (api/book-snapshot ex m 12))
+                          :asks (:asks (api/book-snapshot ex m 12))
+                          :resting (bk/resting-count (get-in ex [:books m]))}))
                      200)
 
                ;; An account's resting orders, WITH their ids.
@@ -2688,6 +2791,23 @@
                ;; `:bridge-authority` the chain mints its own collateral, so
                ;; the number is exact and unbacked, and saying so here is the
                ;; difference between an attestation and a decoration.
+               ;; Which markets exist. Without it a client has to guess an id
+               ;; and read the fallback as an answer.
+               "/markets"
+               (if (= "POST" (.-method request))
+                 ;; POST lists what this build has and the chain does not.
+                 (-> (.listMissingMarkets this)
+                     (.then (fn [r] (json (merge {:ok true} r) 200)))
+                     (.catch (fn [e] (.note! this e)
+                               (json {:ok false :reason (str (or (.-message e) e))} 500))))
+               (let [ex (:machine-state (.-replica this))]
+                 (json {:default market-id
+                        :on-chain (vec (sort (keys (:markets ex))))
+                        :in-build (mapv :id markets)
+                        :markets (mapv (fn [m] (api/market-info ex m))
+                                       (sort (keys (:markets ex))))}
+                       200)))
+
                "/reserves"
                (let [ex (:machine-state (.-replica this))
                      leaves (st/canonical-leaves ex)
@@ -2708,10 +2828,11 @@
 
                "/orders"
                (let [ex (:machine-state (.-replica this))
-                     book (get-in ex [:books market-id])
+                     m (market-param url)
+                     book (get-in ex [:books m])
                      want (some-> (.get (.-searchParams url) "account") js/parseInt)]
                  (json
-                  {:market market-id
+                  {:market m
                    :account want
                    :orders
                    (vec (for [side [bk/bid bk/ask]
