@@ -401,7 +401,7 @@
   idle enough to be evicted. **Deployed and running are different facts** —
   ADR-2608020330 says so, and this constant is what makes the difference
   visible instead of assumed."
-  "122")
+  "125")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -1750,6 +1750,27 @@
   ;; Verify everything in a batch, cache the answers, then fold the batch
   ;; synchronously. The rules stay synchronous and the asynchrony stays at the
   ;; edge — the shape `inga.attest/pending-checks` exists for.
+  ;; One definition of "a batch arrived", whichever transport carried it.
+  ;;
+  ;; `/msg` had this inline. A socket delivering the same bytes to a different
+  ;; entry point would have been a second copy of the decode, the counters and
+  ;; the failure handling — and two definitions of what arriving means is how
+  ;; a transport ends up quietly counting differently from the one it
+  ;; replaces.
+  (ingestBody [this text]
+    (try
+      (let [body (js/JSON.parse text)
+            raw (js->clj (aget body "msgs"))
+            msgs (keep (fn [m] (first (wire/decode m))) raw)]
+        (set! (.-msgs-in this) (+ (or (.-msgs-in this) 0) (count msgs)))
+        (set! (.-types this) (or (.-types this) #js {}))
+        (doseq [m msgs]
+          (let [k (name (:type m))]
+            (aset (.-types this) k (inc (or (aget (.-types this) k) 0)))))
+        (-> (.ingest this (vec msgs))
+            (.then (fn [_] (count msgs)))))
+      (catch :default _ (js/Promise.resolve nil))))
+
   (ingest [this msgs]
     ;; Learn the keys FIRST. A message that arrived before its sender's key
     ;; was known could not be verified, so it was dropped — and a dropped
@@ -2318,6 +2339,69 @@
       (set! (.-outq this) [])
       (.dispatch this q)))
 
+  ;; A standing socket to a peer, or nil while there is not one yet.
+  ;;
+  ;; Every message between replicas was its own HTTP POST to a Durable Object
+  ;; stub: a request to route, a handler invocation to start, a response to
+  ;; wait for. The round trip measured 2-4 ms in the same colo and the median
+  ;; block still took 160-195 ms, with delivery, ingest, the block interval
+  ;; and the proposal path each measured and each ruled out. What was left
+  ;; was the shape of the transport itself — a request per message.
+  ;;
+  ;; A socket makes a message an EVENT at the far end instead of a request.
+  ;; One connection per ordered pair, opened lazily and one-way: replies come
+  ;; back over the peer's own socket to us, so neither side reads.
+  ;;
+  ;; Returns nil rather than a promise while it opens, and `dispatch` posts in
+  ;; the meantime — the socket is an optimisation and the POST is the
+  ;; contract. A transport that has to be up for the chain to run is a second
+  ;; way for the chain to stop.
+  (peerSocket [this w]
+    (let [m (or (.-wsout this) (do (set! (.-wsout this) #js {}) (.-wsout this)))
+          ws (aget m w)]
+      (cond
+        ;; OPEN **and answered**. A socket is used only after the far end has
+        ;; said something back over it.
+        ;;
+        ;; Without that this shipped an outage: the receive handler dropped
+        ;; every message (it read the tags off `ctx`, which is not where the
+        ;; state lives here), the senders saw a healthy open socket, and the
+        ;; chain stopped at 15222 with `delivery {w2:ws 7, w3:ws 6}` and
+        ;; nothing arriving. A transport that cannot tell "connected" from
+        ;; "listened to" turns a receive bug into a silent partition.
+        (and ws (= 1 (.-readyState ws)) (aget (or (.-wsok this) #js {}) w)) ws
+        (and ws (= 1 (.-readyState ws))) nil         ; open, unconfirmed: post
+        (and ws (= 0 (.-readyState ws))) nil         ; CONNECTING: post this time
+        :else
+        (do
+          (aset m w nil)
+          (when-not (aget (or (.-wsopening this)
+                              (do (set! (.-wsopening this) #js {}) (.-wsopening this))) w)
+            (aset (.-wsopening this) w true)
+            (-> (.fetch (.get ^js (.-VALIDATOR env)
+                              (.idFromName ^js (.-VALIDATOR env) (do-name w)))
+                        (js/Request. (str "https://v/peer?w=" w)
+                                     #js {:headers #js {"Upgrade" "websocket"}}))
+                (.then (fn [^js r]
+                         (aset (.-wsopening this) w false)
+                         (when-let [sock (.-webSocket r)]
+                           (.accept sock)
+                           ;; The probe, and the answer that makes the socket
+                           ;; usable. One round trip, once per connection.
+                           (.addEventListener
+                            sock "message"
+                            (fn [_]
+                              (aset (or (.-wsok this)
+                                        (do (set! (.-wsok this) #js {}) (.-wsok this)))
+                                    w true)))
+                           (.addEventListener
+                            sock "close"
+                            (fn [_] (aset (or (.-wsok this) #js {}) w false)))
+                           (aset m w sock)
+                           (try (.send sock "{\"probe\":1}") (catch :default _ nil)))))
+                (.catch (fn [_] (aset (.-wsopening this) w false) nil))))
+          nil))))
+
   ;; Sign each outbound vote and new-view, then post the batch to every peer.
   (dispatch [this outbox]
     ;; Counted HERE, where the messages actually leave.
@@ -2421,21 +2505,40 @@
                              :when (seq mine)
                              :let [body (js/JSON.stringify
                                          (clj->js {:msgs (mapv (comp wire/encode :msg) mine)}))]]
-                         (-> (.fetch (.get ^js (.-VALIDATOR env)
-                                           (.idFromName ^js (.-VALIDATOR env) (do-name w)))
-                                     (js/Request. (str "https://v/msg?w=" w)
-                                                  #js {:method "POST" :body body}))
+                         (if-let [sock (.peerSocket this w)]
+                           ;; Over the socket: no request to route, no handler
+                           ;; to start, no response to wait for. Counted the
+                           ;; same way, under its own key, so the two
+                           ;; transports can be told apart in `/head`.
+                           (try
+                             (.send sock body)
+                             (let [k (str w ":ws")]
+                               (aset (.-delivery this) k
+                                     (inc (or (aget (.-delivery this) k) 0))))
+                             (js/Promise.resolve nil)
+                             (catch :default _
+                               ;; A socket that throws is gone. Drop it and
+                               ;; post — the next dispatch opens a new one.
+                               (aset (.-wsout this) w nil)
+                               (.postTo this w body)))
+                           (.postTo this w body)))))))
+          (.then (fn [_] nil)))))
+
+  (postTo [this w body]
+    (-> (.fetch (.get ^js (.-VALIDATOR env)
+                      (.idFromName ^js (.-VALIDATOR env) (do-name w)))
+                (js/Request. (str "https://v/msg?w=" w)
+                             #js {:method "POST" :body body}))
                              (.then (fn [^js r]
                                       (let [k (str w (if (.-ok r) ":ok" ":err"))]
                                         (aset (.-delivery this) k
                                               (inc (or (aget (.-delivery this) k) 0))))
                                       nil))
-                             (.catch (fn [_]
-                                       (let [k (str w ":throw")]
-                                         (aset (.-delivery this) k
-                                               (inc (or (aget (.-delivery this) k) 0))))
-                                       nil))))))))
-          (.then (fn [_] nil)))))
+        (.catch (fn [_]
+                  (let [k (str w ":throw")]
+                    (aset (.-delivery this) k
+                          (inc (or (aget (.-delivery this) k) 0))))
+                  nil))))
 
   ;; NOTICE that the deployment has moved on. Nothing else.
   ;;
@@ -2908,6 +3011,23 @@
                                 (js/Response. nil #js {:status 101
                                                        :webSocket (aget pair "0")})))
 
+                            ;; The peer side of the standing socket.
+                            ;;
+                            ;; Hibernatable and TAGGED, so `webSocketMessage`
+                            ;; can tell a replica from a browser. `/subscribe`
+                            ;; is one-way and its clients say nothing, but
+                            ;; "says nothing today" is not a thing to route
+                            ;; consensus messages on.
+                            "/peer"
+                            (if-not (= "websocket"
+                                       (some-> (.get (.-headers request) "Upgrade")
+                                               (.toLowerCase)))
+                              (json {:ok false :reason "expected-websocket-upgrade"} 426)
+                              (let [pair (js/WebSocketPair.)]
+                                (.acceptWebSocket ^js do-state (aget pair "1") #js ["peer"])
+                                (js/Response. nil #js {:status 101
+                                                       :webSocket (aget pair "0")})))
+
                             "/adopt"
                             (.adoptFromPeers this)
 
@@ -2963,6 +3083,7 @@
                         ;; waiting to be proposed and `txs-in-chain` whether
                         ;; any transaction has ever reached a block — one
                         ;; question each, and they fail in different places.
+                        :ws-in (or (.-ws-in this) 0)
                         :pending (count (:pending (.-replica this)))
                         :txs-in-chain (reduce + 0 (map #(count (:inga.block/proposals %))
                                                        (:chain (.-replica this))))
@@ -3579,7 +3700,32 @@
 ;; nothing to say back. Defining them anyway is what keeps a client that sends
 ;; something — a stray ping, a reconnect probe — from being an unhandled call
 ;; on the object.
-(gobj/set (.-prototype ValidatorV2) "webSocketMessage" (fn [_ws _msg] nil))
+(gobj/set (.-prototype ValidatorV2) "webSocketMessage"
+          (fn [^js ws msg]
+            (this-as this
+              ;; No tag check, and the first version's was worse than none.
+              ;;
+              ;; It asked `(.-ctx this)` for the socket's tags. The Durable
+              ;; Object state is a `deftype` field here, not `ctx`, so the
+              ;; lookup was `undefined`, the guard was false for every socket,
+              ;; and every consensus message that arrived over a socket was
+              ;; dropped in silence. The chain stopped at 15222 with the
+              ;; sender reporting 149 delivered.
+              ;;
+              ;; It is not needed. `ingestBody` decodes and returns nil on
+              ;; anything that is not a batch, and `/msg` already accepts the
+              ;; same bytes over POST from anyone — a socket adds no reach
+              ;; that was not there, and every message is signature-checked
+              ;; before it counts for anything.
+              (when (string? msg)
+                (set! (.-ws-in ^js this) (inc (or (.-ws-in ^js this) 0)))
+                ;; Answer the probe. This is the whole handshake: the sender
+                ;; learns that something on this end is reading, which is the
+                ;; fact an open socket does not carry.
+                (if (= msg "{\"probe\":1}")
+                  (try (.send ^js ws "{\"pong\":1}") (catch :default _ nil))
+                  (.ingestBody ^js this msg)))
+              nil)))
 (gobj/set (.-prototype ValidatorV2) "webSocketClose" (fn [_ws _code _reason _clean] nil))
 (gobj/set (.-prototype ValidatorV2) "webSocketError" (fn [_ws _err] nil))
 
