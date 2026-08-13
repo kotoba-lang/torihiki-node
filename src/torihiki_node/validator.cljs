@@ -622,9 +622,9 @@
       w2  …trbp5zyxuc2m   height 40842
 
   **Three chains among four replicas.** Not a missing vote — no side can reach
-  three. w2\'s own repair says so in one line:
+  three. the fourth replica's own repair says so in one line:
 
-      adopt-check {ok false, reason "no-quorum-agreed-on-a-state", height 40700}
+      adopt-check {ok false, reason no-quorum-agreed-on-a-state, height 40700}
 
   which is the correct answer: there is no quorum state to adopt, so it
   refuses to invent one. A four-replica chain where no three agree does not
