@@ -595,6 +595,28 @@
 
 (defn- ckpt-key [h] (str "snap:" (.padStart (str h) 12 "0")))
 
+(def ^:const stall-shape
+  "What the deployed chain looks like when it stops, measured 2026-08-13 at
+  height 40853 with every replica on the same code.
+
+      seen-types  sync-response 8238   sync-request 4611
+                  proposal      3324   vote          991
+      votes-for-tip 1-2 (quorum 3), voted-at-tip? true on all three,
+      last-tip-vote [40853, 43403] — the re-vote IS running, once per view
+      view 43403 against height 40853 — two and a half thousand views ahead
+
+  **The recovery is eating the transport.** Every timed-out view sends a
+  sync-request to all three peers; each answers with a segment; the votes that
+  would certify the tip are one message in nine. `inga.replica/on-tick` asks
+  once per view precisely so this cannot become a flood — and at two thousand
+  views past the height, once per view IS a flood.
+
+  Nothing here is a fix. It is written down because the shape is specific and
+  the next person to look will otherwise start from `votes-for-tip 1`, which
+  says a vote is missing and not that it was outnumbered nine to one by the
+  machinery meant to help it."
+  :documented)
+
 (def ^:const tick-ms
   "How often a replica wakes itself to make progress. **25.**
 
