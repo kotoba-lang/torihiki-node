@@ -29,6 +29,17 @@ cleanup() { pkill -f 'torihiki-node.standalone' 2>/dev/null || true; }
 trap cleanup EXIT
 cleanup; rm -rf "$DATA"
 
+ # 0. it has to READ before anything can be measured. Both halves: the
+# standalone under nbb, and the Worker through its own compiler. Two builds
+# went out unread on the day this was written, and both would have stopped
+# here.
+if ${NBB:-npx nbb} -cp "src:script:$CP" script/loads.cljs >/dev/null 2>&1; then
+  say() { printf '%-46s %s\n' "$1" "$2"; }
+  say "standalone reads on ClojureScript" "PASS"
+else
+  printf '%-46s %s\n' "standalone reads on ClojureScript" "FAIL"; exit 1
+fi
+
 echo "starting four replicas"
 for i in 1 2 3 4; do
   W=w$i PEERS="$PEERS" HTTP_PORT=$((BASE_PORT+i)) DATA_DIR="$DATA/w$i" \
