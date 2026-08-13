@@ -1142,9 +1142,14 @@
                        ;; trying to avoid. Past the bound it stops issuing and
                        ;; says so, which is recoverable; the caller retries
                        ;; once blocks catch up.
-                       committed (tauth/expected-nonce ex bridge)
-                       last-issued (or (.-lastFaucetNonce this) 0)
-                       nonce (max committed (inc last-issued))
+                       ;; The chain's expected nonce, not a guess past it.
+                       ;; See `listMissingMarkets` for the failure: a tx that
+                       ;; fails authentication never consumes its nonce, so a
+                       ;; counter that advances on SUBMIT runs permanently
+                       ;; ahead of a chain that is still waiting for the one
+                       ;; that failed — and nonces are strictly sequential, so
+                       ;; nothing after the gap can ever apply.
+                       nonce (tauth/expected-nonce ex bridge)
                        tx {:tx :deposit :account bridge :credit account
                            :amount faucet-grant}
                        payload (tauth/signing-payload chain-id bridge nonce tx)]
