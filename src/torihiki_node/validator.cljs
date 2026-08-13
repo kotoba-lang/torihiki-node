@@ -1213,6 +1213,7 @@
           unpriced (filter #(zero? (get-in ex [:oracle (:id %)] 0)) markets)
           work (concat (map (fn [m] [:list m]) missing)
                        (map (fn [m] [:amend m]) stale)
+                       (map (fn [m] [:amend-tiers m]) (filter :fee-tiers stale))
                        (map (fn [m] [:price m]) unpriced))]
       (if (empty? work)
         (js/Promise.resolve {:listed [] :amended []
@@ -1247,8 +1248,20 @@
                                      :list {:tx :list-market :account bridge :market (:id m)
                                             :spec (dissoc m :id)
                                             :book-opts {:n-levels 4096 :cap 65536 :ev-cap 65536}}
+                                     ;; Sent in TWO transactions, and the split
+                                     ;; is a measurement.
+                                     ;;
+                                     ;; A flat amend (a symbol, a rate) landed.
+                                     ;; The same amend carrying `:fee-tiers` —
+                                     ;; a vector of maps — did not: not
+                                     ;; refused, not counted, nonce never
+                                     ;; consumed. Splitting the nested part out
+                                     ;; makes the next chain state say which of
+                                     ;; the two is the one that cannot travel.
                                      :amend {:tx :amend-market :account bridge :market (:id m)
-                                             :spec (dissoc m :id :tick :lot)}
+                                             :spec (dissoc m :id :tick :lot :fee-tiers :margin-tiers)}
+                                     :amend-tiers {:tx :amend-market :account bridge :market (:id m)
+                                                   :spec (select-keys m [:fee-tiers])}
                                      ;; The same number genesis gives the first
                                      ;; market: a devnet has no feed, and two
                                      ;; markets opening at different prices
@@ -1273,7 +1286,7 @@
                      (.then (fn [rs]
                               (let [rs (vec (array-seq rs))]
                                 {:listed (filterv #(= "list" (name (:kind %))) rs)
-                                 :amended (filterv #(= "amend" (name (:kind %))) rs)
+                                 :amended (filterv #(#{"amend" "amend-tiers"} (name (:kind %))) rs)
                                  :opened (filterv #(= "price" (name (:kind %))) rs)
                                  :bridge bridge})))))))))))
 
