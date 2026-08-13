@@ -2675,6 +2675,37 @@
                                        :edn (aget vals i)}
                                       200))))))
 
+               ;; Proof of reserves, the half a chain can produce by itself.
+               ;;
+               ;; `:total` is the root's merkle-sum: every account's collateral
+               ;; added up, authenticated by the same root each account proves
+               ;; its own share against. `:pending-withdrawals` is what has
+               ;; left an account and not yet left the exchange — a claim is a
+               ;; leaf and carries its amount, so the total does not drop when
+               ;; somebody withdraws, only when the bridge settles.
+               ;;
+               ;; `:backing` says the part this cannot answer. With no
+               ;; `:bridge-authority` the chain mints its own collateral, so
+               ;; the number is exact and unbacked, and saying so here is the
+               ;; difference between an attestation and a decoration.
+               "/reserves"
+               (let [ex (:machine-state (.-replica this))
+                     leaves (st/canonical-leaves ex)
+                     ws (:withdrawals ex {})]
+                 (json {:height (r/height (.-replica this))
+                        :state-root (st/state-root ex)
+                        :total (cm/reserves leaves)
+                        :accounts (count (:accounts (:clearing ex)))
+                        :pending-withdrawals {:count (count ws)
+                                              :amount (reduce + 0 (map :amount (vals ws)))}
+                        :insurance-fund (get-in ex [:clearing :insurance-fund] 0)
+                        :bad-debt (reduce + 0 (keep :deficit (vals (:accounts (:clearing ex)))))
+                        :bridge-authority (:bridge-authority ex)
+                        :backing (if (:bridge-authority ex)
+                                   "an escrow attests separately that it holds at least :total"
+                                   "unbacked — this chain mints its own collateral, so :total is exact and backed by nothing")}
+                       200))
+
                "/orders"
                (let [ex (:machine-state (.-replica this))
                      book (get-in ex [:books market-id])

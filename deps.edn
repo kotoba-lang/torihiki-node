@@ -29,19 +29,34 @@
         io.github.kotoba-lang/torihiki-chart
         {:git/url "https://github.com/kotoba-lang/torihiki-chart.git"
          :git/sha "80ab3d78ee3896c40d050c025c229be23450e584"}
-        ;; NOT main, deliberately. main has moved the state encoding three
-        ;; times since this pin (a governance leaf, `:deficit`, and pending
-        ;; withdrawals), and every one of them changes the state root — so
-        ;; advancing to main forks this chain and there is no rolling upgrade
-        ;; that survives it. See ADR-2608040600.
+        ;; main, and the reason it was not main is gone.
         ;;
-        ;; This is `hotfix/cancel-authorization`: `fa3a8e0c` plus the one fix
-        ;; that could not wait for that decision. `bk/cancel!` took an order id
-        ;; and nothing else, so any authenticated account could cancel any
-        ;; other account's resting orders. The backport touches no encoding —
-        ;; its parity flat root is still `22f75a7f…`, the same number this
-        ;; deployment has been producing — so pinning it cannot split the
-        ;; chain.
+        ;; This pinned a hotfix branch because main had moved the state
+        ;; encoding three times (a governance leaf, `:deficit`, pending
+        ;; withdrawals) and I had concluded that advancing to it forks the
+        ;; chain: replicas on either side compute different state roots for
+        ;; identical state, which is the shape of the divergence the root
+        ;; exists to catch.
+        ;;
+        ;; **That conclusion was wrong.** A block is
+        ;; `height / parent-hash / proposals / proposer / ts`
+        ;; (`inga.consensus/canonical-block`) and nothing else. It carries no
+        ;; state root, `inga.consensus` never mentions one, and
+        ;; `inga.replica/state-root` is computed on demand from machine state
+        ;; for REPORTING. Consensus orders transactions; it never compares
+        ;; what executing them produced.
+        ;;
+        ;; So an encoding change is an ordinary deploy. Replicas report
+        ;; different roots while the rollout is in flight — the window is real
+        ;; and visible in `/head` — and converge once all four run the same
+        ;; code, which is exactly what was observed when a divergent replica
+        ;; restarted onto unified code and replayed.
+        ;;
+        ;; What this brings live: collateral totals under the root
+        ;; (`commit/reserves`), bad debt as `:deficit` rather than a negative
+        ;; balance, withdrawals that raise a claim instead of deleting money,
+        ;; who may mint committed to the root, liquidation driven by the block
+        ;; rather than by a keeper, and cancel-all / amend.
         io.github.kotoba-lang/torihiki
         {:git/url "https://github.com/kotoba-lang/torihiki.git"
-         :git/sha "61cb5b6c26cf3d20d0be761f03c44b83edcc3b26"}}}
+         :git/sha "ef717f7d0969865206f0be9d071fd8b466af45e0"}}}
