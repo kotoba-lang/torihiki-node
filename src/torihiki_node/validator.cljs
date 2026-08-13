@@ -916,7 +916,7 @@
                      :headers #js {"content-type" "application/json"
                                    "access-control-allow-origin" "*"}}))
 
-(deftype Validator [^js do-state ^js env]
+(deftype ValidatorV2 [^js do-state ^js env]
   Object
   ;; Boot: the witness name, the signing key, and the replica. Everything is
   ;; in memory — this is a devnet and a validator that is evicted rejoins by
@@ -3238,7 +3238,7 @@
 ;; `goog.object/set` rather than `aset`: aset on a prototype with an unused
 ;; result was eliminated outright, and the built bundle contained no "alarm"
 ;; anywhere — the fix compiled away as thoroughly as the bug did.
-(gobj/set (.-prototype Validator) "alarm"
+(gobj/set (.-prototype ValidatorV2) "alarm"
           (fn [] (this-as this (.tickNow ^js this))))
 
 ;; The hibernation API calls these by name on the object, so they are attached
@@ -3251,9 +3251,9 @@
 ;; nothing to say back. Defining them anyway is what keeps a client that sends
 ;; something — a stray ping, a reconnect probe — from being an unhandled call
 ;; on the object.
-(gobj/set (.-prototype Validator) "webSocketMessage" (fn [_ws _msg] nil))
-(gobj/set (.-prototype Validator) "webSocketClose" (fn [_ws _code _reason _clean] nil))
-(gobj/set (.-prototype Validator) "webSocketError" (fn [_ws _err] nil))
+(gobj/set (.-prototype ValidatorV2) "webSocketMessage" (fn [_ws _msg] nil))
+(gobj/set (.-prototype ValidatorV2) "webSocketClose" (fn [_ws _code _reason _clean] nil))
+(gobj/set (.-prototype ValidatorV2) "webSocketError" (fn [_ws _err] nil))
 
 (def handler
   #js {:fetch
