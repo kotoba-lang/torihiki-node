@@ -1,5 +1,21 @@
 ;; A builder code against the DEPLOYED chain: the taker pays, the builder is
 ;; credited, the maker pays nothing extra.
+;;
+;; ## Trade near the mark
+;;
+;; The first version quoted at 100 on a market whose mark was 1000, and the
+;; taker's collateral came out HIGHER than it went in — reported as
+;; unexplained, which it was not. Selling at a tenth of the mark makes the
+;; maker insolvent the instant it fills, so the end-of-block sweep liquidates
+;; it and the waterfall's last stage closes the profitable counterparty at the
+;; bankruptcy price. That is auto-deleveraging working, and it realised PnL
+;; into the account this script was measuring fees on.
+;;
+;; Measured after the fact: the maker ended at collateral 0 with no position,
+;; and the taker's long had been cut from 20000 to 12396.
+;;
+;; So the price here is the mark. A fee test that trades far from the mark is
+;; a fee test with a liquidation running through it.
 (ns builder-e2e
   (:require [torihiki.auth :as auth] [torihiki.address :as addr] [promesa.core :as p]))
 (def base "https://torihiki-validator.04-feasts-minded.workers.dev")
@@ -23,13 +39,13 @@
         _ (POST "/faucet?w=w1" {:account (:acct taker)}) _ (wait 9000)
         nm (nonce-of (:acct maker))
         _ (tx maker nm {:tx :order :account (:acct maker) :market 2
-                        :side 1 :level 100 :qty 20000 :flags 0})
+                        :side 1 :level 1000 :qty 20000 :flags 0})
         _ (wait 9000)
         b0 (coll-of (:acct builder))
         t0 (coll-of (:acct taker))
         nt (nonce-of (:acct taker))
         _ (tx taker nt {:tx :order :account (:acct taker) :market 2
-                        :side 0 :level 100 :qty 20000 :flags 0
+                        :side 0 :level 1000 :qty 20000 :flags 0
                         :builder (:acct builder) :builder-fee 500000})
         _ (wait 10000)
         b1 (coll-of (:acct builder))
