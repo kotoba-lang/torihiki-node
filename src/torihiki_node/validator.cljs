@@ -3066,6 +3066,25 @@
                ;; Public because a vault asking for outside money and not
                ;; publishing its book is asking to be trusted — the same
                ;; reason `/reserves` says what it cannot answer.
+               ;; What an account has bonded, and what is on its way back.
+               "/stake"
+               (let [ex (:machine-state (.-replica this))
+                     c (:clearing ex)
+                     a (some-> (.get (.-searchParams url) "account") js/parseInt)]
+                 (json {:account a
+                        :height (r/height (.-replica this))
+                        :bonded (get-in c [:bonds a] {})
+                        :total-bonded (cl/bonded c a)
+                        :unbonding (vec (get-in c [:unbonding a] []))
+                        :unbond-delay-blocks cl/unbond-delay-blocks
+                        ;; What each publisher's word currently weighs. Empty
+                        ;; while nobody has bonded, which is the honest answer
+                        ;; rather than the genesis map dressed as stake.
+                        :publisher-weight
+                        (into {} (for [p (sort (:oracle-publishers ex))]
+                                   [p (cl/stake-of c p)]))}
+                       200))
+
                "/vault"
                (let [ex (:machine-state (.-replica this))
                      v (some-> (.get (.-searchParams url) "id") js/parseInt)
