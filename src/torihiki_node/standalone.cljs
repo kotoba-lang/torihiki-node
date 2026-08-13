@@ -244,11 +244,30 @@
 
 (defn- now [] (.getTime (js/Date.)))
 
-(defn- ship! [outbox]
-  (doseq [{:keys [msg]} outbox]
+(defn- ship!
+  "Send the outbox, and send each message to WHO IT IS FOR.
+
+  This broadcast everything. `inga.replica` has always set `:to` and it was
+  being ignored, which is invisible for votes and proposals — they go to
+  everybody anyway — and fatal for sync: a replica that has fallen behind
+  receives mostly the ANSWERS TO OTHER REPLICAS, each segment starting at a
+  height it cannot reach, and refuses them one after another.
+
+  Measured here, four replicas on one host: w3 sat at height 257 while the
+  others ran at 409, with all three peers connected, **13,379 messages
+  received** and nothing adopted. Being behind was what kept it behind. The
+  Worker's own dispatch carries this note already; the standalone was written
+  without it.
+
+  Only the dialled sockets. Every replica dials every peer, so those reach
+  everyone; also pushing down the inbound sessions sent each message twice."
+  [outbox]
+  (doseq [{:keys [msg to]} outbox]
     (swap! stats update :msgs-out inc)
-    (when-let [n @out-node] ((:broadcast! n) msg))
-    (doseq [[_ s] @registry] (when (:send! s) ((:send! s) msg)))))
+    (when-let [n @out-node]
+      (if (or (nil? to) (= :all to))
+        ((:broadcast! n) msg)
+        ((:send! n) to msg)))))
 
 (defn- note-height! [h]
   ;; The block interval, from the inside, the same way the Worker reports it —
