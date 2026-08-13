@@ -302,6 +302,11 @@
 
 ;; ── HTTP ────────────────────────────────────────────────────────────────────
 
+;; Forward, because the HTTP surface answers with things the log section
+;; defines and the log section needs the replica the HTTP section serves.
+;; Declaring is smaller than moving either one.
+(declare newest-checkpoint)
+
 (defn- json-response [res code body]
   (.writeHead res code #js {"Content-Type" "application/json"
                             "Access-Control-Allow-Origin" "*"})
@@ -443,6 +448,31 @@
       ;; compared. A block header carries no state root here — `canonical-block`
       ;; never had one — so "same root" is established the way consensus
       ;; establishes it: same chain, deterministic machine.
+      ;; The newest checkpoint, for a peer that has to be repaired.
+      ;;
+      ;; A replica that adopted a block the quorum did not certify cannot get
+      ;; back by syncing: every segment its peers offer starts at a height
+      ;; whose parent is not the block it holds, and `inga.sync/adopt` only
+      ;; appends. The way back is to take the state the quorum agrees on.
+      "/snapshot"
+      ;; From the LIVE replica, not from a checkpoint on disk.
+      ;;
+      ;; It answered from the newest disk checkpoint and said `no-checkpoint`
+      ;; when there was none — and checkpoints are every 500 blocks, so a
+      ;; replica that diverged early had nothing to be repaired from. Measured:
+      ;; four replicas frozen together at height 149 with the repair path
+      ;; installed and never firing, because every peer answered `ok false`.
+      ;;
+      ;; `r/snapshot` bounds itself (a tail of the chain, not the chain), so
+      ;; answering from memory is neither large nor slow, and it is always
+      ;; current — which is what a replica being repaired needs.
+      (json-response res 200
+                     {:ok true
+                      :height (r/height s)
+                      :root (st/state-root ex)
+                      :edn (tsnap/write-string
+                            (update (r/snapshot s) :machine-state tsnap/capture))})
+
       "/hash-at"
       (let [h (js/parseInt (or (q "h") "0") 10)
             b (first (filter #(= h (:inga.block/height %)) (:chain s)))]
@@ -690,6 +720,79 @@
                        nil))))
        every))))
 
+(defonce next-repair (atom 0))
+(defonce stall (atom {:at -1 :since 0}))
+
+(def ^:const stall-ms
+  "How long a replica may sit at one height before it asks the quorum for its
+  state. **15000.**
+
+  Long enough that ordinary catching-up — which moves — never reaches it, and
+  short enough that a replica which cannot rejoin does not sit out the day."
+  15000)
+
+(defn- repair!
+  "Take the state the quorum agrees on, when our own chain cannot be extended.
+
+  Triggered by NOT MOVING, not by a reason string.
+
+  `:does-not-link` names the situation exactly and is the wrong trigger: a
+  replica only sees it once it is close enough for a peer to offer the block
+  right above its tip. One that is both divergent and far behind reports
+  `:does-not-attach` — the offered range does not even meet its own — and that
+  reason also appears constantly on a perfectly healthy chain when an answer
+  arrives stale. Measured: a replica handed a foreign 121-block history sat at
+  121 against peers at 4272, reporting `does-not-attach` and never once
+  `does-not-link`.
+
+  So the condition is the one that actually distinguishes: our height has not
+  moved for `stall-ms` while a peer is ahead of us. Being behind is not enough
+  — catching up looks like that too, and it is moving.
+
+  Every peer must answer and every answer must agree, height and root. With
+  four replicas the three peers ARE the quorum, so what they agree on needs no
+  vote from the replica adopting it — and requiring unanimity among the peers
+  is what stops one confused answer from moving a replica that was right.
+
+  The LOG is rewritten too. Leaving our own history on disk would replay the
+  chain we just abandoned on the next restart, which is the same divergence
+  arriving a second time and looking like a fresh one."
+  []
+  (let [now (js/Date.now)
+        s @state]
+    (when (not= (r/height s) (:at @stall))
+      (reset! stall {:at (r/height s) :since now}))
+    (when (and (>= now @next-repair)
+               (> (- now (:since @stall)) stall-ms))
+      (reset! next-repair (+ now 5000))
+      (-> (js/Promise.all
+           (clj->js (for [p (remove #{me} witnesses)]
+                      (-> (js/fetch (str "http://127.0.0.1:"
+                                         (+ 8800 (js/parseInt (subs p 1) 10)) "/snapshot"))
+                          (.then #(.json %))
+                          (.then #(js->clj % :keywordize-keys true))
+                          (.catch (fn [_] nil))))))
+          (.then (fn [rs]
+                   (let [rs (remove nil? (array-seq rs))]
+                     (when (and (= (count rs) (dec (count witnesses)))
+                                (every? :ok rs)
+                                (apply = (map :height rs))
+                                (apply = (map :root rs))
+                                ;; Only forward. A quorum snapshot at or below
+                                ;; where we already are is not a repair, and
+                                ;; adopting it would throw away a chain that
+                                ;; was fine for the sake of a slow peer.
+                                (> (:height (first rs)) (r/height @state)))
+                       (let [snap (-> (tsnap/read-string* (:edn (first rs)))
+                                      (update :machine-state tsnap/restore))]
+                         (reset! state (r/resume (replica-opts) snap))
+                         (fs/writeFileSync log-path "")
+                         (reset! persisted 0)
+                         (reset! last-ckpt -1)
+                         (println (str "  repaired from the quorum at height "
+                                       (:height (first rs)))))))))
+          (.catch (fn [_] nil))))))
+
 (defn -main [& _]
   (let [port (js/parseInt (second (str/split (get peer-url me "x:0") #":(?=[0-9]+$)")) 10)
         wss (ws/WebSocketServer. #js {:port port})
@@ -727,7 +830,8 @@
          (note-height! (r/height s'))
          (ship! out)
          (persist!)
-         (checkpoint!)))
+         (checkpoint!)
+         (repair!)))
      tick-ms)
     (watch-thorchain!)
     (println (str "torihiki " me " · peers " port " · http " (env "HTTP_PORT" "8801")
