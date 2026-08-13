@@ -401,7 +401,7 @@
   idle enough to be evicted. **Deployed and running are different facts** —
   ADR-2608020330 says so, and this constant is what makes the difference
   visible instead of assumed."
-  "128")
+  "129")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -2048,6 +2048,18 @@
                    ;; either: waiting on a peer to answer is how a replica
                    ;; hands its clock to the slowest one, and here it would
                    ;; also let two objects wait on each other.
+                   ;; Which path produced the proposal.
+                   ;;
+                   ;; The block MINIMUM is 25-37 ms and the median 184-211,
+                   ;; and the story for that gap has been "the event path does
+                   ;; not fire every block, and the fallback is a 40 ms
+                   ;; clock". That is an inference. These two counters are the
+                   ;; fact: a proposal that leaves from here was driven by a
+                   ;; message, one that leaves from `round` was driven by the
+                   ;; alarm. If the alarm is producing most of them, the
+                   ;; median has a cause in this code and not in the platform.
+                   (when (some #(= :proposal (:type (:msg %))) out)
+                     (set! (.-proposeOnMsg this) (inc (or (.-proposeOnMsg this) 0))))
                    (.queue! this out)
                    (.notify! this)
                    (let [sends (js/Promise.resolve (.flush! this))]
@@ -2797,6 +2809,8 @@
       ;; Both paths advance the chain, so both have to tell anybody listening.
       ;; `notify!` compares the committed height itself, so calling it when
       ;; nothing moved is a comparison and nothing else.
+      (when (some #(= :proposal (:type (:msg %))) (or (.-outq this) []))
+        (set! (.-proposeOnTick this) (inc (or (.-proposeOnTick this) 0))))
       (.notify! this)
       ;; Rate-limited inside. See `maybeAdopt!` for why this is on the tick
       ;; rather than behind the admin route it shares its evidence with.
@@ -3138,7 +3152,9 @@
                                    :deliver-ms (q (.-deliverMs this))
                                    :ingest-ms (q (.-ingestMs this))
                                    :ingest-phases (js->clj (or (.-ingestPhases this) #js []))
-                                   :colo (.-colo this)})
+                                   :colo (.-colo this)
+                                   :propose-on-msg (or (.-proposeOnMsg this) 0)
+                                   :propose-on-tick (or (.-proposeOnTick this) 0)})
                         ;; Why the tip has no vote on it.
                         ;;
                         ;; `votes-for-tip 0` on every replica at once says the
