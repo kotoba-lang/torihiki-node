@@ -23,23 +23,25 @@
 ;; It is one property of the substrate, and this file is the substrate without
 ;; it. 33 ms is already under the target.
 ;;
-;; ## Where it actually got to (2026-08-13, first run)
+;; ## Where it got to (2026-08-13)
 ;;
 ;; Four processes, one host, the real exchange with two markets:
 ;;
-;;   every replica the same state root at height 7
-;;   block  min 5-14 ms   p50 14-29 ms
+;;   all four replicas, identical block hash at height 500
+;;   heights 1038-1047 and climbing
+;;   block  min 1-2 ms   p50 7-8 ms   max 93-96 ms   (256 samples each)
 ;;
-;; **14 ms at the median against 184-211 ms on Durable Objects**, and under
-;; Hyperliquid's ~70 ms by a factor of five.
+;; **7-8 ms at the median against 184-211 ms on Durable Objects**, and about
+;; nine times under Hyperliquid's ~70 ms.
 ;;
-;; Then it stopped at height 7: inbound message counts froze and the view kept
-;; climbing, which is a replica talking to nobody. The peer sockets are dialled
-;; once and `nws/make-node`'s tick is supposed to redial; something in that
-;; path is not reconnecting here. **Stated rather than rounded off** — the
-;; latency number is real and the liveness is not there yet, and a file that
-;; reported only the first would be the kind of measurement this workspace
-;; keeps having to correct.
+;; The first run stopped at height 7 with every peer `:dropped` and
+;; `failures 0` — nothing had failed to CONNECT, everything had failed to
+;; parse. `:hash-fn` was `wire/wire-id` applied to the canonical block, a
+;; function for witness names that does not return a hash; the ids it made
+;; travelled inside votes and certificates, `inga.wire/decode` refused every
+;; message carrying one, and `:dropped` is terminal. A transport that cannot
+;; say which of those two it is costs a day, so `/head` now reports each
+;; peer's state, failure count and next attempt.
 ;;
 ;; ## What it is NOT
 ;;
@@ -202,7 +204,21 @@
   (atom (r/replica {:witness me
                     :witnesses witnesses
                     :quorum (c/quorum-size (count witnesses))
-                    :hash-fn (fn [b] (wire/wire-id (c/canonical-block b)))
+                    ;; hex of SHA-256 over the canonical block.
+                    ;;
+                    ;; This was `wire/wire-id` applied to the canonical block,
+                    ;; which is a function for witness NAMES and does not
+                    ;; return a hash — the ids it produced travelled inside
+                    ;; votes and certificates, `inga.wire/decode` refused every
+                    ;; message carrying one, and after enough refusals each
+                    ;; peer was marked `:dropped`, which is terminal. All four
+                    ;; replicas sat at height 7 with `failures 0` and every
+                    ;; peer dropped: nothing had failed to CONNECT, everything
+                    ;; had failed to parse.
+                    :hash-fn (fn [b]
+                               (.toString (js/Buffer.from
+                                           (sha256 (js/Buffer.from (c/canonical-block b) "utf8")))
+                                          "hex"))
                     :chain-id chain-id
                     :sign-fn (sign-as me)
                     :verify-fn verify-fn
@@ -276,15 +292,48 @@
       (json-response res 200
                      {:witness me
                       :height (r/height s)
-                      :committed (:committed-height s)
+                      ;; `:committed` is the list of committed blocks, not a height —
+                      ;; reading it as one reported `null` on a chain that was
+                      ;; committing every block.
+                      :committed (count (:committed s))
+                      ;; The root AT the committed tip, which is the only root
+                      ;; two replicas can be compared on: at their own tips
+                      ;; they are legitimately at different heights and
+                      ;; different roots, and comparing those says nothing.
+                      :committed-root
+                      (when-let [b (last (:committed s))]
+                        {:height (:inga.block/height b)
+                         :root (:inga.block/state-root b)})
                       :view (:view (:pm s))
                       :state-root (st/state-root ex)
                       :pending (count (:pending s))
                       :msgs-in (:msgs-in @stats)
                       :msgs-out (:msgs-out @stats)
-                      :peers (count @registry)
+                      :inbound (count @registry)
+                      ;; Which peers this replica can actually reach, from the
+                      ;; driver's own state — not a count of sockets that were
+                      ;; once opened. A replica talking to nobody and a replica
+                      ;; whose peers are quiet look identical from the outside,
+                      ;; and the first run could not tell them apart.
+                      :live-peers (vec (map str (some-> @out-node :live (apply []))))
+                      :peer-status (into {} (for [[k v] (:peers @(:state @out-node))]
+                                              [(str k) {:state (str (:state v))
+                                                        :failures (:failures v)
+                                                        :next-in (when (:next-attempt v)
+                                                                   (- (:next-attempt v) (now)))}]))
                       :block-ms (quantiles (:blocks @stats))
                       :substrate "process"})
+
+      ;; The block hash at a given height, which is how two replicas are
+      ;; compared. A block header carries no state root here — `canonical-block`
+      ;; never had one — so "same root" is established the way consensus
+      ;; establishes it: same chain, deterministic machine.
+      "/hash-at"
+      (let [h (js/parseInt (or (q "h") "0") 10)
+            b (first (filter #(= h (:inga.block/height %)) (:chain s)))]
+        (json-response res 200 {:height h
+                                :hash (when b ((:hash-fn s) b))
+                                :have (count (:chain s))}))
 
       "/tx"
       (-> (read-body req)
