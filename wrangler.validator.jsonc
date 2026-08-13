@@ -6,8 +6,20 @@
   // instance per id, so "this witness is one process" comes from the platform
   // rather than from a lease — the same reason the sequencer is a DO.
   "durable_objects": {
-    "bindings": [{ "name": "VALIDATOR", "class_name": "Validator" }]
+    "bindings": [{ "name": "VALIDATOR", "class_name": "ValidatorV2" }]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Validator"] }],
+  // v2 renames the class, and the rename is the POINT rather than a tidy-up.
+  //
+  // A Durable Object runs the code it booted with until it is evicted, and
+  // these fire an alarm every few tens of milliseconds, so they never go idle
+  // enough to be evicted — measured 2026-08-13: four replicas went on
+  // reporting code-version 100 for as long as they were sampled after a
+  // deploy of 101. `renamed_classes` is Cloudflare's data-preserving move: the
+  // stored data comes with the class, and the objects are instantiated afresh,
+  // which is what makes them pick up the deployed code.
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Validator"] },
+    { "tag": "v2", "renamed_classes": [{ "from": "Validator", "to": "ValidatorV2" }] }
+  ],
   "observability": { "enabled": true }
 }

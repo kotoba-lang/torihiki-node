@@ -12,5 +12,5 @@
    :output-dir "dist-validator"
    :runtime :custom
    :modules {:worker {:exports {default torihiki-node.validator/handler
-                                Validator torihiki-node.validator/Validator}}}
+                                ValidatorV2 torihiki-node.validator/ValidatorV2}}}
    :compiler-options {:infer-externs :auto}}}}
