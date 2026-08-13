@@ -64,6 +64,7 @@
             [torihiki.api :as api]
             [torihiki.auth :as auth]
             [torihiki.clearing :as cl]
+            [torihiki.evm :as evm]
             [torihiki.thorchain :as tc]
             [torihiki.state :as st]))
 
@@ -282,6 +283,63 @@
        (.on req "data" (fn [c] (swap! chunks str c)))
        (.on req "end" (fn [] (resolve @chunks)))))))
 
+;; ── JSON-RPC ────────────────────────────────────────────────────────────────
+
+(def ^:const evm-chain-id
+  "The chain id an EVM caller sees. Distinct from `chain-id`, which is this
+  chain's own name and is not a number — an EIP-155 signature covers a NUMBER,
+  and reusing a string there is how a transaction signed for one chain becomes
+  replayable on another."
+  1337)
+
+(defn- rpc-result [id v]
+  {:jsonrpc "2.0" :id id :result v})
+
+(defn- rpc-error [id code message]
+  {:jsonrpc "2.0" :id id :error {:code code :message message}})
+
+(defn- hex-quantity
+  "A number as an EVM RPC quantity: `0x`-prefixed, no leading zeroes, and `0x0`
+  for zero. Not the same encoding as a 32-byte word — a caller that pads a
+  quantity gets rejected by strict clients, which is the kind of thing that
+  works in curl and fails in ethers."
+  [n]
+  (str "0x" (.toString (js/Number n) 16)))
+
+(defn- rpc-call
+  "One JSON-RPC request against the exchange.
+
+  The read surface only, and the methods a caller actually needs to reach the
+  precompile: what chain this is, how far along it is, and `eth_call`. A
+  method that is not here answers `method not found` rather than something
+  shaped like a result — a node that invents answers for methods it does not
+  implement is worse than one that admits the gap, because a library will
+  believe it."
+  [state* {:keys [id method params]}]
+  (let [s @state*
+        ex (:machine-state s)]
+    (case method
+      "eth_chainId" (rpc-result id (hex-quantity evm-chain-id))
+      "net_version" (rpc-result id (str evm-chain-id))
+      "eth_blockNumber" (rpc-result id (hex-quantity (r/height s)))
+
+      "eth_call"
+      (let [{:keys [to data]} (first params)]
+        (if-let [out (evm/call ex to data)]
+          (rpc-result id out)
+          ;; `execution reverted` rather than a zero word, and for the reason
+          ;; `torihiki.evm/call` returns nil: an answer of zeroes to a
+          ;; question the exchange never understood is indistinguishable from
+          ;; a real zero, and the caller has no way to find out which it got.
+          (rpc-error id 3 "execution reverted")))
+
+      ;; A balance in wei is not collateral in ticks and pretending otherwise
+      ;; would put a number in front of every wallet that means something
+      ;; else. The precompile is where collateral is read.
+      "eth_getBalance" (rpc-result id "0x0")
+
+      (rpc-error id -32601 (str "method not found: " method)))))
+
 (defn- handle-http [^js req ^js res]
   (let [url (js/URL. (.-url req) "http://x")
         path (.-pathname url)
@@ -335,6 +393,15 @@
         (json-response res 200 {:height h
                                 :hash (when b ((:hash-fn s) b))
                                 :have (count (:chain s))}))
+
+      "/rpc"
+      (-> (read-body req)
+          (.then (fn [body]
+                   (let [j (js->clj (js/JSON.parse body) :keywordize-keys true)]
+                     (json-response res 200
+                                    (if (vector? j)
+                                      (mapv #(rpc-call state %) j)
+                                      (rpc-call state j)))))))
 
       "/tx"
       (-> (read-body req)
