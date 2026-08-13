@@ -2065,9 +2065,35 @@
                                          (let [edn (:edn (first g))
                                                snap (tsnap/read-string* edn)
                                                views (:views snap)
+                                               ;; **Never lower the vote
+                                               ;; watermark.**
+                                               ;;
+                                               ;; `inga.replica/snapshot` puts
+                                               ;; `:voted-below` at the tip and
+                                               ;; says what it is for: refusing
+                                               ;; MORE costs a vote at a height
+                                               ;; already decided, refusing
+                                               ;; LESS is equivocation. A peer's
+                                               ;; snapshot carries the peer's
+                                               ;; watermark, so adopting it
+                                               ;; wholesale hands this replica
+                                               ;; permission to vote again at
+                                               ;; every height between the two
+                                               ;; — and it did: w3 and w4
+                                               ;; reported `equivocators [w1]`
+                                               ;; persistently after an
+                                               ;; adoption.
+                                               ;;
+                                               ;; Equivocation is the one thing
+                                               ;; this chain slashes for. A
+                                               ;; repair that causes it is
+                                               ;; worse than the divergence it
+                                               ;; repairs.
+                                               mine (r/height (.-replica this))
                                                snap (-> snap
                                                         (update :machine-state tsnap/restore)
-                                                        (cond-> views (update :machine-state merge views)))
+                                                        (cond-> views (update :machine-state merge views))
+                                                        (update :voted-below (fnil max 0) mine))
                                                resumed (r/resume (.replicaOpts this me) snap)]
                                            (set! (.-replica this) resumed)
                                            (set! (.-notifiedAt this) nil)
