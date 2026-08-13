@@ -322,6 +322,15 @@
             [torihiki.snapshot :as tsnap]
             [torihiki.state :as st]))
 
+(goog-define genesis-set "v1")
+;; Which genesis validator set this BUILD carries. A compile-time constant,
+;; not an environment variable: a Worker has no `process.env`, and a value the
+;; running code could be handed at request time would let the same build claim
+;; two different validator sets — which is the one thing a genesis set must
+;; not be able to do.
+;;
+;; `shadow-cljs release validator-v2` sets it to "v2". See `validator-keys`.
+
 (def ^:const chain-id
   "**Not renamed when the consensus layer moved to inga, on purpose.**
 
@@ -472,13 +481,36 @@
   impersonate) and is the weak point the moment keys are real: whoever answers
   first is believed. A validator set is exactly the thing a chain must know
   before it starts, so it is genesis data, in the source, reviewed with it."
-  {"w1" "futt80Tbbqc50hej5X7xqWjG0oFLy3yrBAHDrOA0td0="
-   "w2" "K8ZA5PssVguLJcRZjzHzZ+vCQQJoLl5VRJ76gbxTqCk="
-   "w3" "iRNrRiAbOb8+HoTkDF63Xp6B1zFB1QApNiSPzb5P/gQ="
-   "w4" "GD3mDeP0zFMnyzCQpz+09+LWcoQcrdL4EvcV9jpZFqM="})
+  (if (= "v2" genesis-set)
+    ;; A second, independently keyed validator set.
+    ;;
+    ;; It exists because the first deployment cannot be given new code: those
+    ;; Durable Objects run what they booted with, never go idle, and survived
+    ;; both a deploy and a `renamed_classes` migration (measured 2026-08-13).
+    ;; Everything written since then — spot markets, the reserve attestation,
+    ;; the two-chain commit, chosen leverage, sub-accounts — is verified only
+    ;; by tests, and a test is not a deployment.
+    ;;
+    ;; So: a parallel chain, with its own keys, that CAN run the new code. The
+    ;; first deployment is untouched; this one is where the new code is
+    ;; answered for. Both key sets live here, in source, reviewed with the
+    ;; code, for the reason the paragraph above this one gives.
+    {"w1" "1aJxhZfNXYrOfM6MoInHY3N60QvWk3FQrZAOmzp34Ww="
+     "w2" "gzo4VJ1tUqS7Xsm39C3LJ82A88+XHuJhTZA52KTciuU="
+     "w3" "Zn9VaTKLffouJfWAV18/rTqT9DpN41jURl9bqRJbdRM="
+     "w4" "3zUgkgYGPkI/fP9zNSBBHxWS28S+RFo3TPv0NB7OB88="}
+    {"w1" "futt80Tbbqc50hej5X7xqWjG0oFLy3yrBAHDrOA0td0="
+     "w2" "K8ZA5PssVguLJcRZjzHzZ+vCQQJoLl5VRJ76gbxTqCk="
+     "w3" "iRNrRiAbOb8+HoTkDF63Xp6B1zFB1QApNiSPzb5P/gQ="
+     "w4" "GD3mDeP0zFMnyzCQpz+09+LWcoQcrdL4EvcV9jpZFqM="}))
 
-(def ^:const bridge-pubkey
-  "jmBeKHD9Pb6GYmlFUfnFwfoci+pSE5rZ+ALlAfnP00o=")
+(def bridge-pubkey
+  "The faucet's public key — the account that may mint collateral.
+
+  Per genesis set, like the validator keys and for the same reason."
+  (if (= "v2" genesis-set)
+    "o9Fpro5qdCeeY2LZnxQS16/Yir4LDghHTjHL6PSPOek="
+    "jmBeKHD9Pb6GYmlFUfnFwfoci+pSE5rZ+ALlAfnP00o="))
 
 (defn key-distribution
   "What `/head` says about where the validator set's public keys came from —
@@ -649,21 +681,20 @@
           :fee-tiers [{:min-volume 0          :taker-fee-rate 350000 :maker-fee-rate 100000}
                       {:min-volume 100000000 :taker-fee-rate 250000 :maker-fee-rate 50000}
                       {:min-volume 1000000000 :taker-fee-rate 150000 :maker-fee-rate 0}])
-   ;; The spot market is NOT listed here yet.
+   ;; A spot market: balances change hands, nothing is margined. `:asset` is
+   ;; the id of what is bought and sold; the quote is the collateral the venue
+   ;; keeps its books in.
    ;;
-   ;; It is implemented and tested in the engine (274 tests, six gates), and
-   ;; putting it in this vector while it is absent from the chain stopped
-   ;; every bridge transaction from landing — the faucet included. Measured
-   ;; twice: adding it broke them, removing it restored them.
-   ;;
-   ;; The mechanism found so far: `listMissingMarkets` queued a PRICE for a
-   ;; market that was not listed yet, which `api/validate` refuses as
-   ;; `:unknown-market`, and a guaranteed-invalid transaction in a strictly
-   ;; sequential nonce line is a wall every later bridge transaction queues
-   ;; behind. That filter is fixed below. The fix has not been shown to work
-   ;; on the deployment yet — a Durable Object runs the code it booted with,
-   ;; and the retry after deploying it still queued the price — so the market
-   ;; stays out of this vector until a run proves the sync is clean.
+   ;; It was held out of this vector while the first deployment could not take
+   ;; new code — listing a market the chain does not have made
+   ;; `listMissingMarkets` queue a PRICE for it too, and a guaranteed-invalid
+   ;; transaction in a strictly sequential nonce line is a wall every later
+   ;; bridge transaction queues behind. That filter is fixed, and this build is
+   ;; the one that actually runs.
+   (assoc (cl/market {:id 3 :symbol "BTC-USD" :max-leverage 1 :tick 10 :lot 1})
+          :kind :spot :asset 77
+          :taker-fee-rate 350000
+          :maker-fee-rate 100000)
    (assoc (cl/market {:id 2 :symbol "ETH-PERP" :max-leverage 20 :tick 10 :lot 1})
           :taker-fee-rate 500000
           :maker-fee-rate 100000
