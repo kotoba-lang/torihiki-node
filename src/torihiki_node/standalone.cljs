@@ -66,6 +66,8 @@
             [torihiki.auth :as auth]
             [torihiki.clearing :as cl]
             [torihiki.evm :as evm]
+            [torihiki.evm.interp :as evmi]
+            [torihiki.keccak :as kc]
             [torihiki.snapshot :as tsnap]
             [torihiki.thorchain :as tc]
             [torihiki.state :as st]))
@@ -295,6 +297,8 @@
 
 ;; ── JSON-RPC ────────────────────────────────────────────────────────────────
 
+(def ^:private zero-address "0x0000000000000000000000000000000000000000")
+
 (def ^:const evm-chain-id
   "The chain id an EVM caller sees. Distinct from `chain-id`, which is this
   chain's own name and is not a number — an EIP-155 signature covers a NUMBER,
@@ -333,9 +337,25 @@
       "net_version" (rpc-result id (str evm-chain-id))
       "eth_blockNumber" (rpc-result id (hex-quantity (r/height s)))
 
+      "eth_getCode"
+      (rpc-result id (str "0x" (get-in ex [:evm (some-> (first params) str/lower-case) :code] "")))
+
       "eth_call"
-      (let [{:keys [to data]} (first params)]
-        (if-let [out (evm/call ex to data)]
+      (let [{:keys [to data]} (first params)
+            to (some-> to str/lower-case)]
+        (if-let [out (or (evm/call ex to data)
+                         ;; Deployed bytecode, from CHAIN state — `:evm` is in
+                         ;; the state root, so two replicas answering this
+                         ;; question differently is a disagreement the root
+                         ;; shows. A world kept in the node would have made it
+                         ;; invisible.
+                         (when-let [code (get-in ex [:evm to :code])]
+                           (let [world (into {} (for [[a c] (:evm ex)]
+                                                  [a {:code (kc/hex->bytes (:code c))}]))
+                                 r (evmi/run ex world
+                                             {:address to :caller zero-address :depth 0}
+                                             (kc/hex->bytes code) data)]
+                             (when (= :return (:status r)) (str "0x" (:data r))))))]
           (rpc-result id out)
           ;; `execution reverted` rather than a zero word, and for the reason
           ;; `torihiki.evm/call` returns nil: an answer of zeroes to a
