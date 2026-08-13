@@ -1,0 +1,36 @@
+# One validator, as a service. `systemctl enable --now torihiki@w1`.
+#
+# A template unit rather than four copies: the four differ in one word, and
+# four files that differ in one word drift.
+#
+# Restart=always with a delay, because the thing this is protecting against is
+# a replica that died — and a replica that comes back has a chain log and a
+# checkpoint to come back WITH. Coming back fast enough to matter is the whole
+# reason those exist.
+[Unit]
+Description=torihiki validator %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=torihiki
+WorkingDirectory=/opt/torihiki
+EnvironmentFile=/etc/torihiki/common.env
+EnvironmentFile=/etc/torihiki/%i.env
+Environment=W=%i
+ExecStart=/usr/bin/npx nbb -cp src:%h/.torihiki/cp -m torihiki-node.standalone
+Restart=always
+RestartSec=2
+# The log and the checkpoints. Losing them means a replica that rejoins from
+# genesis, which the quorum can repair but should not have to.
+StateDirectory=torihiki
+# It answers HTTP and talks to three peers. Nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/torihiki
+
+[Install]
+WantedBy=multi-user.target
