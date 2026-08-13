@@ -64,6 +64,7 @@
             [torihiki.api :as api]
             [torihiki.auth :as auth]
             [torihiki.clearing :as cl]
+            [torihiki.thorchain :as tc]
             [torihiki.state :as st]))
 
 (defn- env [k d] (or (some-> js/process .-env (aget k)) d))
@@ -354,6 +355,63 @@
 
 ;; ── start ───────────────────────────────────────────────────────────────────
 
+;; ── the escrow watcher ──────────────────────────────────────────────────────
+
+(defonce watcher-nonce (atom 0))
+
+(defn- attest! [tx]
+  (let [acct (derive-account (pub-of me))
+        nonce (swap! watcher-nonce inc)
+        tx (assoc tx :account acct)
+        payload (auth/signing-payload chain-id acct nonce tx)
+        env {:tx tx :account acct :nonce nonce
+             :pubkey (pub-of me)
+             :sig ((sign-as me) payload)}]
+    (swap! state r/submit (js/JSON.stringify (clj->js env)))))
+
+(defn- watch-thorchain!
+  "Poll THORChain and attest what this validator sees.
+
+  Nothing here decides anything: `torihiki.thorchain` says which observations
+  are usable and `torihiki.state` decides when enough validators agree. This
+  is the network in between, and it is separate from both for the reason the
+  namespace docstring gives — the part that needs a network to run is the part
+  that cannot be tested, so it holds as little as possible.
+
+  Off unless `THOR_VAULT` is set. A watcher with no vault to watch would poll
+  a public endpoint forever and attest nothing, which is a cost with no
+  answer."
+  []
+  (when-let [vault (env "THOR_VAULT" nil)]
+    (let [base (env "THOR_URL" "https://thornode.ninerealms.com")
+          every (js/parseInt (env "THOR_POLL_MS" "6000") 10)]
+      (println (str "  escrow: watching " vault " via " base))
+      (js/setInterval
+       (fn []
+         (-> (js/fetch (str base "/thorchain/lastblock"))
+             (.then #(.json %))
+             (.then (fn [j]
+                      (let [tip (js/parseInt (or (some-> (aget j 0) (aget "thorchain"))
+                                                 (aget j "thorchain") "0") 10)]
+                        (-> (js/fetch (str base "/thorchain/queue/outbound"))
+                            (.then #(.json %))
+                            (.then (fn [obs]
+                                     (let [os (js->clj obs)]
+                                       (doseq [tx (tc/deposits-in
+                                                   (derive-account (pub-of me))
+                                                   vault tip os)]
+                                         (attest! tx))
+                                       (doseq [tx (tc/payouts-in
+                                                   (derive-account (pub-of me))
+                                                   tip os)]
+                                         (attest! tx)))))))))
+             (.catch (fn [_]
+                       ;; A poll that failed is a poll that failed. It is not
+                       ;; evidence of anything and must not become an
+                       ;; attestation, so there is nothing to do but try again.
+                       nil))))
+       every))))
+
 (defn -main [& _]
   (let [port (js/parseInt (second (str/split (get peer-url me "x:0") #":(?=[0-9]+$)")) 10)
         wss (ws/WebSocketServer. #js {:port port})
@@ -387,5 +445,6 @@
          (note-height! (r/height s'))
          (ship! out)))
      tick-ms)
+    (watch-thorchain!)
     (println (str "torihiki " me " · peers " port " · http " (env "HTTP_PORT" "8801")
                   " · tick " tick-ms "ms"))))
