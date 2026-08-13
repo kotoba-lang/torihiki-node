@@ -546,16 +546,44 @@
 (defn- ckpt-key [h] (str "snap:" (.padStart (str h) 12 "0")))
 
 (def ^:const tick-ms
-  "200, halved from 400 to ask one question: is the ceiling at height 225 a
-  property of the CHAIN or of the CLOCK?
+  "How often a replica wakes itself to make progress. **25.**
 
-  Seven stalls at exactly 225 have survived every protocol change made, and
-  the chain is deterministic — same blocks, same hashes, every run — so a
-  state-dependent bug would land on the same height every time and so would a
-  time-dependent one, because the block rate has also been the same every
-  time. Halving the tick separates them: if the ceiling is the chain it stays
-  at 225, and if it is elapsed time it moves to roughly 450."
-  200)
+  It was 400, then 200 to answer a question about a stall at height 225 (was
+  the ceiling the chain or the clock?). Neither number was ever chosen for
+  speed, and at 200 blocks landed every 462 ms while Durable-Object-to-
+  Durable-Object HTTP costs tens of milliseconds — an order of magnitude
+  between the cadence and the transport, all of it in waiting.
+
+  Measured, live, 45 seconds per point, all four replicas sampled throughout:
+
+  ```
+    tick   interval   blocks/s   catching-up   equivocators   split roots
+     200     462 ms      2.17         0%            none          none
+     100     345 ms      2.89         0%            none          none
+      50     259 ms      3.86         0%            none          none
+      25     185 ms      5.40         0%            none          none
+      10     126 ms      7.96         0%            none          none
+       5    STOPPED      0.00       6.5%            none          none
+  ```
+
+  **The cliff is between 10 and 5, and it is a cliff rather than a slope**: the
+  chain did not slow down at 5, it stopped — zero blocks in 67 seconds — and
+  no replica reported an error, equivocated, or disagreed about a root while it
+  did. That is the same shape ADR-2608025400 measured from the other side
+  (20 ms of delivery delay took committed blocks to zero): this implementation
+  needs a round to fit between ticks, and when it does not, nothing says so.
+
+  **25 and not 10**, giving up 60 ms per block. 10 measured perfectly healthy
+  and sits one step from a cliff whose only symptom is silence, and `witnesses`
+  already records what running with zero margin costs — four replicas and a
+  quorum of three, where a single eviction leaves exactly quorum. Taking the
+  best measured number would be making that mistake again in a different
+  variable.
+
+  Still 2.5x the rate this started at, and the remaining distance to
+  Hyperliquid's ~0.07 s is not here — it is the transport, which is HTTP
+  between isolates and answers to co-location rather than to a constant."
+  25)
 
 (def ^:const replay-page
   "How many persisted blocks one invocation folds on the way back up.
