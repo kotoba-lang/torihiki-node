@@ -401,7 +401,7 @@
   idle enough to be evicted. **Deployed and running are different facts** —
   ADR-2608020330 says so, and this constant is what makes the difference
   visible instead of assumed."
-  "117")
+  "120")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -631,6 +631,16 @@
   Hyperliquid's ~0.07 s is not here — it is the transport, which is HTTP
   between isolates and answers to co-location rather than to a constant."
   25)
+
+(def ^:const deliver-cap-ms
+  "How long a tick will wait for its own messages to be delivered. **40.**
+
+  Not a timeout — the sends are not cancelled and `deliver-ms` still reports
+  what they really cost. It is the point past which waiting stops being the
+  local clock's business. 40 is above the measured p50 round trip (3-18 ms
+  same colo, 24-36 ms to the one replica in another city) and well under the
+  247 ms median block it is meant to cut into."
+  40)
 
 (def ^:const replay-page
   "How many persisted blocks one invocation folds on the way back up.
@@ -1509,6 +1519,23 @@
                    (set! (.-replica this) (r/replica (.replicaOpts this name)))
                    (set! (.-persisted this) 0)
                    (set! (.-ready this) true)
+                   ;; Where this object actually runs.
+                   ;;
+                   ;; Asked from INSIDE the object, because that is the only
+                   ;; vantage that answers it: `request.cf.colo` on the way in
+                   ;; names the edge nearest whoever called, which for these
+                   ;; measurements is a laptop. A Durable Object's own
+                   ;; outbound request leaves from where the object is.
+                   ;;
+                   ;; Fire and forget: nothing waits on it and a failure
+                   ;; leaves the field nil, which reads as "not measured"
+                   ;; rather than as a location.
+                   (-> (js/fetch "https://cloudflare.com/cdn-cgi/trace")
+                       (.then #(.text %))
+                       (.then (fn [t]
+                                (set! (.-colo this)
+                                      (second (re-find #"colo=(\S+)" t)))))
+                       (.catch (fn [_] nil)))
                    ;; The log is NOT replayed here.
                    ;;
                    ;; It was, in one `.list` with no limit and one `r/replay`
@@ -2558,6 +2585,32 @@
     ;; Re-proposing is safe: a block is a pure function of its parent now, so
     ;; it is the same block, byte for byte, every time.
     (let [now (js/Date.now)]
+      ;; Where a block's 185 ms actually goes.
+      ;;
+      ;; `tick-ms` is 25 and blocks land every 185 ms, and the table under
+      ;; `tick-ms` attributes the remainder to "the transport". Measured from
+      ;; inside the objects, the transport is 2-4 ms between replicas in the
+      ;; same colo (`/transport`), so the attribution cannot be right. These
+      ;; three separate the candidates and cost two subtractions a tick:
+      ;;
+      ;;   gap   — wall time between consecutive ticks. If the alarm does not
+      ;;           actually fire every 25 ms, nothing else matters.
+      ;;   work  — time inside this function, dispatch included.
+      ;;   block — wall time between height increments, from the inside.
+      (let [prev (.-lastTickAt this)]
+        (when prev
+          (set! (.-tickGaps this)
+                (let [a (or (.-tickGaps this) #js [])]
+                  (.slice (.concat a (- now prev)) -64))))
+        (set! (.-lastTickAt this) now))
+      (let [h (r/height (.-replica this))]
+        (when (not= h (.-lastHeight this))
+          (when-let [t (.-lastHeightAt this)]
+            (set! (.-blockGaps this)
+                  (let [a (or (.-blockGaps this) #js [])]
+                    (.slice (.concat a (- now t)) -64))))
+          (set! (.-lastHeight this) h)
+          (set! (.-lastHeightAt this) now)))
       (when (zero? (r/height (.-replica this)))
         (let [[s' out] (r/start (.-replica this) now)]
           (set! (.-replica this) s')
@@ -2634,9 +2687,49 @@
         (when (and (pos? h)
                    (= (:inga.block/proposer tip) (.-witness this))
                    (zero? (mod n 8))
-                   (nil? (get (:qcs st) (block-hash (c/canonical-block tip)))))
+                   ;; CID, like everywhere the replica keys `:qcs`. Asked with
+                   ;; `block-hash` this was always nil, so the guard "only
+                   ;; while the tip has no certificate" never held and the
+                   ;; proposer re-broadcast its tip every eighth round for the
+                   ;; life of the chain — the storm this condition exists to
+                   ;; prevent, at one eighth the rate.
+                   (nil? (get (:qcs st) (block-cid tip))))
           (.queue! this [{:to :all :msg {:type :proposal :block tip}}])))
-      (.flush! this)))
+      ;; The tick does not wait out a slow peer.
+      ;;
+      ;; `dispatch` returns `Promise.all` over one `fetch` per peer, and this
+      ;; awaited it before rearming — so the local clock ran at the speed of
+      ;; the slowest replica. Measured from inside the objects:
+      ;;
+      ;;   tick gap   min 25   p50 29    max 1960
+      ;;   tick work  min  0   p50  0    max 1922
+      ;;   block      min 54   p50 247   max 1960
+      ;;
+      ;; The work is free at the median and occasionally two seconds, and the
+      ;; block interval follows it exactly. Meanwhile `/transport` puts the
+      ;; round trip between replicas at 2-4 ms in the same colo. **The
+      ;; distance to Hyperliquid was never the transport — the floor here is
+      ;; already 54 ms. It is this wait.**
+      ;;
+      ;; Bounded rather than removed: the sends keep running (a promise is not
+      ;; cancelled by nobody holding it, and these objects rearm every 25 ms
+      ;; so the isolate stays alive), and `waitUntil` says so explicitly where
+      ;; the runtime offers it. What changes is that the clock stops being
+      ;; hostage to them.
+      (let [sends (js/Promise.resolve (.flush! this))
+            t0 (js/Date.now)]
+        (.then sends (fn [_]
+                       (set! (.-deliverMs this)
+                             (let [a (or (.-deliverMs this) #js [])]
+                               (.slice (.concat a (- (js/Date.now) t0)) -64)))))
+        (when (fn? (.-waitUntil do-state)) (.waitUntil do-state sends))
+        (-> (js/Promise.race
+             #js [sends (js/Promise. (fn [res] (js/setTimeout res deliver-cap-ms)))])
+            (.then (fn [r]
+                     (set! (.-tickWork this)
+                           (let [a (or (.-tickWork this) #js [])]
+                             (.slice (.concat a (- (js/Date.now) now)) -64)))
+                     r))))))
 
   (rearm [this]
     ;; If no alarm is pending, set one. A loop that can be lost needs
@@ -2839,6 +2932,17 @@
                         ;; runs ahead they name different replicas, and the
                         ;; outside answer is the wrong one.
                         :propose-refusal (:propose-refusal (.-replica this))
+                        :timing (let [q (fn [a] (when (and a (pos? (.-length a)))
+                                                  (let [v (vec (sort (array-seq a)))]
+                                                    {:min (first v)
+                                                     :p50 (nth v (quot (count v) 2))
+                                                     :max (peek v)
+                                                     :n (count v)})))]
+                                  {:tick-gap-ms (q (.-tickGaps this))
+                                   :tick-work-ms (q (.-tickWork this))
+                                   :block-ms (q (.-blockGaps this))
+                                   :deliver-ms (q (.-deliverMs this))
+                                   :colo (.-colo this)})
                         ;; Why the tip has no vote on it.
                         ;;
                         ;; `votes-for-tip 0` on every replica at once says the
@@ -3064,6 +3168,58 @@
                             (.boot this w)))
                    (.then (fn [_] (json {:ok true :witness w
                                          :height (r/height (.-replica this))} 200))))
+
+               "/transport"
+               ;; What the transport actually costs, measured rather than
+               ;; asserted.
+               ;;
+               ;; The tick-ms table ends with "the remaining distance to
+               ;; Hyperliquid's ~0.07 s is not here — it is the transport,
+               ;; which is HTTP between isolates and answers to co-location",
+               ;; and that sentence was never measured. It names the fix
+               ;; (co-location) for a cost nobody had timed and a spread
+               ;; nobody had looked at. This times it: the round trip from
+               ;; this object to each peer, and where each object actually
+               ;; runs.
+               ;;
+               ;; `/clock` is the target because it touches storage the way
+               ;; a real message does — timing a route that only returns a
+               ;; constant would measure the runtime and call it the network.
+               (let [peers (remove #(= (.-witness this) %) witnesses)
+                     n 12]
+                 (-> (js/Promise.all
+                      (clj->js
+                       (for [w peers]
+                         (let [stub (.get ^js (.-VALIDATOR env)
+                                          (.idFromName ^js (.-VALIDATOR env) (do-name w)))]
+                           (-> (.reduce
+                                (clj->js (vec (range n)))
+                                (fn [acc _]
+                                  (-> acc
+                                      (.then (fn [^js xs]
+                                               (let [t0 (js/Date.now)]
+                                                 (-> (.fetch stub (str "https://v/clock?w=" w))
+                                                     (.then #(.json %))
+                                                     (.then (fn [_]
+                                                              (.concat xs (clj->js [(- (js/Date.now) t0)]))))))))))
+                                (js/Promise.resolve #js []))
+                               (.then (fn [^js xs]
+                                        (let [v (sort (array-seq xs))]
+                                          {:peer w
+                                           :min (first v)
+                                           :p50 (nth v (quot (count v) 2))
+                                           :max (last v)})))
+                               (.catch (fn [e] {:peer w :error (str (or (.-message e) e))})))))))
+                     (.then (fn [rs]
+                              (json {:witness (.-witness this)
+                                     ;; Where this object runs, from its own
+                                     ;; outbound request — not from the edge
+                                     ;; that served the caller, which is
+                                     ;; wherever the caller happens to be.
+                                     :colo (.-colo this)
+                                     :samples n
+                                     :round-trip-ms (vec (array-seq rs))}
+                                    200)))))
 
                "/clock"
                ;; The clock itself, not its effects. Three stalls were called
