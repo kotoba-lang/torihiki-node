@@ -1910,7 +1910,13 @@
         (js/Promise.resolve nil)
         (do
           (set! (.-nextAdoptCheck this) (+ now adopt-check-ms))
-          (-> (.adoptIfOutvoted this)
+          ;; `js/Promise.resolve` around it, because `adoptIfOutvoted` does not
+          ;; always return a promise: the early refusals (`a-peer-did-not-answer`,
+          ;; `peers-share-no-checkpoint-height`) return a map directly, and
+          ;; `.then` on a map is not a function. It threw on exactly the paths
+          ;; that were supposed to be the quiet ones, and the throw was caught
+          ;; and recorded — which is how it was visible at all.
+          (-> (js/Promise.resolve (.adoptIfOutvoted this))
               ;; EVERY answer is recorded, not only the ones that adopt.
               ;;
               ;; The first version stored successes and dropped the rest, so a
@@ -1955,24 +1961,39 @@
              (let [rs (remove nil? (array-seq rs))]
                (if (not= (count rs) (count peers))
                  (js/Promise.resolve {:ok false :reason "a-peer-did-not-answer"})
-                 ;; Only heights this replica also holds: the comparison needs
-                 ;; OUR root at the same height, and without one there is
-                 ;; nothing to be outvoted about.
-                 (-> (.list ^js (.-storage do-state)
-                            #js {:prefix "snap:" :reverse true :limit checkpoints-kept})
-                     (.then
-                      (fn [^js mine]
-                        (let [mk (js/Array.from (.keys mine))
-                              mv (js/Array.from (.values mine))
-                              my-h (mapv #(js/parseInt (subs % (count "snap:")) 10)
-                                         (array-seq mk))
-                              common (apply set/intersection (set my-h)
-                                            (map (comp set :heights) rs))
-                              h (when (seq common) (apply max common))]
-                          (if (nil? h)
-                            (js/Promise.resolve {:ok false :reason "no-shared-checkpoint-height"})
-                            (let [i (first (keep-indexed #(when (= h %2) %1) my-h))
-                                  my-root (root-of (aget mv i))]
+                 ;; The height the PEERS share, not the one everybody shares.
+                 ;;
+                 ;; This required a checkpoint height every replica held,
+                 ;; including this one — and that is exactly backwards: a
+                 ;; replica far enough behind to need repairing is the one
+                 ;; whose window has stopped overlapping. Observed live: w2 sat
+                 ;; at checkpoint 1307600 while the other three kept 1308100
+                 ;; and up, so the intersection was empty and the check refused
+                 ;; with `no-shared-checkpoint-height` — the one replica that
+                 ;; needed the state was the reason nobody could be given it.
+                 ;;
+                 ;; With four replicas the three peers ARE the quorum, so what
+                 ;; they agree on needs no vote from the replica adopting it.
+                 (let [common (apply set/intersection (map (comp set :heights) rs))
+                       h (when (seq common) (apply max common))]
+                   (if (nil? h)
+                     (js/Promise.resolve {:ok false :reason "peers-share-no-checkpoint-height"})
+                     (-> (.list ^js (.-storage do-state)
+                                #js {:prefix "snap:" :reverse true :limit checkpoints-kept})
+                         (.then
+                          (fn [^js mine]
+                            (let [mk (js/Array.from (.keys mine))
+                                  mv (js/Array.from (.values mine))
+                                  my-h (mapv #(js/parseInt (subs % (count "snap:")) 10)
+                                             (array-seq mk))
+                                  i (first (keep-indexed #(when (= h %2) %1) my-h))
+                                  ;; No checkpoint at their height means one of
+                                  ;; two things and both want the same answer:
+                                  ;; this replica is behind, or it evicted that
+                                  ;; height while they kept it. `nil` compares
+                                  ;; unequal to any root, so the adopt is taken.
+                                  my-root (when i (root-of (aget mv i)))
+                                  behind? (or (empty? my-h) (< (apply max my-h) h))]
                               (-> (js/Promise.all (clj->js (for [w peers] (ask w (str "&h=" h)))))
                                   (.then
                                    (fn [rs2]
@@ -1989,7 +2010,7 @@
                                           :height h :quorum q
                                           :offered (mapv #(select-keys % [:witness :root]) scored)}
 
-                                         (= root my-root)
+                                         (and my-root (= root my-root))
                                          {:ok false :reason "already-agrees" :height h :root root}
 
                                          :else
@@ -2004,7 +2025,8 @@
                                            (set! (.-notifiedAt this) nil)
                                            (set! (.-adopted this)
                                                  #js {"height" h "from" (clj->js (mapv :witness g))
-                                                      "was" my-root "now" root})
+                                                      "was" (or my-root "none") "now" root
+                                                      "behind" behind?})
                                            (-> (.put ^js (.-storage do-state) (ckpt-key h) edn)
                                                (.then (fn [_]
                                                         (set! (.-lastCkpt this) h)
@@ -2013,7 +2035,14 @@
                                                         (set! (.-persisted this) (count (:chain resumed)))
                                                         {:ok true :height h
                                                          :adopted-from (mapv :witness g)
-                                                         :root-was my-root :root-now root}))))))))))))))))))))))
+                                                         :root-was (or my-root "none") :root-now root
+                                                         :behind behind?}))))))))))))))))))))))
+  ;; No `.catch` here. The paren juggling that closed this form put one on a
+  ;; value that is not a promise, and it threw `.catch is not a function` on
+  ;; every quiet path — the refusals, which are the common case. Both callers
+  ;; catch: `maybeAdopt!` records the throw and `adoptFromPeers` turns it into
+  ;; a 500. A third catch was never the thing keeping this safe. 
+
 
   (persist! [this]
     ;; Everything adopted since the last write. Cheap because the chain only
