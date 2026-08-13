@@ -316,6 +316,9 @@
             [ipld.link :as ilink]
             [torihiki-chart.candle :as cndl]
             [torihiki.auth :as tauth]
+            [torihiki.evm :as evm]
+            [torihiki.evm.interp :as evmi]
+            [torihiki.keccak :as kc]
             [torihiki.api :as api]
             [torihiki.book :as bk]
             [torihiki.clearing :as cl]
@@ -401,7 +404,7 @@
   idle enough to be evicted. **Deployed and running are different facts** —
   ADR-2608020330 says so, and this constant is what makes the difference
   visible instead of assumed."
-  "129")
+  "135")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -3069,6 +3072,55 @@
                                 (.acceptWebSocket ^js do-state (aget pair "1") #js ["peer"])
                                 (js/Response. nil #js {:status 101
                                                        :webSocket (aget pair "0")})))
+
+                            ;; The EVM read surface, on the deployed chain.
+                            ;;
+                            ;; The same three answers the standalone gives, and
+                            ;; deliberately the same code underneath: a contract
+                            ;; that reads a position here and there must get the
+                            ;; same number, and two implementations of `eth_call`
+                            ;; would be two chances to disagree about what the
+                            ;; exchange holds.
+                            "/rpc"
+                            (-> (.json request)
+                                (.then
+                                 (fn [body]
+                                   (let [j (js->clj body :keywordize-keys true)
+                                         ex (:machine-state (.-replica this))
+                                         id (:id j)
+                                         to (some-> (:to (first (:params j)))
+                                                    clojure.string/lower-case)]
+                                     (json
+                                      (case (:method j)
+                                        "eth_chainId" {:jsonrpc "2.0" :id id :result "0x539"}
+                                        "net_version" {:jsonrpc "2.0" :id id :result "1337"}
+                                        "eth_blockNumber"
+                                        {:jsonrpc "2.0" :id id
+                                         :result (str "0x" (.toString (r/height (.-replica this)) 16))}
+                                        "eth_getCode"
+                                        {:jsonrpc "2.0" :id id
+                                         :result (str "0x" (get-in ex [:evm to :code] ""))}
+                                        "eth_call"
+                                        (let [data (:data (first (:params j)))
+                                              out (or (evm/call ex to data)
+                                                      (when-let [code (get-in ex [:evm to :code])]
+                                                        (let [world (into {} (for [[a c] (:evm ex)]
+                                                                               [a {:code (kc/hex->bytes (:code c))}]))
+                                                              rr (evmi/run ex world
+                                                                           {:address to
+                                                                            :caller "0x0000000000000000000000000000000000000000"
+                                                                            :depth 0}
+                                                                           (kc/hex->bytes code) data)]
+                                                          (when (= :return (:status rr))
+                                                            (str "0x" (:data rr))))))]
+                                          (if out
+                                            {:jsonrpc "2.0" :id id :result out}
+                                            {:jsonrpc "2.0" :id id
+                                             :error {:code 3 :message "execution reverted"}}))
+                                        {:jsonrpc "2.0" :id id
+                                         :error {:code -32601
+                                                 :message (str "method not found: " (:method j))}})
+                                      200)))))
 
                             "/adopt"
                             (.adoptFromPeers this)
