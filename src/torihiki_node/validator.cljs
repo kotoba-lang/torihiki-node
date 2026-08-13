@@ -2304,6 +2304,34 @@
                                        nil))))))))
           (.then (fn [_] nil)))))
 
+  ;; NOTICE that the deployment has moved on. Nothing else.
+  ;;
+  ;; The Worker isolate is replaced by a deploy; a Durable Object is not — it
+  ;; runs the code it booted with until evicted, and one firing an alarm every
+  ;; few tens of milliseconds is never idle enough to be evicted. Measured
+  ;; 2026-08-13: after deploying a new version the four replicas went on
+  ;; reporting the old `code-version` indefinitely, and a `renamed_classes`
+  ;; migration did not dislodge them either.
+  ;;
+  ;; So the half that DOES update tells the half that does not, and `/head`
+  ;; reports it. **That is all it does**, deliberately.
+  ;;
+  ;; Standing down was written and taken back out. Stopping the alarm does not
+  ;; make these objects idle — peers address them constantly with votes — so
+  ;; it would not have caused the eviction it was for, and four replicas
+  ;; standing down together would have stopped the chain to fix a problem that
+  ;; is only about which build is running. A remedy that has to be staggered
+  ;; across a quorum is not something to leave behind untested in a system
+  ;; where deploys do not take effect.
+  ;;
+  ;; What this buys is that the next session sees the staleness in `/head`
+  ;; instead of inferring it, which is how this was found in the first place.
+  (staleCode? [this ^js request]
+    (let [deployed (.get (.-headers request) "x-deployed-code-version")]
+      (when (and deployed (not= deployed code-version))
+        (set! (.-standingDown this) deployed)
+        true)))
+
   (note! [this e]
     (set! (.-last-error this) (str (or (.-message e) e)))
     nil)
@@ -2603,7 +2631,11 @@
   (handle [this ^js request]
     (let [url (js/URL. (.-url request))
           path (.-pathname url)
-          w (or (.get (.-searchParams url) "w") "w1")]
+          w (or (.get (.-searchParams url) "w") "w1")
+          ;; Asked on every request rather than once: the deploy that makes
+          ;; this object stale can happen at any moment, and the only signal
+          ;; that it did is a request carrying a different version.
+          _ (.staleCode? this request)]
       (if (and (#{"/wipe" "/reset" "/adopt"} path) (not (.adminOk this request)))
         (js/Promise.resolve
          (json {:ok false :reason "forbidden"
@@ -2645,7 +2677,11 @@
                  (json {:ok false :catching-up true
                         :witness (.-witness this)
                         :at (r/height (.-replica this))
-                        :code-version code-version}
+                        :code-version code-version
+                        ;; Set when a request arrived carrying a different
+                        ;; deployed version. A reader seeing this knows the
+                        ;; object is waiting to be reclaimed, not healthy.
+                        :standing-down-for (.-standingDown this)}
                        503))))
             (.then
              (fn [early]
@@ -3273,4 +3309,24 @@
                ^js ns* (.-VALIDATOR env)]
            (if-not (some #{w} witnesses)
              (json {:ok false :reason "unknown-witness"} 404)
-             (.fetch (.get ns* (.idFromName ns* (do-name w))) request)))))})
+             ;; The deployed `code-version`, carried in on every request.
+             ;;
+             ;; The Worker isolate IS replaced by a deploy; a Durable Object is
+             ;; not — it runs the code it booted with until it is evicted, and
+             ;; one that fires an alarm every few tens of milliseconds is never
+             ;; idle enough to be evicted. Measured 2026-08-13: after deploying
+             ;; a new version, four replicas went on reporting the old
+             ;; `code-version` indefinitely, and a `renamed_classes` migration
+             ;; did not dislodge them either.
+             ;;
+             ;; So the half that DOES update tells the half that does not. The
+             ;; object compares this against its own constant and stands down
+             ;; when they differ — see `staleCode?`. This cannot rescue the
+             ;; objects running today, because today's code does not read the
+             ;; header; it means the next deploy after they restart is the last
+             ;; one that needs a restart.
+             (.fetch (.get ns* (.idFromName ns* (do-name w)))
+                     (js/Request. request
+                                  #js {:headers (doto (js/Headers. (.-headers request))
+                                                  (.set "x-deployed-code-version"
+                                                        code-version))}))))))})
