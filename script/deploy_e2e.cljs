@@ -5,8 +5,12 @@
             [torihiki.auth :as auth]
             [torihiki.keccak :as kc]))
 
-(def base "http://127.0.0.1:8801")
-(def chain-id "torihiki-standalone-1")
+(def base
+  ;; The DEPLOYED chain, not a local one. A contract that only runs where the
+  ;; test runs is a contract nobody can call.
+  (or (some-> js/process .-env .-TORIHIKI_BASE)
+      "https://torihiki-validator-v2.04-feasts-minded.workers.dev"))
+(def chain-id "torihiki-engi-devnet-1")
 (defn b64 [b] (.toString b "base64"))
 (defn derive-account [pub]
   (let [d (sha256 (js/Buffer.from pub "base64"))]
@@ -27,21 +31,23 @@
 (p/let [tx {:tx :evm-deploy :account acct :code code :salt salt}
         payload (auth/signing-payload chain-id acct 1 tx)
         sig (b64 (nc/sign nil (js/Buffer.from payload "utf8") (.-privateKey kp)))
-        _ (js/fetch (str base "/tx") #js {:method "POST"
+        r0 (js/fetch (str base "/tx?w=w1") #js {:method "POST"
                                           :body (js/JSON.stringify
                                                  (clj->js {:tx tx :account acct :nonce 1
                                                            :pubkey pub :sig sig}))})
-        _ (p/create (fn [r _] (js/setTimeout r 4000)))
+        t0 (.text r0)
+        _ (println "/tx →" t0)
+        _ (p/create (fn [r _] (js/setTimeout r 12000)))
         want (kc/create2-address (addr-of acct) salt code)
         _ (println "account" acct "→ contract" want)
-        r (js/fetch (str base "/rpc")
+        r (js/fetch (str base "/rpc?w=w1")
                     #js {:method "POST"
                          :body (js/JSON.stringify
                                 (clj->js {:jsonrpc "2.0" :id 1 :method "eth_getCode"
                                           :params [want]}))})
         j (.json r)
         _ (println "eth_getCode →" (.-result j))
-        r2 (js/fetch (str base "/rpc")
+        r2 (js/fetch (str base "/rpc?w=w1")
                      #js {:method "POST"
                           :body (js/JSON.stringify
                                  (clj->js {:jsonrpc "2.0" :id 2 :method "eth_call"
