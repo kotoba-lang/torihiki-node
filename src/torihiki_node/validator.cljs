@@ -967,7 +967,21 @@
                                             ;; change to how it is derived a
                                             ;; change to the chain's identity.
                                             (as-> ex'
-                                                  (let [fills (bk/fills (get-in ex' [:books market-id]))]
+                                                  ;; The guard asks EVERY book.
+                                                  ;;
+                                                  ;; It asked market 1's, so a
+                                                  ;; block whose only fills were
+                                                  ;; on market 2 skipped the
+                                                  ;; fold entirely — the inner
+                                                  ;; loop was per market and
+                                                  ;; never got to run. Making
+                                                  ;; the body multi-market and
+                                                  ;; leaving the guard single
+                                                  ;; is the same bug one level
+                                                  ;; out, and it reads as
+                                                  ;; correct.
+                                                  (let [fills (mapcat #(bk/fills (get-in ex' [:books %]))
+                                                                      (keys (:books ex')))]
                                                     (if (empty? fills)
                                                       ex'
                                                       (update ex' :candles
