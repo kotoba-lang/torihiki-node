@@ -744,6 +744,18 @@
 
 ;; ── the replica ─────────────────────────────────────────────────────────────
 
+(defn- occupied-levels
+  "Every occupied price level on `side`, best first.
+
+  `bk/next-occupied` goes strictly BEYOND the level it is given, descending for
+  bids and ascending for asks, and answers -1 at the end — so the walk starts
+  at `bk/best` and stops on -1. Written out rather than expressed as `iterate`
+  because the two sides run in opposite directions and a single arithmetic
+  step that looked right for asks silently returned nothing for bids."
+  [book side]
+  (loop [l (bk/best book side) acc []]
+    (if (neg? l) acc (recur (bk/next-occupied book side l) (conj acc l)))))
+
 (defn- json [x status]
   (js/Response. (js/JSON.stringify (clj->js x))
                 #js {:status status
@@ -2377,6 +2389,38 @@
                         :asks (:asks (api/book-snapshot ex market-id 12))
                         :resting (bk/resting-count (get-in ex [:books market-id]))})
                      200)
+
+               ;; An account's resting orders, WITH their ids.
+               ;;
+               ;; Nothing exposed an order id. `/book` aggregates by level and
+               ;; `/account` carries collateral, positions and triggers, so a
+               ;; client could place an order and then had no way to learn what
+               ;; to name in order to cancel it — `:cancel` existed as a
+               ;; transaction and was unreachable through the API.
+               ;;
+               ;; That was found by trying to prove the cancel authorization
+               ;; fix against the live chain: the attempt could not get an id
+               ;; to attack with, which is a strange kind of security and not
+               ;; one to rely on.
+               ;;
+               ;; Walks the occupied levels rather than the whole ladder, so it
+               ;; costs what the book HOLDS — the same property `state-root`
+               ;; and the snapshot already have, and for the same reason.
+               "/orders"
+               (let [ex (:machine-state (.-replica this))
+                     book (get-in ex [:books market-id])
+                     want (some-> (.get (.-searchParams url) "account") js/parseInt)]
+                 (json
+                  {:market market-id
+                   :account want
+                   :orders
+                   (vec (for [side [bk/bid bk/ask]
+                              lvl (occupied-levels book side)
+                              o (bk/level-orders book side lvl)
+                              :when (or (nil? want) (= want (:owner o)))]
+                          {:oid (:oid o) :side side :level lvl
+                           :qty (:qty o) :owner (:owner o)}))}
+                  200))
 
                             (json {:ok false :reason "not-found"} 404))))))))))))
 

@@ -29,6 +29,19 @@
         io.github.kotoba-lang/torihiki-chart
         {:git/url "https://github.com/kotoba-lang/torihiki-chart.git"
          :git/sha "80ab3d78ee3896c40d050c025c229be23450e584"}
+        ;; NOT main, deliberately. main has moved the state encoding three
+        ;; times since this pin (a governance leaf, `:deficit`, and pending
+        ;; withdrawals), and every one of them changes the state root — so
+        ;; advancing to main forks this chain and there is no rolling upgrade
+        ;; that survives it. See ADR-2608040600.
+        ;;
+        ;; This is `hotfix/cancel-authorization`: `fa3a8e0c` plus the one fix
+        ;; that could not wait for that decision. `bk/cancel!` took an order id
+        ;; and nothing else, so any authenticated account could cancel any
+        ;; other account's resting orders. The backport touches no encoding —
+        ;; its parity flat root is still `22f75a7f…`, the same number this
+        ;; deployment has been producing — so pinning it cannot split the
+        ;; chain.
         io.github.kotoba-lang/torihiki
         {:git/url "https://github.com/kotoba-lang/torihiki.git"
-         :git/sha "fa3a8e0cc213c8d2a11f7e521b3e38007749d83c"}}}
+         :git/sha "89b7f1742e056e1c0753682185214294ea33efef"}}}
