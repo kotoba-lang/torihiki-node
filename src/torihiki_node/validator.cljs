@@ -3177,8 +3177,18 @@
                         :insurance-fund (get-in ex [:clearing :insurance-fund] 0)
                         :bad-debt (reduce + 0 (keep :deficit (vals (:accounts (:clearing ex)))))
                         :bridge-authority (:bridge-authority ex)
+                        ;; The asset side, as attested — and what it does not
+                        ;; cover. nil means nobody has attested, which is not
+                        ;; the same as a shortfall of zero: silence is not a
+                        ;; claim.
+                        :attested (:amount (:reserve-attestation ex))
+                        :attested-at (:at (:reserve-attestation ex))
+                        :shortfall (cm/shortfall leaves
+                                                 (:amount (:reserve-attestation ex)))
                         :backing (if (:bridge-authority ex)
-                                   "an escrow attests separately that it holds at least :total"
+                                   (if (:reserve-attestation ex)
+                                     "the bridge has attested what the escrow holds — compare :attested against :total, and :shortfall is the difference"
+                                     "no attestation: the chain knows what it owes and has been told nothing about what backs it")
                                    "unbacked — this chain mints its own collateral, so :total is exact and backed by nothing")}
                        200))
 
