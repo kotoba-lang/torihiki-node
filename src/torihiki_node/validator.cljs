@@ -401,7 +401,7 @@
   idle enough to be evicted. **Deployed and running are different facts** —
   ADR-2608020330 says so, and this constant is what makes the difference
   visible instead of assumed."
-  "109")
+  "117")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -2583,7 +2583,14 @@
             tip (r/tip st)
             th (:inga.block/height tip)
             next-h (inc th)
-            certified? (some? (get (:qcs st) (block-hash (c/canonical-block tip))))
+            ;; The replica keys `:qcs` and `:votes` by CID -- `:hash-fn` is
+            ;; `block-cid`. This asked with `block-hash`, the identity that
+            ;; stopped deciding what a block is, so it found nothing and said
+            ;; so: `tip-certified false` and `votes-for-tip 0` on all four
+            ;; replicas of a chain that was committing normally. Two
+            ;; investigations took that reading as the symptom and went
+            ;; looking for a missing vote that was recorded all along.
+            certified? (some? (get (:qcs st) (block-cid tip)))
             leader (nth witnesses (mod next-h (count witnesses)))
             mine? (= leader (.-witness this))]
         (set! (.-why this)
@@ -2598,8 +2605,7 @@
                                       :else "nothing")
                    "view" (:view (:pm st))
                    "deadline-in-ms" (- (:deadline (:pm st) 0) now)
-                   "votes-for-tip" (count (get (:votes st)
-                                               (block-hash (c/canonical-block tip)) {}))}))
+                   "votes-for-tip" (count (get (:votes st) (block-cid tip) {}))}))
 
       ;; Re-broadcast the tip while it has no certificate.
       ;;
@@ -2827,6 +2833,28 @@
                         :why-not-proposing (js->clj (or (.-why this) #js {}))
                         :last-proposal (:last-proposal (.-replica this))
                         :last-sync-outcome (:last-sync (.-replica this))
+                        ;; `propose`'s OWN answer, not one built out here.
+                        ;; `why-not-proposing` decides whose turn it is by
+                        ;; height; `propose` decides by round. Once the view
+                        ;; runs ahead they name different replicas, and the
+                        ;; outside answer is the wrong one.
+                        :propose-refusal (:propose-refusal (.-replica this))
+                        ;; Why the tip has no vote on it.
+                        ;;
+                        ;; `votes-for-tip 0` on every replica at once says the
+                        ;; vote is missing; it does not say whether it was
+                        ;; never cast, cast and dropped, or refused by the
+                        ;; watermark a resume leaves. Each has a different fix
+                        ;; and reading the code decided between them twice,
+                        ;; wrongly. These are the three states themselves.
+                        :vote-debug {:voted-below (:voted-below (.-replica this) -1)
+                                     :voted-at-tip? (contains? (:voted (.-replica this))
+                                                               (:inga.block/height
+                                                                (r/tip (.-replica this))))
+                                     :last-tip-vote (:last-tip-vote (.-replica this))
+                                     :vote-keys (count (:votes (.-replica this)))
+                                     :dropped-votes (:dropped-votes (.-replica this))
+                                     :last-dropped-vote (:last-dropped-vote (.-replica this))}
                         :tip-certificate (r/tip-certificate (.-replica this))
                         :dropped-votes (:dropped-votes (.-replica this))
                         :last-dropped-vote (:last-dropped-vote (.-replica this))

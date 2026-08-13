@@ -18,7 +18,7 @@
         ;; wire and NOT `inga.state`, so arrangement does not reach the bundle.
         io.github.kotoba-lang/inga
         {:git/url "https://github.com/kotoba-lang/inga.git"
-         :git/sha "c014edc043e3427ef24389a6c401b5714817507e"}
+         :git/sha "528a2b21c7506132b250c4568ed2d940af77358b"}
         ;; The candle fold. The terminal draws from the same library, so
         ;; `/candles` and the chart cannot disagree about what a candle is.
         ;; The IPLD layer: canonical DAG-CBOR and CIDv1. Block identity is a
