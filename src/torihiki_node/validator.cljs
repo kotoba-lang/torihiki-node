@@ -401,7 +401,7 @@
   idle enough to be evicted. **Deployed and running are different facts** —
   ADR-2608020330 says so, and this constant is what makes the difference
   visible instead of assumed."
-  "125")
+  "128")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -630,6 +630,34 @@
   Still 2.5x the rate this started at, and the remaining distance to
   Hyperliquid's ~0.07 s is not here — it is the transport, which is HTTP
   between isolates and answers to co-location rather than to a constant."
+  ;; **Back to 25**, and now the number is measured rather than inherited.
+  ;;
+  ;; The table above was taken when every message between replicas was its own
+  ;; HTTP POST, and it put a cliff between 10 and 5 — at 5 the chain did not
+  ;; slow, it STOPPED. 25 was chosen to keep two steps from a cliff whose only
+  ;; symptom is silence. Messages now travel over standing sockets and are
+  ;; flushed as the batch is folded rather than on the next tick, so the
+  ;; condition the cliff was made of — a round that no longer fits between
+  ;; ticks — is not the same condition. A number kept for a reason that has
+  ;; been removed is a number nobody measured. So it was re-measured.
+  ;;
+  ;; At 10, over sockets, live on all four replicas:
+  ;;
+  ;;   tick gap   min 14-50   p50 42-57   max 55-1015
+  ;;   block      min 18-37   p50 154-279
+  ;;
+  ;; **The alarm does not fire at 10 ms.** Asked for 10 it delivered a median
+  ;; gap of 42-57 — worse than the 33-43 it delivered when asked for 25 — and
+  ;; the block median went with it. A Durable Object alarm has a cadence floor
+  ;; somewhere around 35-55 ms and asking for less buys more scheduling, not
+  ;; more speed.
+  ;;
+  ;; That is the honest end of what a constant can do here. The block MINIMUM
+  ;; is 18-37 ms, which is the event-driven path — socket in, vote out,
+  ;; certificate, proposal — running without waiting for any alarm at all, and
+  ;; it is already faster than the target. What is left is that this path does
+  ;; not fire on every block, and the fallback is a clock that cannot go
+  ;; faster than about 40 ms a step.
   25)
 
 (def ^:const deliver-cap-ms
