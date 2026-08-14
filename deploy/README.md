@@ -1,5 +1,33 @@
 # Placing the validators
 
+## Not Cloudflare Containers — measured
+
+The obvious way to keep this on Cloudflare without Durable Objects is a
+Container: an ordinary process, ordinary disk, ordinary sockets, which is the
+shape a validator wants. It was deployed and timed, two instances of one
+image, thirty round trips:
+
+    container A → a plain Worker  (egress only)    min 146  p50 160 ms
+    container A → itself via the Worker            min 308  p50 315 ms
+    container A → container B                      min 436  p50 450 ms
+
+    for comparison, Durable Object → Durable Object      min 2  p50 3 ms
+
+**A container's own network is the problem, not the Durable Object in front of
+it.** Leaving the container costs about 150 ms before anything else happens,
+and arriving at one costs about the same. A four-validator set would spend
+nearly half a second on every message it exchanges.
+
+So the choice is not "Workers or Containers on Cloudflare". It is:
+
+  - **Durable Objects** — peers 2-4 ms apart, but the object serialises what
+    arrives and its alarm has a floor around 40 ms. Measured end to end on a
+    clean chain: **74-104 ms per block**.
+  - **Ordinary hosts** — what everything below describes. Measured with four
+    processes on one machine: **3-13 ms per block**.
+
+Containers are neither.
+
 Four hosts, or one host with four processes. The difference is not the
 configuration — it is what an outage takes down with it.
 
