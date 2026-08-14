@@ -427,7 +427,7 @@
   ;; What gave it away: `/reset` answered with `deleted` and `drained`, fields
   ;; that only the new build has. The behaviour said what the version number
   ;; would not.
-  "162")
+  "165")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -803,7 +803,27 @@
   ;; ~90 ms is therefore close to the floor here while the objects are doing
   ;; the work. Hyperliquid is ~70 ms; four ordinary processes on one host
   ;; measured 3-13 ms.
-  25)
+  ;; ## 50, because the object itself said it was overloaded
+  ;;
+  ;; Captured from the deployed chain, as a fatal Durable Object exception:
+  ;;
+  ;;   Durable Object is overloaded. Requests queued for too long.
+  ;;
+  ;; Not a logic error and not the storage timeout — the object is single
+  ;; threaded, and requests were arriving faster than it could serve them.
+  ;;
+  ;; The table above already describes this failure from the other side: at
+  ;; tick 5 the chain STOPPED rather than slowed, with no replica reporting
+  ;; anything. That measurement was taken before the ten consensus fixes in
+  ;; this session, and those fixes RAISED the block rate — the chain ran at
+  ;; roughly 8 blocks a second where the table records 5.4 at this tick. The
+  ;; margin 25 was chosen to preserve was spent by making the consensus
+  ;; faster, and nothing re-measured it.
+  ;;
+  ;; So it goes back up. The cost is throughput and the purchase is a replica
+  ;; that stays answerable — and with a quorum of three out of four, one
+  ;; unanswerable replica is the whole margin.
+  50)
 
 (def ^:const deliver-cap-ms
   "How long a tick will wait for its own messages to be delivered. **40.**
