@@ -727,6 +727,26 @@
   namespace docstring gives — the part that needs a network to run is the part
   that cannot be tested, so it holds as little as possible.
 
+  ## Off, and it must stay off until `THOR_OBSERVE` is real
+  
+  This polled `/thorchain/queue/outbound` — the queue of payments THORChain is
+  about to SEND. **Deposits do not appear there.** A vault funded while this
+  ran would have been observed by nobody, attested by nobody and credited to
+  nobody, and the money would have sat in the vault with the venue reporting
+  nothing wrong. That is the worst failure this whole path exists to prevent,
+  written into the thing preventing it.
+  
+  There is no thornode endpoint that lists recent inbounds to an address;
+  observing them means an indexer (Midgard `/v2/actions?address=…`) or
+  following specific transaction hashes. Which one, and the shape it answers
+  in, has NOT been checked against the live network — this sandbox cannot
+  reach thornode.
+  
+  So the source is `THOR_OBSERVE` and it has no default. Unset, the watcher
+  fetches `/UNSET`, fails, and attests nothing — loudly useless rather than
+  quietly wrong. **Do not fund a vault until this has been pointed at a real
+  endpoint and a test deposit has been seen to arrive.**
+
   Off unless `THOR_CHAIN` is set. A watcher with no chain to watch would poll
   a public endpoint forever and attest nothing, which is a cost with no
   answer.
@@ -764,7 +784,8 @@
              (.then (fn [j]
                       (let [tip (js/parseInt (or (some-> (aget j 0) (aget "thorchain"))
                                                  (aget j "thorchain") "0") 10)]
-                        (-> (js/fetch (str base "/thorchain/queue/outbound"))
+                        ;; **NOT the outbound queue.** See `THOR_OBSERVE`.
+                        (-> (js/fetch (str base (env "THOR_OBSERVE" "/UNSET")))
                             (.then #(.json %))
                             (.then (fn [obs]
                                      (let [os (js->clj obs)]
