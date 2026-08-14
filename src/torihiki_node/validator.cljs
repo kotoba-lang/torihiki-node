@@ -430,7 +430,7 @@
   ;; What gave it away: `/reset` answered with `deleted` and `drained`, fields
   ;; that only the new build has. The behaviour said what the version number
   ;; would not.
-  "170")
+  "172")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -3733,6 +3733,7 @@
                         :sent-types (js->clj (or (.-outtypes this) #js {}))
                         :last-sync-request (or (.-lastsync this) nil)
                         :why-not-proposing (js->clj (or (.-why this) #js {}))
+                        :lock (r/lock-state (.-replica this))
                         :last-proposal (:last-proposal (.-replica this))
                         :last-sync-outcome (:last-sync (.-replica this))
                         ;; `propose`'s OWN answer, not one built out here.
