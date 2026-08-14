@@ -285,6 +285,36 @@
                                      (vec (take-last 256 (conj v (- (now) t))))
                                      v)))))))))
 
+(defonce ^:private voted-view-path (atom nil))
+(defonce ^:private voted-view-on-disk (atom -1))
+
+(defn- keep-vote!
+  "Write the vote watermark, and answer whether it is safe to send.
+
+  `inga.replica/voted-view` is the safety contract of one-vote-per-view: a
+  replica that votes in view V, dies without recording it, comes back not
+  knowing, and votes again in V for a different block has equivocated — by
+  accident, against itself. So the record has to be on disk BEFORE the vote is
+  on the wire.
+
+  Synchronous, and that is the point: `appendFileSync` returning is the
+  promise being kept. An async write would put the send and the record in a
+  race, which is the whole hazard.
+
+  Only when it moves — at most once a view, not once a message."
+  []
+  (let [v (r/voted-view @state)]
+    (if (<= v @voted-view-on-disk)
+      true
+      (try
+        (fs/writeFileSync @voted-view-path (str v))
+        (reset! voted-view-on-disk v)
+        true
+        (catch :default _
+          ;; The write failed, so the vote must not go. A vote nobody
+          ;; recorded is a vote that can be cast twice.
+          false)))))
+
 (defn- feed! [msg]
   (swap! stats update :msgs-in inc)
   (let [[s' out] (r/on-message @state msg (now))]
@@ -293,7 +323,9 @@
     ;; Sent HERE, as the message is folded, not on the next tick. On the
     ;; Worker this was the difference between a block every 250 ms and a block
     ;; every 150: a reply that waits for a clock adds a clock to every hop.
-    (ship! out)))
+    ;;
+    ;; But only after the watermark is down.
+    (when (keep-vote!) (ship! out))))
 
 (defn- quantiles [v]
   (when (seq v)
@@ -633,6 +665,15 @@
   chain this replica never agreed to out of the pieces of one it did."
   []
   (fs/mkdirSync data-dir #js {:recursive true})
+  (reset! voted-view-path (str data-dir "/voted-view"))
+  ;; The watermark first. The log says what this replica ADOPTED; it does not
+  ;; say what it voted for, so `replay` alone comes back believing it has never
+  ;; voted — which is exactly the window the contract closes.
+  (when (fs/existsSync @voted-view-path)
+    (let [v (js/parseInt (fs/readFileSync @voted-view-path "utf8") 10)]
+      (when (integer? v)
+        (reset! voted-view-on-disk v)
+        (swap! state r/with-voted-view v))))
   ;; The checkpoint first, then only the log ABOVE it.
   ;;
   ;; Replaying from zero is correct and gets slower every block; the point of
