@@ -404,7 +404,22 @@
   idle enough to be evicted. **Deployed and running are different facts** —
   ADR-2608020330 says so, and this constant is what makes the difference
   visible instead of assumed."
-  "136")
+  ;; **143.** Bumped by hand, and the hand missed it six times in a row.
+  ;;
+  ;; Six deploys in one session each meant to bump this and did not — the edits
+  ;; were `perl -0pi -e 's/  "141"\)/  "142")/'` against text that did not
+  ;; match, and every one of them failed silently. The number stayed at 136
+  ;; while the code changed underneath it, and `/head` went on reporting 136,
+  ;; which was read as "the Durable Objects are running the old code" and used
+  ;; to conclude that a fix was not live. It was live. The instrument had
+  ;; stopped moving, and a constant that does not move looks exactly like an
+  ;; object that has not restarted — which is the one thing this constant
+  ;; exists to tell apart.
+  ;;
+  ;; What gave it away: `/reset` answered with `deleted` and `drained`, fields
+  ;; that only the new build has. The behaviour said what the version number
+  ;; would not.
+  "143")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -484,7 +499,23 @@
   impersonate) and is the weak point the moment keys are real: whoever answers
   first is believed. A validator set is exactly the thing a chain must know
   before it starts, so it is genesis data, in the source, reviewed with it."
-  (if (= "v2" genesis-set)
+  (if (= "v3" genesis-set)
+    ;; A THIRD set, for the same reason the second exists.
+    ;;
+    ;; A Durable Object runs the code it booted with until it is evicted, and
+    ;; these tick every few tens of milliseconds so they never idle. `/reset`
+    ;; rebuilds the replica INSIDE the running isolate; it does not reload the
+    ;; script. Measured again on 2026-08-14: cv142 deployed, `/reset` on all
+    ;; four, and every one of them came back reporting cv136.
+    ;;
+    ;; So the one-vote-per-view rule and the durable vote watermark — the fix
+    ;; for the deadlock that stopped v1 and v2 — cannot be answered for on v2.
+    ;; This set can run them. v2 is left alone.
+    {"w1" "xb9Rtxn0MZxXqDA9bl3vLAbzNw4ri/aNhlC2X2IrEVI="
+     "w2" "TMxZ9HTn4xVC9LcLCTNgMb5Kjmp3Vy1AeFa9f1Frw10="
+     "w3" "zmrI9gQ8lGllAV2l7Lf3mNNfi4ENGNnmpAsgCNCXcOo="
+     "w4" "JoiW2c7WZz4cnwaVM28u9tobMC9e9b/9nszgA/kixz4="}
+    (if (= "v2" genesis-set)
     ;; A second, independently keyed validator set.
     ;;
     ;; It exists because the first deployment cannot be given new code: those
@@ -505,15 +536,17 @@
     {"w1" "futt80Tbbqc50hej5X7xqWjG0oFLy3yrBAHDrOA0td0="
      "w2" "K8ZA5PssVguLJcRZjzHzZ+vCQQJoLl5VRJ76gbxTqCk="
      "w3" "iRNrRiAbOb8+HoTkDF63Xp6B1zFB1QApNiSPzb5P/gQ="
-     "w4" "GD3mDeP0zFMnyzCQpz+09+LWcoQcrdL4EvcV9jpZFqM="}))
+     "w4" "GD3mDeP0zFMnyzCQpz+09+LWcoQcrdL4EvcV9jpZFqM="})))
 
 (def bridge-pubkey
   "The faucet's public key — the account that may mint collateral.
 
   Per genesis set, like the validator keys and for the same reason."
-  (if (= "v2" genesis-set)
-    "o9Fpro5qdCeeY2LZnxQS16/Yir4LDghHTjHL6PSPOek="
-    "jmBeKHD9Pb6GYmlFUfnFwfoci+pSE5rZ+ALlAfnP00o="))
+  (if (= "v3" genesis-set)
+    "n2o/YwaUdBVcCRXZtLYyTJ6YtGq0527igb2GQptSIbI="
+    (if (= "v2" genesis-set)
+      "o9Fpro5qdCeeY2LZnxQS16/Yir4LDghHTjHL6PSPOek="
+      "jmBeKHD9Pb6GYmlFUfnFwfoci+pSE5rZ+ALlAfnP00o=")))
 
 (defn key-distribution
   "What `/head` says about where the validator set's public keys came from —

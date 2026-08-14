@@ -1,0 +1,22 @@
+{
+  // A SECOND validator deployment, with its own genesis validator set.
+  //
+  // It exists because the first one cannot be given new code: those Durable
+  // Objects run what they booted with, never go idle enough to be evicted,
+  // and survived both a deploy and a `renamed_classes` migration (measured
+  // 2026-08-13). Everything written after that point — spot markets, the
+  // reserve attestation, the two-chain commit, chosen leverage, sub-accounts
+  // — is verified by tests alone, and a test is not a deployment.
+  //
+  // This chain is where that code is answered for. The first deployment is
+  // untouched: different worker, different Durable Object namespace,
+  // different keys.
+  "name": "torihiki-validator-v3",
+  "main": "dist-validator-v3/worker.js",
+  "compatibility_date": "2026-08-01",
+  "durable_objects": {
+    "bindings": [{ "name": "VALIDATOR", "class_name": "ValidatorV2" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ValidatorV2"] }],
+  "observability": { "enabled": true }
+}

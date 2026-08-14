@@ -17,6 +17,15 @@
    :modules {:worker {:exports {default torihiki-node.validator/handler
                                 ValidatorV2 torihiki-node.validator/ValidatorV2}}}
    :compiler-options {:infer-externs :auto}}
+  ;; The third set. Same code, third genesis — see `validator-keys`.
+  :validator-v3
+  {:target :esm
+   :output-dir "dist-validator-v3"
+   :runtime :custom
+   :closure-defines {torihiki-node.validator/genesis-set "v3"}
+   :modules {:worker {:exports {default torihiki-node.validator/handler
+                                ValidatorV2 torihiki-node.validator/ValidatorV2}}}
+   :compiler-options {:infer-externs :auto}}
   :validator
   {:target :esm
    :output-dir "dist-validator"
