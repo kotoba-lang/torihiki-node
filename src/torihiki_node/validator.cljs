@@ -426,7 +426,7 @@
   ;; What gave it away: `/reset` answered with `deleted` and `drained`, fields
   ;; that only the new build has. The behaviour said what the version number
   ;; would not.
-  "144")
+  "145")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -782,10 +782,26 @@
   ;; block waits on — the reading at 100 looked like the tick because 94.8 is
   ;; near 100, and it was a coincidence of two numbers being close.
   ;;
-  ;; So ~90 ms is three or four round trips of something that is NOT the 2-4 ms
-  ;; between objects and NOT the clock. Where it actually goes is still open,
-  ;; and the honest place to leave it is here rather than in a constant that
-  ;; pretends to be the answer.
+  ;; ## Where the ~90 ms goes — found
+  ;;
+  ;; The round trip between objects is not 2-4 ms. That number was measured on
+  ;; a chain that had STOPPED, and an idle Durable Object answers immediately.
+  ;; The same probe against objects that are actually running consensus:
+  ;;
+  ;;   /clock  (touches storage, returns)    p50 42-50 ms
+  ;;   /msg    (decode, verify, fold)        p50 24-56 ms
+  ;;
+  ;; A block needs about two of those, and 2 × ~45 ms is the ~90 ms observed.
+  ;; **The numbers close.**
+  ;;
+  ;; So the cost is the object being busy, not the network and not the clock:
+  ;; a Durable Object is single-threaded and every message waits behind
+  ;; whatever it is doing. Quartering the tick could not help because the tick
+  ;; was never what the message was queued behind — the other messages were.
+  ;;
+  ;; ~90 ms is therefore close to the floor here while the objects are doing
+  ;; the work. Hyperliquid is ~70 ms; four ordinary processes on one host
+  ;; measured 3-13 ms.
   25)
 
 (def ^:const deliver-cap-ms
@@ -3659,6 +3675,45 @@
                                    ;; disk is what put four replicas at rounds
                                    ;; 518, 82439 and 82440.
                                    :drained done?} 200))))
+
+               ;; The same probe, against the route consensus actually uses.
+               ;;
+               ;; `/transport` times `/clock`, which touches storage and
+               ;; returns. `/msg` decodes, verifies signatures, folds into the
+               ;; replica and persists. If the two differ, the difference is
+               ;; what a message costs to HANDLE rather than to carry — and
+               ;; with the block at ~90 ms and the carry at 2-4 ms, that is
+               ;; where the rest has to be.
+               "/transport-msg"
+               (let [peers (remove #(= (.-witness this) %) witnesses)
+                     n 10
+                     body (js/JSON.stringify (clj->js {:msgs []}))]
+                 (-> (js/Promise.all
+                      (clj->js
+                       (for [w peers]
+                         (let [stub (.get ^js (.-VALIDATOR env)
+                                          (.idFromName ^js (.-VALIDATOR env) (do-name w)))]
+                           (-> (.reduce
+                                (clj->js (vec (range n)))
+                                (fn [acc _]
+                                  (.then acc (fn [^js xs]
+                                               (let [t0 (js/Date.now)]
+                                                 (-> (.fetch stub (js/Request.
+                                                                   (str "https://v/msg?w=" w)
+                                                                   #js {:method "POST" :body body}))
+                                                     (.then #(.text %))
+                                                     (.then (fn [_]
+                                                              (.concat xs (clj->js [(- (js/Date.now) t0)])))))))))
+                                (js/Promise.resolve #js []))
+                               (.then (fn [^js xs]
+                                        (let [v (sort (array-seq xs))]
+                                          {:peer w :min (first v)
+                                           :p50 (nth v (quot (count v) 2))
+                                           :max (last v)})))
+                               (.catch (fn [e] {:peer w :error (str (or (.-message e) e))})))))))
+                     (.then (fn [rs]
+                              (json {:witness (.-witness this) :samples n
+                                     :empty-msg-ms (vec (array-seq rs))} 200)))))
 
                "/transport"
                ;; What the transport actually costs, measured rather than
