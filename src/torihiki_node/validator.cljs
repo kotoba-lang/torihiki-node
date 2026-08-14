@@ -562,7 +562,7 @@
   pages there are, not how big one is. Both bounds are needed: without the
   page bound one invocation can exceed its budget, and without the checkpoint
   the number of invocations grows with the chain."
-  100)
+  25)
 
 (def ^:const checkpoints-kept
   "How many checkpoints to keep.
@@ -702,7 +702,28 @@
   ;; it is already faster than the target. What is left is that this path does
   ;; not fire on every block, and the fallback is a clock that cannot go
   ;; faster than about 40 ms a step.
-  25)
+  ;; **25**, and the experiment that says why 100 is not better.
+  ;;
+  ;; At 100 the block interval read exactly 100 ms — min, median and the gap,
+  ;; all the same number. That is not a chain running at 100 ms; it is the
+  ;; INSTRUMENT saturating. `block-ms` is sampled inside the tick, so it
+  ;; cannot see anything shorter than one, and at 25 it reported 74-104 ms
+  ;; because a block really did take three or four ticks. Raising the tick
+  ;; raised the floor of what could be observed and nothing else.
+  ;;
+  ;; Kept at 25. The measurement below has to come from outside the object.
+  ;;
+  ;; The table above was taken when a message left only when the tick sent it,
+  ;; so a bigger tick meant a slower chain and the numbers show exactly that.
+  ;; Neither is true now: `foldMsgs` flushes as it folds, and `propose` runs
+  ;; when the certificate forms — counted live, `propose-on-msg 10-12` against
+  ;; `propose-on-tick 0`. **Every proposal is driven by a message.**
+  ;;
+  ;; What the tick does now is time views out and re-cast a vote nobody
+  ;; answered — and STEAL the object while it does it. A Durable Object
+  ;; serialises what arrives, so every tick is a window in which incoming
+  ;; votes wait. Forty windows a second is forty chances to be late.
+  100)
 
 (def ^:const deliver-cap-ms
   "How long a tick will wait for its own messages to be delivered. **40.**
@@ -1717,7 +1738,12 @@
   ;; resets the object. Keys are re-listed from the front each page because
   ;; the ones just deleted are gone — no cursor to keep, and nothing to lose
   ;; if the object is reset between calls.
-  (wipePage [this]
+  ;; The deletion itself, without an answer wrapped around it.
+  ;;
+  ;; `wipePage` returned a `Response`, so `/reset` could not reuse it and used
+  ;; `deleteAll` instead — the unbounded call this file already knew fails on
+  ;; storage large enough to need wiping. Two callers, one loop.
+  (drainStorage [this]
     (let [deadline (+ (js/Date.now) 2000)
           step (fn step [n]
                  (-> (.list ^js (.-storage do-state) #js {:limit 128})
@@ -1731,8 +1757,11 @@
                                                  (if (< (js/Date.now) deadline)
                                                    (step n')
                                                    (js/Promise.resolve [n' false]))))))))))))]
-      (-> (step 0)
-          (.then (fn [[n done?]]
+      (step 0)))
+
+  (wipePage [this]
+    (-> (.drainStorage this)
+        (.then (fn [[n done?]]
                    (set! (.-ready this) false)
                    (set! (.-witness this) nil)
                    (set! (.-persisted this) 0)
@@ -1742,7 +1771,7 @@
                           :note (if done?
                                   "empty — boots at genesis on the next request"
                                   "more remains, call /wipe again")}
-                         200))))))
+                         200)))))
 
   ;; Fold one bounded page of the persisted log. Resolves true when the
   ;; replica has caught up to what storage holds.
@@ -2331,7 +2360,34 @@
                                            [root g] (last (sort-by (comp count val)
                                                                    (group-by :root scored)))]
                                        (cond
-                                         (or (nil? g) (< (count g) q))
+                                         ;; A quorum COUNTING THIS REPLICA.
+                                         ;;
+                                         ;; This asked `q` peers to agree, and
+                                         ;; there are only `q` peers in a set
+                                         ;; of four — so it demanded unanimity
+                                         ;; among them and called it a quorum.
+                                         ;; The one state that most needs
+                                         ;; repairing is the one where the set
+                                         ;; is split, and a split is exactly
+                                         ;; when unanimity is unavailable.
+                                         ;;
+                                         ;; Live, at height 1927: two replicas
+                                         ;; on one tip, one on another, one
+                                         ;; behind. Two peers agreed, this
+                                         ;; check wanted three, and the chain
+                                         ;; sat there.
+                                         ;;
+                                         ;; Adopting makes us the third, so
+                                         ;; `q-1` agreeing peers IS the
+                                         ;; quorum. And it is safe under the
+                                         ;; fault model this set already
+                                         ;; assumes: with a quorum of three
+                                         ;; out of four, at most one replica
+                                         ;; may be faulty, so of two agreeing
+                                         ;; peers at least one is honest —
+                                         ;; which is the whole argument for
+                                         ;; adopting a state at all.
+                                         (or (nil? g) (< (inc (count g)) q))
                                          {:ok false :reason "no-quorum-agreed-on-a-state"
                                           :height h :quorum q
                                           :offered (mapv #(select-keys % [:witness :root]) scored)}
@@ -3466,13 +3522,40 @@
                ;; Wipe this replica back to genesis. It should rejoin by
                ;; asking its peers for what it missed — which is what
                ;; inga.sync is for and what nothing had exercised.
-               (-> (.deleteAll ^js (.-storage do-state))
-                   (.then (fn [_]
+               ;;
+               ;; PAGED, like `/wipe`, and for the reason `/wipe` already
+               ;; states three hundred lines up: `deleteAll` is one storage
+               ;; operation over however many keys there are, and Cloudflare
+               ;; resets an object whose storage operation runs too long. This
+               ;; route used `deleteAll` anyway.
+               ;;
+               ;; What that looked like: four replicas holding a 40,853-block
+               ;; chain were reset, every one answered `{ok true, height 0}`,
+               ;; and the blocks were still there. `boot` replayed them,
+               ;; `catch-up-view` did its job and jumped the pacemaker to the
+               ;; round of a tip from the chain that had just been thrown
+               ;; away — and the fresh chain stalled at height 517 with its
+               ;; replicas at rounds 518, 82439 and 82440. **The reset
+               ;; reported success and deleted nothing.**
+               ;;
+               ;; `remaining` is in the answer, so a caller can tell a wipe
+               ;; that finished from one that ran out of budget, and repeat.
+               (-> (.drainStorage this)
+                   (.then (fn [[n done?]]
                             (set! (.-ready this) false)
                             (set! (.-persisted this) 0)
-                            (.boot this w)))
-                   (.then (fn [_] (json {:ok true :witness w
-                                         :height (r/height (.-replica this))} 200))))
+                            (-> (.boot this w)
+                                (.then (fn [_] [n done?])))))
+                   (.then (fn [[n done?]]
+                            (json {:ok true :witness w
+                                   :height (r/height (.-replica this))
+                                   :deleted n
+                                   ;; false means the budget ran out with keys
+                                   ;; left. Call again — a reset that reports
+                                   ;; success while the old chain is still on
+                                   ;; disk is what put four replicas at rounds
+                                   ;; 518, 82439 and 82440.
+                                   :drained done?} 200))))
 
                "/transport"
                ;; What the transport actually costs, measured rather than
