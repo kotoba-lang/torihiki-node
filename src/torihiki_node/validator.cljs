@@ -426,7 +426,7 @@
   ;; What gave it away: `/reset` answered with `deleted` and `drained`, fields
   ;; that only the new build has. The behaviour said what the version number
   ;; would not.
-  "145")
+  "147")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -3684,6 +3684,64 @@
                ;; what a message costs to HANDLE rather than to carry — and
                ;; with the block at ~90 ms and the carry at 2-4 ms, that is
                ;; where the rest has to be.
+               ;; What THORChain actually answers, asked from somewhere that
+               ;; can reach it.
+               ;;
+               ;; `torihiki.thorchain` was written against a guess at the
+               ;; response shape because the machine it was written on cannot
+               ;; reach thornode. This Worker can. Fixed URLs, no parameter, so
+               ;; it cannot be used as a proxy for anything else; admin-gated
+               ;; for the same reason.
+               ;;
+               ;; It answers with the SHAPE — the keys, and one sample — not
+               ;; with a verdict. A reader has to see what the network says.
+               ;;
+               ;; ## What it said (2026-08-14)
+               ;;
+               ;;   thornode.ninerealms.com    530   (Cloudflare 1016, DNS)
+               ;;   thornode.thorchain.info    530
+               ;;   thornode.thorswap.net      403   ← resolved, refused
+               ;;   midgard.ninerealms.com     530
+               ;;   midgard.thorchain.info     530
+               ;;
+               ;; **A validator running here cannot see THORChain.** Four names
+               ;; do not resolve from a Worker and the one that does refuses.
+               ;; The four are themselves behind Cloudflare, and a Worker
+               ;; fetching another Cloudflare-fronted zone failing this way is
+               ;; a known shape — that is a plausible cause and not a proven
+               ;; one; the 403 is a different refusal and probably wants an
+               ;; API key.
+               ;;
+               ;; Either way the escrow watcher cannot do its job from this
+               ;; substrate as it stands. It needs an endpoint that answers a
+               ;; Worker — a paid node, an allowlisted key, or a proxy we run —
+               ;; or the validators need ordinary internet egress, which is
+               ;; the ordinary-host deployment.
+               "/thor-probe"
+               (if-not (.adminOk this request)
+                 (json {:ok false :reason "forbidden"} 403)
+                 (let [;; Several hosts, because the first one answered 1016
+                       ;; — Cloudflare could not resolve it. A single host is
+                       ;; a single point of "the network is unreachable" that
+                       ;; is really "this name is".
+                       urls ["https://thornode.ninerealms.com/thorchain/lastblock"
+                             "https://thornode.thorchain.info/thorchain/lastblock"
+                             "https://thornode.thorswap.net/thorchain/lastblock"
+                             "https://midgard.ninerealms.com/v2/health"
+                             "https://midgard.thorchain.info/v2/health"]
+                       grab (fn [path]
+                              (-> (js/fetch path)
+                                  (.then (fn [^js r]
+                                           (-> (.text r)
+                                               (.then (fn [t]
+                                                        {:path path :status (.-status r)
+                                                         :bytes (count t)
+                                                         :head (subs t 0 (min 400 (count t)))})))))
+                                  (.catch (fn [e] {:path path
+                                                   :error (str (or (.-message e) e))}))))]
+                   (-> (js/Promise.all (clj->js (map grab urls)))
+                       (.then (fn [rs] (json {:ok true :probed (vec (array-seq rs))} 200))))))
+
                "/transport-msg"
                (let [peers (remove #(= (.-witness this) %) witnesses)
                      n 10
