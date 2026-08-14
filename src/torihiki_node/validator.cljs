@@ -324,7 +324,10 @@
             [torihiki.book :as bk]
             [torihiki.clearing :as cl]
             [torihiki.snapshot :as tsnap]
-            [torihiki.state :as st]))
+            [torihiki.state :as st]
+            ;; The view shapes, out here because this namespace cannot be
+            ;; loaded outside a Worker and they can be checked without one.
+            [torihiki-node.views :as vw]))
 
 (goog-define genesis-set "v1")
 ;; Which genesis validator set this BUILD carries. A compile-time constant,
@@ -427,7 +430,7 @@
   ;; What gave it away: `/reset` answered with `deleted` and `drained`, fields
   ;; that only the new build has. The behaviour said what the version number
   ;; would not.
-  "165")
+  "170")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -449,12 +452,17 @@
   already abandoned."
   [w]
   w)
-(def ^:const market-id
+(def market-id
   "The market a read route answers about when the caller does not say.
 
   Not `the` market any more — see `markets`. It is the default so that every
-  existing client keeps working unchanged, and every read route takes `?m=`."
-  1)
+  existing client keeps working unchanged, and every read route takes `?m=`.
+
+  Taken from `torihiki-node.views/default-market` rather than written again:
+  the market a read route defaults to and the market a pre-split candle vector
+  is attributed to must be the same one, and two literals is how they stop
+  being."
+  vw/default-market)
 (def witnesses
   "Seven, not four.
   
@@ -917,13 +925,21 @@
   "faucet")
 
 (def ^:const checkpointed-candles
-  "How many block candles ride along in a checkpoint.
+  "How many block candles ride along in a checkpoint, PER MARKET.
 
   Fewer than `candle-retention`, because a Durable Object storage value has a
   hard size ceiling and the checkpoint is already carrying the whole exchange.
   A checkpoint that grew past it would fail to write — and `checkpoint!`
   catches its own errors, so the failure would be silent and the replica would
   fall back to replaying from further and further back.
+
+  Per market, and the words matter: `:candles` became a map keyed by market id
+  and the bound went on being applied as `(vec (take-last 600 cs))`, which on a
+  map takes 600 ENTRIES — 600 markets, each holding up to `candle-retention`
+  candles. See `torihiki-node.views/checkpoint-candles`, which is where the
+  bound is applied now and where it can be checked. The ceiling this names is
+  `checkpointed-candles` times the number of markets, which is a number that
+  grows when a market is added and is worth knowing about.
 
   What is lost past this bound is HISTORY, not state: `/candles` reports its
   own horizon in `retained-from`, so a shorter chart after a restart is
@@ -944,12 +960,31 @@
   2000)
 
 (def ^:const candle-retention
-  "Block candles kept in the machine. Only blocks that traded make one.
+  "Block candles kept in the machine, PER MARKET. Only blocks that traded make
+  one.
 
   Bounded because this lives in the machine state, which every replica holds
   in memory and writes into every checkpoint — an unbounded index would grow
   the thing the bounded resume exists to keep small."
   4000)
+
+(def ^:const refused-retention
+  "Refusal reasons kept in the machine, across all markets.
+
+  This was unbounded. `apply-block` clears `:rejected` every block, so the fold
+  below copies each block's reasons out before they are lost — and copied them
+  into a vector nothing ever trimmed. One entry per refused transaction, for
+  the life of the chain, in the machine state, which is written whole into
+  every checkpoint. It is the one thing in there that only ever grows, and it
+  grows fastest exactly when something is wrong.
+
+  Bounded like `tape-retention` and for the same reason. What is lost past this
+  is HISTORY: `/health` reports `refused` as `frequencies` over what is kept,
+  so after this many refusals the counts describe the recent ones rather than
+  all of them. The alternative was a count per reason, which never forgets and
+  cannot say what happened lately; the recent window is the one a person
+  looking at a stuck chain is asking about."
+  2000)
 
 (def ^:const adopt-check-ms
   "How often a replica asks whether it has been outvoted on state.
@@ -1289,11 +1324,10 @@
                                                                 ;; and silently gave every later
                                                                 ;; market an empty chart forever.
                                                                 ;;
-                                                                ;; A vector here is a checkpoint from
-                                                                ;; before the split; it is market 1's,
-                                                                ;; because market 1 is what it could
-                                                                ;; have been about.
-                                                                (let [cs (if (vector? cs) {market-id cs} (or cs {}))]
+                                                                ;; Whatever shape it was restored in;
+                                                                ;; `candles-by-market` names the three
+                                                                ;; and which checkpoint wrote each.
+                                                                (let [cs (vw/candles-by-market cs)]
                                                                   (reduce
                                                                    (fn [acc m]
                                                                      (let [fs (bk/fills (get-in ex' [:books m]))]
@@ -1348,10 +1382,17 @@
                                             ;; holding only the last one's —
                                             ;; which reads as nothing ever
                                             ;; having been refused.
+                                            ;;
+                                            ;; Bounded, which it was not: this
+                                            ;; appended and never trimmed, in
+                                            ;; the machine state, which is
+                                            ;; written whole into every
+                                            ;; checkpoint. See
+                                            ;; `refused-retention`.
                                             (as-> ex' (update ex' :refused
-                                                              (fnil into [])
-                                                              (map :reason
-                                                                   (:rejected ex'))))))
+                                                              #(vw/absorb-refusals
+                                                                refused-retention
+                                                                % (:rejected ex'))))))
                                       :root-fn st/state-root}})
 
   ;; The bridge's keypair, derived and cached.
@@ -1836,15 +1877,12 @@
                                      views (:views snap)
                                      snap (-> snap
                                               (update :machine-state tsnap/restore)
-                                              ;; `merge` and not `assoc`: a
-                                              ;; checkpoint written before
-                                              ;; `:views` existed has none,
-                                              ;; and restoring nil over a
-                                              ;; freshly built machine would
-                                              ;; be the same loss with an
-                                              ;; extra step.
-                                              (cond-> views
-                                                (update :machine-state merge views)))]
+                                              ;; A checkpoint from when the
+                                              ;; views rode inside it. See
+                                              ;; `merge-views` for why the
+                                              ;; three arrival points share
+                                              ;; one definition.
+                                              (update :machine-state vw/merge-views views))]
                                  (r/resume (.replicaOpts this (.-witness this)) snap))
                                (catch :default e (.note! this e) nil))]
                          (if restored
@@ -1858,10 +1896,10 @@
                                 (.then (.get ^js (.-storage do-state) "views:latest")
                                        (fn [v]
                                          (when v
-                                           (let [vw (tsnap/read-string* v)]
+                                           (let [hist (tsnap/read-string* v)]
                                              (set! (.-replica this)
                                                    (update (.-replica this) :machine-state
-                                                           merge (select-keys vw [:tape :candles])))))))
+                                                           vw/merge-views hist))))))
                                 (fn [_] nil))
                                (set! (.-lastCkpt this) (r/height restored))
                                (set! (.-bootedFromCkpt this) true)
@@ -2369,10 +2407,30 @@
               ;; Two bounded writes instead of one unbounded one. The split
               ;; also decides what dies first: if the history write is the one
               ;; that times out, it no longer takes the STATE write with it.
+              ;;
+              ;; **The split lived in this comment and nowhere else until
+              ;; now.** `tsnap/capture` rewrote `:books` and `:rejected` and
+              ;; passed everything else through, so `:tape`, `:candles` and
+              ;; `:refused` stayed inside `:machine-state` and rode in the
+              ;; state write exactly as before — while a second write went out
+              ;; carrying a copy of them. The comment described the intent, the
+              ;; code did the old thing plus extra, and what was written grew
+              ;; slightly FASTER than before the split was written down.
+              ;; `torihiki.snapshot/view-keys` is where it is now enforced —
+              ;; and `vw/state-only` here as well, because `deps.edn` pins the
+              ;; engine by sha and a fix that waits for a repin is a fix that
+              ;; is not running.
               snap (-> (r/snapshot s)
-                       (update :machine-state tsnap/capture))
+                       (update :machine-state (comp tsnap/capture vw/state-only)))
               views {:tape (vec (:tape ms))
-                     :candles (vec (take-last checkpointed-candles (:candles ms)))}]
+                     :candles (vw/checkpoint-candles checkpointed-candles (:candles ms))
+                     ;; `:refused` rides here rather than being dropped: it is
+                     ;; history like the other two, it is bounded by
+                     ;; `refused-retention`, and `/health` reads it — a counter
+                     ;; that silently restarts at a reset is a counter that
+                     ;; disagrees with the other replicas for a reason nobody
+                     ;; can see.
+                     :refused (vec (:refused ms))}]
           (-> (.put ^js (.-storage do-state) (ckpt-key h) (tsnap/write-string snap))
               (.then (fn [_]
                        ;; History, and explicitly not per-height: one key,
@@ -2619,7 +2677,7 @@
                                                mine (r/height (.-replica this))
                                                snap (-> snap
                                                         (update :machine-state tsnap/restore)
-                                                        (cond-> views (update :machine-state merge views))
+                                                        (update :machine-state vw/merge-views views)
                                                         (update :voted-below (fnil max 0) mine))
                                                resumed (r/resume (.replicaOpts this me) snap)]
                                            (set! (.-replica this) resumed)
@@ -3833,11 +3891,14 @@
                (let [ex (:machine-state (.-replica this))
                      span (max 1 (or (js/parseInt (or (.get (.-searchParams url) "span") "10")) 1))
                      n (max 1 (min 1000 (or (js/parseInt (or (.get (.-searchParams url) "n") "200")) 200)))
-                     ;; A vector is a checkpoint from before candles were
-                     ;; per market; it is market 1's.
-                     cs (:candles ex)
-                     arr (vec (if (vector? cs) (when (= (market-param url) market-id) cs)
-                                  (get cs (market-param url))))
+                     ;; Through `candles-by-market`, so an old checkpoint's
+                     ;; shape is decided in ONE place. This had its own copy
+                     ;; of the vector check, and its own copy could not tell a
+                     ;; pre-split vector of candles from a vector of
+                     ;; `[market candles]` pairs — it answered the second one
+                     ;; as market 1's chart.
+                     cs (vw/candles-by-market (:candles ex))
+                     arr (vec (get cs (market-param url)))
                      floor (when (seq arr)
                              (- (cndl/bucket span (:h (peek arr))) (* span (dec n))))
                      window (if floor (filterv #(>= (:h %) floor) arr) [])]
