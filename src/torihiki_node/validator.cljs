@@ -427,7 +427,7 @@
   ;; What gave it away: `/reset` answered with `deleted` and `drained`, fields
   ;; that only the new build has. The behaviour said what the version number
   ;; would not.
-  "161")
+  "162")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -1829,6 +1829,20 @@
                                (catch :default e (.note! this e) nil))]
                          (if restored
                            (do (set! (.-replica this) restored)
+                               ;; The history, if it is still there. Best
+                               ;; effort and not awaited: an empty chart after
+                               ;; a restart is a shorter chart, and `/candles`
+                               ;; reports its own horizon, so it is visible
+                               ;; rather than implied.
+                               (.catch
+                                (.then (.get ^js (.-storage do-state) "views:latest")
+                                       (fn [v]
+                                         (when v
+                                           (let [vw (tsnap/read-string* v)]
+                                             (set! (.-replica this)
+                                                   (update (.-replica this) :machine-state
+                                                           merge (select-keys vw [:tape :candles])))))))
+                                (fn [_] nil))
                                (set! (.-lastCkpt this) (r/height restored))
                                (set! (.-bootedFromCkpt this) true)
                                ;; Everything at or below the checkpoint is
@@ -2314,12 +2328,39 @@
               ;; Beside rather than inside: putting a view into the engine's
               ;; snapshot would make the engine's serialisation depend on what
               ;; a UI wanted to draw.
+              ;; The engine only. The tape and the candles go in a SEPARATE
+              ;; write.
+              ;;
+              ;; They used to ride inside this value, and this value is one
+              ;; Durable Object storage operation. It carries the whole
+              ;; exchange, and it grows with the chain — so past some size the
+              ;; write stops fitting in the platform's storage timeout, and
+              ;; the platform's answer to that is not an error you catch:
+              ;;
+              ;;   Durable Object storage operation exceeded timeout which
+              ;;   caused object to be reset.
+              ;;
+              ;; **Captured from the deployed chain.** The replica was reset,
+              ;; the venue dropped to three of four, and a three-of-four
+              ;; consensus with one replica down has no slack left — the next
+              ;; replica to fall behind stopped the chain. It happened three
+              ;; times, and each time it looked like a consensus stall.
+              ;;
+              ;; Two bounded writes instead of one unbounded one. The split
+              ;; also decides what dies first: if the history write is the one
+              ;; that times out, it no longer takes the STATE write with it.
               snap (-> (r/snapshot s)
-                       (update :machine-state tsnap/capture)
-                       (assoc :views {:tape (vec (:tape ms))
-                                      :candles (vec (take-last checkpointed-candles
-                                                               (:candles ms)))}))]
+                       (update :machine-state tsnap/capture))
+              views {:tape (vec (:tape ms))
+                     :candles (vec (take-last checkpointed-candles (:candles ms)))}]
           (-> (.put ^js (.-storage do-state) (ckpt-key h) (tsnap/write-string snap))
+              (.then (fn [_]
+                       ;; History, and explicitly not per-height: one key,
+                       ;; overwritten. Keeping a copy beside every checkpoint
+                       ;; would multiply the thing that was already too big.
+                       (.catch (.put ^js (.-storage do-state) "views:latest"
+                                     (tsnap/write-string (assoc views :height h)))
+                               (fn [_] nil))))
               (.then (fn [_]
                        (set! (.-lastCkpt this) h)
                        ;; Drop the ones past the keep count. `.list` with
