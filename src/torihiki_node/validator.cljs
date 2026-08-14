@@ -406,6 +406,13 @@
   visible instead of assumed."
   ;; **143.** Bumped by hand, and the hand missed it six times in a row.
   ;;
+  ;; And it settled a second question it exists for: **a deployed script IS
+  ;; picked up.** With the constant moving again, `wrangler deploy` was
+  ;; followed by all four objects reporting the new number within a minute —
+  ;; no reset, no eviction. The older note in this file, that a Durable Object
+  ;; runs what it booted with until evicted, was written when this constant
+  ;; was stuck and could not have shown otherwise.
+  ;;
   ;; Six deploys in one session each meant to bump this and did not — the edits
   ;; were `perl -0pi -e 's/  "141"\)/  "142")/'` against text that did not
   ;; match, and every one of them failed silently. The number stayed at 136
@@ -419,7 +426,7 @@
   ;; What gave it away: `/reset` answered with `deleted` and `drained`, fields
   ;; that only the new build has. The behaviour said what the version number
   ;; would not.
-  "143")
+  "144")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -756,7 +763,30 @@
   ;; answered — and STEAL the object while it does it. A Durable Object
   ;; serialises what arrives, so every tick is a window in which incoming
   ;; votes wait. Forty windows a second is forty chances to be late.
-  100)
+  ;; **25**, and this line has now been changed on purpose three times and
+  ;; landed once.
+  ;;
+  ;; Twice it was `perl -0pi -e` against text that did not match, which fails
+  ;; silently — the same way six `code-version` bumps failed in one session.
+  ;; The chain then ran at 100 ms a block while the source said 25 and the
+  ;; measurement was read as the platform's floor. **An edit that does not
+  ;; apply looks exactly like a change that did not help.**
+  ;;
+  ;; Measured on v3, from outside the objects:
+  ;;
+  ;;   tick 100   317 blocks / 30,040 ms   94.8 ms per block
+  ;;   tick  25   337 blocks / 30,003 ms   89.0 ms per block
+  ;;              327 blocks / 30,051 ms   91.9 ms per block
+  ;;
+  ;; **Quartering the tick bought three milliseconds.** The tick is not what a
+  ;; block waits on — the reading at 100 looked like the tick because 94.8 is
+  ;; near 100, and it was a coincidence of two numbers being close.
+  ;;
+  ;; So ~90 ms is three or four round trips of something that is NOT the 2-4 ms
+  ;; between objects and NOT the clock. Where it actually goes is still open,
+  ;; and the honest place to leave it is here rather than in a constant that
+  ;; pretends to be the answer.
+  25)
 
 (def ^:const deliver-cap-ms
   "How long a tick will wait for its own messages to be delivered. **40.**
