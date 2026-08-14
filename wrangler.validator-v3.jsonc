@@ -18,5 +18,59 @@
     "bindings": [{ "name": "VALIDATOR", "class_name": "ValidatorV2" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ValidatorV2"] }],
-  "observability": { "enabled": true }
+  "observability": { "enabled": true },
+
+  // ── the escrow watcher ────────────────────────────────────────────────────
+  //
+  // Here rather than in `wrangler secret`, deliberately: none of it is secret,
+  // and THOR_ASSETS is an allowlist that decides what counts as money. A
+  // reviewer has to be able to see it, and a secret is exactly the kind of
+  // configuration nobody reviews.
+  //
+  // Every value below was checked against Ethereum itself — see the ADR. The
+  // one that cannot be is THOR_VAULT; read its note.
+  "vars": {
+    // Measured: this is the one public endpoint that answers a Worker. It is
+    // also range-limited — a 64-block `eth_getLogs` span answers and 128 is
+    // refused as "archive" — which is why `watchEth!` asks for 48.
+    "ETH_RPC": "https://ethereum-rpc.publicnode.com",
+
+    // THORChain's Router. Not pasted on trust: this address emits the exact
+    // `Deposit(address,address,uint256,string)` topic derived by `keccak` in
+    // this repo, and the memos in those logs are THORChain's own command
+    // language ("=:b:bc1q…"). Queried live before it was written here.
+    "THOR_ROUTER": "0xD37BbE5744D730a1d98d8DC97c42F0Ca46aD7146",
+
+    // The asgard vaults deposits are accepted into.
+    //
+    // **This is the one value here that is not verified.** THORChain's own
+    // `/thorchain/inbound_addresses` is behind a Cloudflare bot challenge and
+    // returns "Just a moment" to every non-browser client — from a Worker AND
+    // from an ordinary shell, so it is not a Workers limitation. These three
+    // are the addresses observed RECEIVING Router deposits in recent blocks,
+    // which is evidence and not authority: the Router lets a caller name any
+    // recipient, so an address seen here is an address somebody sent to.
+    //
+    // The consequence is bounded and known: a deposit to a vault not on this
+    // list is not credited, and nothing is lost — THORChain still holds it and
+    // the log is still there once the address is added. The opposite mistake
+    // is the dangerous one, which is why the list is an allowlist.
+    //
+    // **Before depositing, confirm the inbound address THORChain gives you is
+    // one of these, and add it if not.** It churns every few days.
+    "THOR_VAULT": "0xed23d1bf7ac2ce8b4c09a090e252ea6ee5145e6e,0x64fb273b328cde17b15d3fff2731b4096ff0a132,0x15a18266c5331ac3a7f6bc5cdf25bcc55561b4fa",
+
+    // What this venue takes as collateral: address, the name it is booked
+    // under, and the token's decimals.
+    //
+    // USDC, verified on-chain by `symbol()` and `decimals()` rather than
+    // pasted. Its 6 decimals are also the venue's own, so it scales by
+    // exactly 1 and cannot be mis-scaled at all — the reason to fund in this
+    // and not in an 18-decimal token.
+    //
+    // Adding a line here is a decision about what counts as money. Anything
+    // absent is dropped, which is what stops a token minted this morning from
+    // being credited at face value.
+    "THOR_ASSETS": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48:ETH.USDC:6"
+  }
 }

@@ -319,6 +319,7 @@
             [torihiki.evm :as evm]
             [torihiki.evm.interp :as evmi]
             [torihiki.keccak :as kc]
+            [torihiki.thorchain :as tc]
             [torihiki.api :as api]
             [torihiki.book :as bk]
             [torihiki.clearing :as cl]
@@ -426,7 +427,7 @@
   ;; What gave it away: `/reset` answered with `deleted` and `drained`, fields
   ;; that only the new build has. The behaviour said what the version number
   ;; would not.
-  "147")
+  "152")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -1686,6 +1687,18 @@
                          (reduce (fn [o [w pub]] (doto o (aset w pub)))
                                  #js {} validator-keys))
                    (set! (.-verified this) #js {})
+                   ;; This validator's own trading account — the identity an
+                   ;; attestation is signed with. `torihiki.state` checks the
+                   ;; speaker's BOND, so the attestor is an account like any
+                   ;; other and has to be funded and bonded like one.
+                   (set! (.-acct this) (addr/derive (.-pub k)))
+                   ;; Where the escrow watcher had reached. Not awaited — the
+                   ;; watcher runs on the tick, not on boot, and a poll that
+                   ;; happens to fire before this lands re-scans one window,
+                   ;; which is idempotent (`:deposit-attest` is keyed by txid
+                   ;; and credits exactly once).
+                   (.then (.get ^js (.-storage do-state) "eth-cursor")
+                          (fn [c] (when (integer? c) (set! (.-ethCursor this) c))))
                    (set! (.-delivery this) #js {})
                    (set! (.-why this) #js {})
                    (set! (.-replica this) (r/replica (.replicaOpts this name)))
@@ -2975,6 +2988,206 @@
                   (json {:ok false :error (str (or (.-message e) e))
                          :witness (.-witness this)} 500)))))
 
+  ;; The escrow, watched on Ethereum.
+  ;;
+  ;; THORChain's own hosts do not answer a Worker — five measured, four
+  ;; unresolvable and one refusing. An ETH deposit is a call to THORChain's
+  ;; Router on Ethereum, and the Router's `Deposit` event carries the vault,
+  ;; the asset, the amount and the memo. `ethereum-rpc.publicnode.com` does
+  ;; answer a Worker, so the observation comes from the source chain.
+  ;;
+  ;; OFF unless `ETH_RPC`, `THOR_ROUTER`, `THOR_VAULT` and `THOR_ASSETS` are
+  ;; all set. A watcher missing any of them would poll and attest nothing,
+  ;; which reads as healthy and is not.
+  (watchEth! [this]
+    (let [rpc (.-ETH_RPC env) router (.-THOR_ROUTER env)
+          vaults (.-THOR_VAULT env) assets (.-THOR_ASSETS env)
+          now (js/Date.now)]
+      (if-not (and rpc router vaults assets
+                   (>= now (or (.-nextEthScan this) 0)))
+        (js/Promise.resolve nil)
+        (do
+          (set! (.-nextEthScan this) (+ now 6000))
+          (let [call (fn [method params]
+                       (-> (js/fetch rpc #js {:method "POST"
+                                              :headers #js {"content-type" "application/json"}
+                                              :body (js/JSON.stringify
+                                                     (clj->js {:jsonrpc "2.0" :id 1
+                                                               :method method :params params}))})
+                           (.then #(.json %))
+                           (.then (fn [j]
+                                    ;; A JSON-RPC error is a 200 with an
+                                    ;; `error` member. Reading `result` and
+                                    ;; finding nil turns every refusal into
+                                    ;; "no logs" — the exact shape of a
+                                    ;; watcher that looks healthy and sees
+                                    ;; nothing.
+                                    (when-let [e (aget j "error")]
+                                      (throw (js/Error. (str "rpc: " (aget e "message")))))
+                                    (aget j "result")))))
+                topic (str "0x" (kc/digest-hex (map #(.charCodeAt % 0)
+                                                    (seq tc/deposit-event-signature))))
+                registry (.assetRegistry this assets)]
+            (-> (call "eth_blockNumber" [])
+                (.then
+                 (fn [tip-hex]
+                   (let [tip (js/parseInt tip-hex 16)
+                         _ (set! (.-ethTip this) tip)
+                         ;; How much history this endpoint will serve.
+                         ;;
+                         ;; **Measured**, against the real Router on
+                         ;; publicnode: a 64-block span answers, 128 is
+                         ;; refused with `Archive requests require a personal
+                         ;; token`. A free endpoint keeps roughly the last
+                         ;; hundred blocks and calls the rest archive.
+                         ;;
+                         ;; The first version asked for `tip - 200` and would
+                         ;; have been refused on every single poll, forever,
+                         ;; while `/escrow` showed a watcher that was "on".
+                         span 48
+                         want (or (.-ethCursor this) (- tip span))
+                         ;; Never ask for more history than it will serve.
+                         from (max want (- tip span))
+                         ;; What we could not read. Not silently skipped: an
+                         ;; object down longer than the servable window has a
+                         ;; hole in its evidence, and the only honest thing is
+                         ;; to say which blocks are in it. Recovering them
+                         ;; needs an archive-capable endpoint.
+                         gap (- from want)
+                         to (min (- tip tc/min-confirmations) (+ from span))]
+                     (when (pos? gap)
+                       (set! (.-ethGap this) (+ (or (.-ethGap this) 0) gap))
+                       (set! (.-ethGapFrom this) want))
+                     (if (or (not (integer? tip)) (>= from to))
+                       nil
+                       (-> (call "eth_getLogs"
+                                 [{:address router
+                                   :topics [topic]
+                                   :fromBlock (str "0x" (.toString from 16))
+                                   :toBlock (str "0x" (.toString to 16))}])
+                           (.then
+                            (fn [logs]
+                              (let [ls (js->clj logs :keywordize-keys true)
+                                    txs (tc/deposits-from-logs
+                                         (.-acct this)
+                                         (set (.split vaults ","))
+                                         tip
+                                         ls
+                                         registry)]
+                                (set! (.-ethCursor this) (inc to))
+                                ;; Persisted, because a Durable Object can be
+                                ;; evicted at any moment and an in-memory
+                                ;; cursor comes back one window behind the
+                                ;; tip. An object down longer than that would
+                                ;; skip every deposit in between and report
+                                ;; nothing wrong.
+                                (.catch (.put ^js (.-storage do-state)
+                                              "eth-cursor" (inc to))
+                                        (fn [_] nil))
+                                ;; Logs SEEN and deposits USABLE, separately.
+                                ;; One number cannot tell "the Router is quiet"
+                                ;; from "every deposit is being dropped by the
+                                ;; registry", and those need opposite fixes.
+                                (set! (.-ethLogs this)
+                                      (+ (or (.-ethLogs this) 0) (count ls)))
+                                (set! (.-ethSeen this)
+                                      (+ (or (.-ethSeen this) 0) (count txs)))
+                                (reduce (fn [p tx] (.then p (fn [_] (.attest! this tx))))
+                                        (js/Promise.resolve nil) txs)))))))))
+                (.catch (fn [e]
+                          ;; A failed poll is a failed poll. It is not evidence
+                          ;; of anything and must not become an attestation.
+                          (set! (.-ethError this) (str (or (.-message e) e)))
+                          nil))))))))
+
+  ;; `THOR_ASSETS` as the allowlist `deposits-from-logs` takes.
+  ;;
+  ;;   0xa0b8...eb48:ETH.USDC:6,0x6b17...1d0f:ETH.DAI:18
+  ;;
+  ;; address, the name this venue books it under, and the token's decimals.
+  ;; All three are needed and none can be guessed: the address is the only
+  ;; thing distinguishing USDC from a token minted this morning, the name is
+  ;; what four validators have to agree on character for character, and the
+  ;; decimals are the difference between crediting a deposit and crediting
+  ;; 10^12 times its value.
+  ;;
+  ;; An entry that does not parse is DROPPED rather than defaulted. A default
+  ;; here would be a guess about somebody's money.
+  (assetRegistry [_ s]
+    (into {} (for [e (.split (or s "") ",")
+                   :let [[addr nm dec] (.split (.trim e) ":")
+                         d (js/parseInt dec 10)]
+                   :when (and addr nm (integer? d) (not (js/isNaN d)))]
+               [(.toLowerCase addr) {:asset nm :decimals d}])))
+
+  ;; One attestation, signed as this validator's own account.
+  ;;
+  ;; ## The nonce is not a counter
+  ;;
+  ;; It is the chain's expected nonce, or one past the last we signed —
+  ;; whichever is further along, and only up to a bound. Both halves were paid
+  ;; for by the faucet on the deployed chain:
+  ;;
+  ;;   Committed state alone gives every attestation in one poll the SAME
+  ;;   number, because a transaction takes a block to commit, and all but the
+  ;;   first are refused `bad-nonce`.
+  ;;
+  ;;   A local counter runs permanently ahead the moment one attestation fails
+  ;;   to land — nonces are strictly sequential, so nothing after the gap can
+  ;;   ever apply, and the validator stops attesting anything forever while
+  ;;   still looking healthy.
+  ;;
+  ;; The bound is what keeps the second failure recoverable: past it we stop
+  ;; signing rather than issue numbers that can never be accepted.
+  (attest! [this tx]
+    (let [acct (.-acct this)
+          ex (:machine-state (.-replica this))
+          expected (tauth/expected-nonce ex acct)
+          nonce (max expected (inc (or (.-lastAttNonce this) -1)))]
+      (if (> (- nonce expected) 16)
+        (do (set! (.-ethError this)
+                  (str "attestations are not landing — nonce " nonce
+                       " is " (- nonce expected) " ahead of the chain's " expected))
+            (js/Promise.resolve nil))
+        (let [t (assoc tx :account acct)
+              payload (tauth/signing-payload chain-id acct nonce t)]
+          (-> (js/crypto.subtle.sign #js {:name "Ed25519"}
+                                     (.-privateKey (.-kp this))
+                                     (.encode (js/TextEncoder.) payload))
+              (.then (fn [sig]
+                       ;; Cached as verified BEFORE it is submitted.
+                       ;;
+                       ;; The machine's `verify-fn` is a synchronous lookup in
+                       ;; this map — it has to be, the platform's verifier is
+                       ;; async and `apply-block` is not. Peers fill it from
+                       ;; `verifyTxs` when the proposal arrives. The submitter
+                       ;; has no such moment, so an attestation this Worker
+                       ;; signed and did not cache is one THIS replica refuses
+                       ;; while every peer accepts it: not a dropped
+                       ;; transaction, a fork.
+                       (aset (or (.-txok this) (set! (.-txok this) #js {}))
+                             (str (.-pub this) "|" payload "|" (b64 sig)) true)
+                       ;; The same door a client uses: `r/submit` takes the
+                       ;; encoded envelope, so an attestation is checked
+                       ;; exactly as a stranger's transaction is. A validator
+                       ;; that could put transactions in by a private route is
+                       ;; a validator nobody can audit.
+                       (set! (.-replica this)
+                             (r/submit (.-replica this)
+                                       (js/JSON.stringify
+                                        (clj->js {:tx t :account acct
+                                                  :nonce nonce
+                                                  :pubkey (.-pub this)
+                                                  :sig (b64 sig)}))))
+                       (set! (.-lastAttNonce this) nonce)
+                       (set! (.-ethAttested this)
+                             (inc (or (.-ethAttested this) 0)))
+                       nil))
+              (.catch (fn [e]
+                        (set! (.-ethError this)
+                              (str "attest: " (or (.-message e) e)))
+                        nil)))))))
+
   (round [this]
     ;; One round: bootstrap if there is nothing yet, and ALWAYS tick.
     ;;
@@ -3034,6 +3247,7 @@
       ;; Rate-limited inside. See `maybeAdopt!` for why this is on the tick
       ;; rather than behind the admin route it shares its evidence with.
       (.maybeAdopt! this)
+      (.watchEth! this)
       ;; Why this replica did NOT propose.
       ;;
       ;; Every counter here says what happened. A stall is the absence of
@@ -3717,6 +3931,178 @@
                ;; Worker — a paid node, an allowlisted key, or a proxy we run —
                ;; or the validators need ordinary internet egress, which is
                ;; the ordinary-host deployment.
+               ;; What the escrow watcher is actually doing.
+               ;;
+               ;; A watcher with no observable is the failure this session has
+               ;; now made six times: it polls, it finds nothing, and nothing
+               ;; anywhere says whether that is because there are no deposits
+               ;; or because it is watching the wrong address, the wrong
+               ;; event, or nothing at all. `:on` is the honest headline — all
+               ;; three of `ETH_RPC`, `THOR_ROUTER` and `THOR_VAULT` present —
+               ;; and `:cursor` moving is the proof it is really polling.
+               "/escrow"
+               (json {:ok true
+                      :on (boolean (and (.-ETH_RPC env) (.-THOR_ROUTER env)
+                                        (.-THOR_VAULT env)))
+                      :rpc (boolean (.-ETH_RPC env))
+                      :router (.-THOR_ROUTER env)
+                      ;; The vaults, not a count: a churn that left this at
+                      ;; the old asgard is the failure mode, and only the
+                      ;; addresses show it.
+                      :vaults (when-let [v (.-THOR_VAULT env)]
+                                (vec (.split v ",")))
+                      :topic (str "0x" (kc/digest-hex
+                                        (map #(.charCodeAt % 0)
+                                             (seq tc/deposit-event-signature))))
+                      :account (.-acct this)
+                      :cursor (.-ethCursor this)
+                      :tip (.-ethTip this)
+                      :found (or (.-ethSeen this) 0)
+                      :attested (or (.-ethAttested this) 0)
+                      :last-nonce (.-lastAttNonce this)
+                      :error (.-ethError this)}
+                     200)
+
+               ;; Feed a log through the real path, to prove the path.
+               ;;
+               ;; Everything from the fetch to the memo parser is provable
+               ;; against live Router traffic (`/escrow-probe`), but the last
+               ;; link is not: no real THORChain user will ever send the memo
+               ;; `TORIHIKI:<n>`, so nothing on Ethereum exercises `attest!` —
+               ;; the nonce rule, the signature, the verify cache, the submit,
+               ;; and the chain's quorum. Those are the parts that move money,
+               ;; and they would first run in production.
+               ;;
+               ;; ## Why it is gated twice
+               ;;
+               ;; This is a MINT. It takes a log as given, so whoever can call
+               ;; it can name any vault, any amount and any account, and three
+               ;; validators' worth of calls is a credit out of nothing. The
+               ;; admin token alone is not enough of an answer to that.
+               ;;
+               ;; So it also requires `ESCROW_TEST` in the environment, which
+               ;; is not set in the deployed configuration. The capability does
+               ;; not exist unless somebody deliberately deploys it, and taking
+               ;; it away is a deploy that can be verified — this route
+               ;; answering 404 is the proof.
+               "/escrow-inject"
+               (cond
+                 (not (.-ESCROW_TEST env))
+                 (json {:ok false :reason "not-a-test-deployment"} 404)
+
+                 (not (.adminOk this request))
+                 (json {:ok false :reason "forbidden"} 403)
+
+                 :else
+                 (-> (.json request)
+                     (.then
+                      (fn [b]
+                        (let [ls (js->clj (aget b "logs") :keywordize-keys true)
+                              tip (or (aget b "tip") (.-ethTip this) 0)
+                              txs (tc/deposits-from-logs
+                                   (.-acct this)
+                                   (set (.split (or (.-THOR_VAULT env) "") ","))
+                                   tip ls
+                                   (.assetRegistry this (.-THOR_ASSETS env)))]
+                          (-> (reduce (fn [p tx] (.then p (fn [_] (.attest! this tx))))
+                                      (js/Promise.resolve nil) txs)
+                              (.then (fn [_]
+                                       (json {:ok true :attested (vec txs)
+                                              :account (.-acct this)
+                                              :last-nonce (.-lastAttNonce this)
+                                              :error (.-ethError this)} 200)))))))))
+
+               ;; Read a real range of the Router's logs and say what this
+               ;; build makes of each one.
+               ;;
+               ;; `found: 0` is the same answer whether the Router is quiet or
+               ;; the watcher is broken, and that ambiguity is the whole
+               ;; failure mode of a watcher. This resolves it against live
+               ;; data: every log in the range, decoded by the same decoder,
+               ;; with the reason it was or was not usable. Real THORChain
+               ;; traffic should come back `memo-is-not-ours` — which proves
+               ;; the fetch, the topic, the ABI decode and the memo parser all
+               ;; work, using somebody else's deposits and none of our money.
+               ;;
+               ;; Read-only. It attests nothing.
+               "/escrow-probe"
+               (if-not (.adminOk this request)
+                 (json {:ok false :reason "forbidden"} 403)
+                 (let [u (js/URL. (.-url request))
+                       p (.-searchParams u)
+                       rpc (.-ETH_RPC env) router (.-THOR_ROUTER env)
+                       registry (.assetRegistry this (.-THOR_ASSETS env))
+                       vaults (set (.split (or (.-THOR_VAULT env) "") ","))
+                       topic (str "0x" (kc/digest-hex (map #(.charCodeAt % 0)
+                                                           (seq tc/deposit-event-signature))))]
+                   (if-not (and rpc router)
+                     (json {:ok false :reason "escrow is not configured"} 400)
+                     (-> (js/fetch rpc
+                                   #js {:method "POST"
+                                        :headers #js {"content-type" "application/json"}
+                                        :body (js/JSON.stringify
+                                               (clj->js {:jsonrpc "2.0" :id 1
+                                                         :method "eth_blockNumber" :params []}))})
+                         (.then #(.json %))
+                         (.then
+                          (fn [j]
+                            (let [tip (js/parseInt (aget j "result") 16)
+                                  span (js/parseInt (or (.get p "span") "48") 10)
+                                  to (- tip tc/min-confirmations)
+                                  from (- to span)]
+                              (-> (js/fetch rpc
+                                            #js {:method "POST"
+                                                 :headers #js {"content-type" "application/json"}
+                                                 :body (js/JSON.stringify
+                                                        (clj->js
+                                                         {:jsonrpc "2.0" :id 1
+                                                          :method "eth_getLogs"
+                                                          :params [{:address router
+                                                                    :topics [topic]
+                                                                    :fromBlock (str "0x" (.toString from 16))
+                                                                    :toBlock (str "0x" (.toString to 16))}]}))})
+                                  (.then #(.json %))
+                                  (.then
+                                   (fn [j2]
+                                     (if-let [e (aget j2 "error")]
+                                       (json {:ok false :rpc-error (aget e "message")
+                                              :from from :to to} 502)
+                                       (let [ls (js->clj (aget j2 "result")
+                                                         :keywordize-keys true)
+                                             seen (map
+                                                   (fn [l]
+                                                     (let [d (tc/decode-deposit-data (:data l))
+                                                           tok (some-> (nth (:topics l) 2 nil)
+                                                                       (subs 26) (->> (str "0x"))
+                                                                       clojure.string/lower-case)
+                                                           vault (some-> (nth (:topics l) 1 nil)
+                                                                         (subs 26) (->> (str "0x"))
+                                                                         clojure.string/lower-case)
+                                                           spec (get registry tok)]
+                                                       {:block (:blockNumber l)
+                                                        :vault vault
+                                                        :token tok
+                                                        :memo (:memo d)
+                                                        :amount-raw (:amount d)
+                                                        :credit (tc/parse-memo (:memo d))
+                                                        :scaled (when spec
+                                                                  (tc/scaled-amount (:amount d)
+                                                                                    (:decimals spec)))
+                                                        :why (cond
+                                                               (nil? (tc/parse-memo (:memo d)))
+                                                               "memo-is-not-ours"
+                                                               (not (contains? vaults vault))
+                                                               "vault-is-not-watched"
+                                                               (nil? spec) "token-is-not-listed"
+                                                               :else "usable")}))
+                                                   ls)]
+                                         (json {:ok true :from from :to to :tip tip
+                                                :logs (count ls)
+                                                :usable (count (tc/deposits-from-logs
+                                                                (.-acct this) vaults tip ls registry))
+                                                :seen (vec seen)}
+                                               200)))))))))))))
+
                "/thor-probe"
                (if-not (.adminOk this request)
                  (json {:ok false :reason "forbidden"} 403)
@@ -3724,13 +4110,31 @@
                        ;; — Cloudflare could not resolve it. A single host is
                        ;; a single point of "the network is unreachable" that
                        ;; is really "this name is".
-                       urls ["https://thornode.ninerealms.com/thorchain/lastblock"
-                             "https://thornode.thorchain.info/thorchain/lastblock"
-                             "https://thornode.thorswap.net/thorchain/lastblock"
-                             "https://midgard.ninerealms.com/v2/health"
-                             "https://midgard.thorchain.info/v2/health"]
+                       ;; THORChain's own hosts are all behind Cloudflare and
+                       ;; a Worker cannot resolve them. But the deposit is not
+                       ;; only a THORChain fact: an ETH deposit is a call to
+                       ;; THORChain's Router **on Ethereum**, which emits a
+                       ;; Deposit event carrying the vault, the asset, the
+                       ;; amount and the MEMO. Everything the attestation
+                       ;; needs is in an Ethereum log.
+                       ;;
+                       ;; So the question becomes whether an Ethereum RPC
+                       ;; answers a Worker.
+                       urls ["https://cloudflare-eth.com"
+                             "https://ethereum-rpc.publicnode.com"
+                             "https://eth.llamarpc.com"
+                             "https://rpc.ankr.com/eth"
+                             "https://thornode.ninerealms.com/thorchain/lastblock"]
+                       body (js/JSON.stringify
+                             (clj->js {:jsonrpc "2.0" :id 1
+                                       :method "eth_blockNumber" :params []}))
                        grab (fn [path]
-                              (-> (js/fetch path)
+                              (-> (js/fetch path
+                                            (if (clojure.string/includes? path "thornode")
+                                              #js {}
+                                              #js {:method "POST"
+                                                   :headers #js {"content-type" "application/json"}
+                                                   :body body}))
                                   (.then (fn [^js r]
                                            (-> (.text r)
                                                (.then (fn [t]
