@@ -1610,8 +1610,15 @@
                    (set! (.-delivery this) #js {})
                    (set! (.-why this) #js {})
                    (set! (.-replica this) (r/replica (.replicaOpts this name)))
+                   ;; The watermark, restored before anything can vote.
+                   ;;
+                   ;; Read and APPLIED, not read and dropped. The log says what
+                   ;; this replica ADOPTED; it does not say what it voted for,
+                   ;; so a `replay` alone comes back believing it has never
+                   ;; voted — which is exactly the window one-vote-per-view
+                   ;; needs closed. Awaited, because a replica that boots and
+                   ;; votes before this lands has already lost the guarantee.
                    (set! (.-persisted this) 0)
-                   (set! (.-ready this) true)
                    ;; Where this object actually runs.
                    ;;
                    ;; Asked from INSIDE the object, because that is the only
@@ -1629,6 +1636,16 @@
                                 (set! (.-colo this)
                                       (second (re-find #"colo=(\S+)" t)))))
                        (.catch (fn [_] nil)))
+                   ;; ready ONLY after the watermark is back.
+                   (-> (.get ^js (.-storage do-state) "voted-view")
+                       (.then (fn [v]
+                                (when (number? v)
+                                  (set! (.-votedView this) v)
+                                  (set! (.-replica this)
+                                        (r/with-voted-view (.-replica this) v)))
+                                (set! (.-ready this) true)
+                                nil))
+                       (.catch (fn [_] (set! (.-ready this) true) nil)))
                    ;; The log is NOT replayed here.
                    ;;
                    ;; It was, in one `.list` with no limit and one `r/replay`
@@ -2135,9 +2152,32 @@
                      (set! (.-proposeOnMsg this) (inc (or (.-proposeOnMsg this) 0))))
                    (.queue! this out)
                    (.notify! this)
-                   (let [sends (js/Promise.resolve (.flush! this))]
-                     (when (fn? (.-waitUntil do-state)) (.waitUntil do-state sends))
-                     (.catch sends (fn [_] nil)))
+                   ;; The vote watermark, DURABLE BEFORE THE VOTE LEAVES.
+                   ;;
+                   ;; `inga.replica/voted-view` is the safety contract of
+                   ;; one-vote-per-view: a replica that votes in view V,
+                   ;; crashes without recording it, comes back and votes again
+                   ;; in V for a different block has equivocated — by
+                   ;; accident, against itself. Sending first and writing
+                   ;; after leaves a window exactly one crash wide.
+                   ;;
+                   ;; Only when it MOVES, which is once per view at most, not
+                   ;; once per message.
+                   (let [vv (r/voted-view (.-replica this))
+                         send! (fn []
+                                 (let [sends (js/Promise.resolve (.flush! this))]
+                                   (when (fn? (.-waitUntil do-state))
+                                     (.waitUntil do-state sends))
+                                   (.catch sends (fn [_] nil))))]
+                     (if (> vv (or (.-votedView this) -1))
+                       (-> (.put ^js (.-storage do-state) "voted-view" vv)
+                           (.then (fn [_] (set! (.-votedView this) vv) (send!)))
+                           (.catch (fn [_]
+                                     ;; The write failed, so the vote must not
+                                     ;; go. A vote nobody recorded is a vote
+                                     ;; that can be cast twice.
+                                     nil)))
+                       (send!)))
                    (.persist! this))))))
 
   ;; Persistence was turned OFF here for one deploy, to test whether writing a
