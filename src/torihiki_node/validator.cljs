@@ -427,7 +427,7 @@
   ;; What gave it away: `/reset` answered with `deleted` and `drained`, fields
   ;; that only the new build has. The behaviour said what the version number
   ;; would not.
-  "152")
+  "158")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -3955,6 +3955,22 @@
                                         (map #(.charCodeAt % 0)
                                              (seq tc/deposit-event-signature))))
                       :account (.-acct this)
+                      ;; Is this validator's word worth anything?
+                      ;;
+                      ;; `torihiki.state/deposit-attest` counts BONDED
+                      ;; attestors and silently ignores everyone else — it
+                      ;; returns the state unchanged, which is right (an
+                      ;; unbonded stranger must not be able to credit anybody)
+                      ;; and invisible. Measured: four validators each
+                      ;; attested the same deposit, `refused` did not move,
+                      ;; `pending` drained, and the account stayed at zero.
+                      ;; Nothing anywhere said why.
+                      ;;
+                      ;; So the watcher reports its own standing. `bonded 0`
+                      ;; with `attested` climbing is the whole diagnosis.
+                      :bonded (cl/stake-of (:clearing (:machine-state (.-replica this)))
+                                           (.-acct this))
+                      :attest-quorum st/attest-quorum
                       :cursor (.-ethCursor this)
                       :tip (.-ethTip this)
                       :found (or (.-ethSeen this) 0)
