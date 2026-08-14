@@ -427,7 +427,7 @@
   ;; What gave it away: `/reset` answered with `deleted` and `drained`, fields
   ;; that only the new build has. The behaviour said what the version number
   ;; would not.
-  "158")
+  "161")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
