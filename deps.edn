@@ -16,9 +16,17 @@
         ;; it, since shadow-cljs only compiles what is required. `inga.replica`
         ;; requires consensus / pacemaker / quorum / attest / stake / sync /
         ;; wire and NOT `inga.state`, so arrangement does not reach the bundle.
+        ;;
+        ;; 7fb9f43 brings the fork resolution: `inga.sync/sync-step` anchored at
+        ;; the tip and nowhere else, so a segment could only be APPENDED. Right
+        ;; for a replica that is BEHIND, and unable to resolve a fork, where a
+        ;; replica is BESIDE — its tip at the same height as its peers' and a
+        ;; different block, so every segment they can offer starts at or below
+        ;; that height and is refused `:does-not-attach`. That is the stall
+        ;; root ADR-2800004800 §1d measured on THIS deployment at 1030/1031.
         io.github.kotoba-lang/inga
         {:git/url "https://github.com/kotoba-lang/inga.git"
-         :git/sha "a8e16a006a07a117b2622c3996b23c5c94a6f948"}
+         :git/sha "7fb9f43467a541ac6b6577451d5a67da41b99291"}
         ;; The candle fold. The terminal draws from the same library, so
         ;; `/candles` and the chart cannot disagree about what a candle is.
         ;; The IPLD layer: canonical DAG-CBOR and CIDv1. Block identity is a

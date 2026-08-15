@@ -426,7 +426,12 @@
   ;; What gave it away: `/reset` answered with `deleted` and `drained`, fields
   ;; that only the new build has. The behaviour said what the version number
   ;; would not.
-  "147")
+  ;;
+  ;; **148.** The chain comes back: inga at 7fb9f43 (the fork resolution this
+  ;; deployment's own stall at 1030/1031 was the evidence for) and the alarm
+  ;; cadence off 25 ms, which is what the bill was made of rather than
+  ;; anything that was wrong with the chain.
+  "148")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -802,7 +807,74 @@
   ;; ~90 ms is therefore close to the floor here while the objects are doing
   ;; the work. Hyperliquid is ~70 ms; four ordinary processes on one host
   ;; measured 3-13 ms.
-  25)
+  ;;
+  ;; ## Why the default is now 500 and not 25 (2026-08-15)
+  ;;
+  ;; **This chain was retired to stop a bill, not because it did not work.**
+  ;; The deployment history reads: 21:46 "Reduce devnet validator alarm cadence
+  ;; from 50ms to 500ms to stop DO cost amplification", 21:53 a tombstone
+  ;; answering 410. At 25 ms each of four Durable Objects wakes 40 times a
+  ;; second — 160 invocations a second, ~13.8 million a day — and it does that
+  ;; forever, because the abandonment cutoff above only fires when NOTHING
+  ;; addresses the object and four validators keep each other addressed by
+  ;; construction. The one state that stops the clock is the one a running
+  ;; chain is never in.
+  ;;
+  ;; Raising it is nearly free, and this file already measured why:
+  ;;
+  ;;     tick 100   317 blocks / 30,040 ms   94.8 ms per block
+  ;;     tick  25   337 blocks / 30,003 ms   89.0 ms per block
+  ;;
+  ;; **Quartering the tick bought three milliseconds.** Every proposal is
+  ;; driven by a message (`propose-on-msg 10-12` against `propose-on-tick 0`);
+  ;; the alarm times views out and re-casts an unanswered vote. It is a
+  ;; watchdog, and paying 40 wake-ups a second for a watchdog is the shape of
+  ;; the bill that closed this chain.
+  ;;
+  ;; **Measured at 500, from outside the objects, on the revived v3:**
+  ;;
+  ;;     tick 500   764 blocks / 60,162 ms   78.7 ms per block
+  ;;     tick 100   317 blocks / 30,040 ms   94.8 ms per block
+  ;;     tick  25   337 blocks / 30,003 ms   89.0 ms per block
+  ;;
+  ;; **Twenty times fewer alarms, and the blocks got FASTER.** Not a wash — a
+  ;; win in both directions, which means 25 was not buying speed at all. The
+  ;; paragraph above this one already said why and did not draw the
+  ;; conclusion: a Durable Object serialises what arrives, so every tick is a
+  ;; window in which incoming votes wait, and forty windows a second is forty
+  ;; chances to be late. The clock was competing with the messages that
+  ;; actually drive the chain.
+  ;;
+  ;; Measured from OUTSIDE (block count over a wall-clock window). `block-ms`
+  ;; is sampled inside the tick and cannot see anything shorter than one,
+  ;; which is how a previous reading turned into "the instrument saturating".
+  ;;
+  ;; `TICK_MS` overrides it per deployment so a measurement run does not need
+  ;; a source edit — the three landed-once/failed-twice edits recorded above
+  ;; are what a constant that can only be changed by `perl -0pi` costs.
+  500)
+
+
+(defn tick-interval
+  "The alarm cadence this deployment runs at: `TICK_MS` when it is a sane
+  number, `tick-ms` otherwise.
+
+  Bounded on BOTH sides, and the lower bound is the point. 25 was the source
+  default when this chain was retired to stop a Durable Object bill, so a
+  typo'd `TICK_MS=1` must not be able to reinstate that by a factor of
+  twenty-five — a cost regression is silent, arrives as an invoice weeks
+  later, and is exactly what a floor is for. The upper bound keeps a
+  fat-fingered value from turning the watchdog off without saying so.
+
+  A blank, absent or unparseable value is the default rather than an error:
+  every deployment that predates this variable has one, and refusing to boot
+  over a missing tuning knob would be a worse failure than running at 500."
+  [env]
+  (let [raw (when env (some-> (gobj/get env "TICK_MS") str))
+        n (when (and raw (not= "" raw)) (js/parseInt raw 10))]
+    (if (and (number? n) (not (js/isNaN n)) (>= n 50) (<= n 60000))
+      n
+      tick-ms)))
 
 (def ^:const deliver-cap-ms
   "How long a tick will wait for its own messages to be delivered. **40.**
@@ -1778,7 +1850,7 @@
                        (.then (fn [_] (.restoreCheckpoint this)))
                        (.then (fn [_]
                                 (.setAlarm ^js (.-storage do-state)
-                                           (+ (js/Date.now) tick-ms))))))))))
+                                           (+ (js/Date.now) (tick-interval env)))))))))))
 
   ;; Adopt the newest checkpoint, if there is one that parses.
   ;;
@@ -2947,7 +3019,7 @@
                    ;; gets its grace period and an old one that has been
                    ;; talking to nobody for two minutes stops.
                    (when (< (- (js/Date.now) (max q b)) 120000)
-                     (.setAlarm ^js (.-storage do-state) (+ (js/Date.now) tick-ms))))))
+                     (.setAlarm ^js (.-storage do-state) (+ (js/Date.now) (tick-interval env)))))))
         ;; An alarm handler that rejects is retried with backoff and then
         ;; dropped, and a dropped alarm is a chain that stops for good. It
         ;; must not reject, ever.
@@ -3161,7 +3233,7 @@
     (-> (.getAlarm ^js (.-storage do-state))
         (.then (fn [a]
                  (when (or (nil? a) (< a (js/Date.now)))
-                   (.setAlarm ^js (.-storage do-state) (+ (js/Date.now) tick-ms)))))
+                   (.setAlarm ^js (.-storage do-state) (+ (js/Date.now) (tick-interval env))))))
         (.catch (fn [_] nil))))
 
   (alarmPending [this]
