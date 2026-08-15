@@ -26,7 +26,14 @@
         ;; root ADR-2800004800 §1d measured on THIS deployment at 1030/1031.
         io.github.kotoba-lang/inga
         {:git/url "https://github.com/kotoba-lang/inga.git"
-         :git/sha "7fb9f43467a541ac6b6577451d5a67da41b99291"}
+         :git/sha "e4974f757e95d627a0688f162801b922cccce092"}
+        ;; e4974f7: equivocation is per VIEW. The voting rule became one vote
+        ;; per view and the detector kept grouping by [witness height], so a
+        ;; view change — vote again at this height, different block, later
+        ;; view — was recorded and broadcast as a signed proof of equivocation
+        ;; against an honest replica. Measured on THIS deployment: after a
+        ;; reset `equivocators` climbed 0 -> 1 -> 4 as views turned over, and
+        ;; at four the chain stopped, each replica alone on its own tip.
         ;; The candle fold. The terminal draws from the same library, so
         ;; `/candles` and the chart cannot disagree about what a candle is.
         ;; The IPLD layer: canonical DAG-CBOR and CIDv1. Block identity is a
