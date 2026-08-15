@@ -320,6 +320,8 @@
             [torihiki.evm.interp :as evmi]
             [torihiki.keccak :as kc]
             [torihiki.thorchain :as tc]
+            [torihiki.chainlink :as clk]
+            [torihiki.oracle :as orc]
             [torihiki.api :as api]
             [torihiki.book :as bk]
             [torihiki.clearing :as cl]
@@ -430,7 +432,7 @@
   ;; What gave it away: `/reset` answered with `deleted` and `drained`, fields
   ;; that only the new build has. The behaviour said what the version number
   ;; would not.
-  "172")
+  "178")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -684,6 +686,20 @@
   neither was the cause. The tips were the cause, and it took splitting
   `:uncertified` from `:does-not-link` to be able to see it."
   :documented)
+
+(def ^:const px-retry-ms
+  "How long a price submission may be outstanding before it is signed again.
+  **30000.**
+
+  Nothing acknowledges a transaction. The gate that keeps one submission in
+  flight at a time is what stopped `bad-nonce 125`, and without a timeout it
+  is also what stops the feed forever the first time one is lost — measured as
+  `sent 1` against a chain that never left its listing price.
+
+  Thirty seconds is many blocks at the measured cadence, so a resend means the
+  first one is genuinely gone rather than merely slow. Resending a nonce is
+  safe: a nonce is single-use, so a duplicate either lands once or is refused."
+  30000)
 
 (def ^:const tick-ms
   "How often a replica wakes itself to make progress. **25.**
@@ -1556,7 +1572,21 @@
           unpriced (filter #(and (contains? (:markets ex) (:id %))
                                  (zero? (get-in ex [:oracle (:id %)] 0)))
                            markets)
-          work (concat (map (fn [m] [:list m]) missing)
+          ;; The oracle parameters, reconciled toward this build like a market
+          ;; spec is.
+          ;;
+          ;; They were genesis data and could only be corrected by rebuilding
+          ;; the chain — and `:max-age` WAS wrong: 60, against a `:ts` that
+          ;; advances 100 per block, which is a window of 0.6 blocks. The
+          ;; deployed venue could not publish a price at all until this could
+          ;; be changed in place.
+          params-stale? (let [on-chain (:oracle-params ex)]
+                          (and (seq on-chain)
+                               (not= (select-keys on-chain [:quorum :max-age])
+                                     (select-keys orc/default-params
+                                                  [:quorum :max-age]))))
+          work (concat (when params-stale? [[:params orc/default-params]])
+                       (map (fn [m] [:list m]) missing)
                        (map (fn [m] [:amend m]) stale)
                        (map (fn [m] [:amend-tiers m]) (filter :fee-tiers stale))
                        (map (fn [m] [:price m]) unpriced))]
@@ -1612,7 +1642,11 @@
                                      ;; markets opening at different prices
                                      ;; would imply one.
                                      :price {:tx :oracle :account bridge
-                                             :market (:id m) :price 1000})
+                                             :market (:id m) :price 1000}
+                                     :params {:tx :set-oracle-params
+                                              :account bridge
+                                              :quorum (:quorum m)
+                                              :max-age (:max-age m)})
                                 payload (tauth/signing-payload chain-id bridge nonce tx)]
                             (-> (js/crypto.subtle.sign #js {:name "Ed25519"}
                                                        (.-privateKey k)
@@ -3107,6 +3141,130 @@
                   (json {:ok false :error (str (or (.-message e) e))
                          :witness (.-witness this)} 500)))))
 
+  ;; The price feed.
+  ;;
+  ;; This venue had none. Nothing in either repository sent an
+  ;; `:oracle-submit`, so every market carried the one price the bridge gave it
+  ;; at listing and never moved — margin, funding and liquidation all computed
+  ;; against a constant. A book without a moving price is not a market.
+  ;;
+  ;; Prices come from Chainlink aggregators read over the SAME `eth_call` path
+  ;; the escrow watcher uses, because that path is measured and works. A
+  ;; private price API would be a host this venue has to trust and cannot show
+  ;; anyone; an aggregator's answer is on a public chain and every validator
+  ;; reads the same one.
+  ;;
+  ;; OFF unless `ETH_RPC` and `PRICE_FEEDS` are both set.
+  (watchPrices! [this]
+    (let [rpc (.-ETH_RPC env) feeds (.-PRICE_FEEDS env)
+          now (js/Date.now)]
+      (if-not (and rpc feeds (.-acct this)
+                   (>= now (or (.-nextPxScan this) 0)))
+        (js/Promise.resolve nil)
+        (do
+          (set! (.-nextPxScan this) (+ now 6000))
+          (let [specs (.feedSpecs this feeds)
+                call (fn [to]
+                       (-> (js/fetch rpc
+                                     #js {:method "POST"
+                                          :headers #js {"content-type" "application/json"}
+                                          :body (js/JSON.stringify
+                                                 (clj->js {:jsonrpc "2.0" :id 1
+                                                           :method "eth_call"
+                                                           :params [{:to to
+                                                                     :data clk/latest-round-data-selector}
+                                                                    "latest"]}))})
+                           (.then #(.json %))
+                           (.then (fn [j]
+                                    (when-let [e (aget j "error")]
+                                      (throw (js/Error. (str "rpc: " (aget e "message")))))
+                                    (aget j "result")))))]
+            (-> (js/Promise.all
+                 (clj->js (for [{:keys [market feed]} specs] (call feed))))
+                (.then
+                 (fn [^js answers]
+                   (let [by-market
+                         (into {}
+                               (map (fn [{:keys [market feed-decimals px-decimals]} a]
+                                      [market {:answer-hex a
+                                               :feed-decimals feed-decimals
+                                               :px-decimals px-decimals}])
+                                    specs (array-seq answers)))
+                         txs (clk/submissions (.-acct this) by-market)
+                         prices (into {} (map (juxt :market :price) txs))]
+                     (set! (.-pxRead this) (count txs))
+                     (set! (.-pxLast this) (clj->js prices))
+                     (if (or (empty? prices)
+                             ;; One submission outstanding at a time.
+                             ;;
+                             ;; Nonces are strictly sequential, so a publisher
+                             ;; that signs a new one every poll while the last
+                             ;; has not committed is signing numbers the chain
+                             ;; will refuse. Measured: `bad-nonce 125` against
+                             ;; a price that never landed once — the poll ran
+                             ;; every six seconds, the transaction needed a
+                             ;; block, and the counter walked away from the
+                             ;; chain and stayed there.
+                             ;;
+                             ;; So the previous one has to have landed before
+                             ;; the next is signed. A price feed that publishes
+                             ;; one block later is a price feed; one that fills
+                             ;; the mempool with numbers nobody can apply is
+                             ;; not.
+                             (let [ex (:machine-state (.-replica this))
+                                   expected (tauth/expected-nonce ex (.-acct this))]
+                               ;; ...unless it has been outstanding too long.
+                               ;;
+                               ;; Nothing acknowledges a submission. Without a
+                               ;; retry, one lost transaction stops the price
+                               ;; feed permanently: `expected` never passes
+                               ;; `pxNonce`, so nothing is ever signed again.
+                               ;; Measured: `sent 1` and a chain that stayed at
+                               ;; its listing price for as long as it was
+                               ;; watched. The same lesson the vote path
+                               ;; already carries in its own words.
+                               (and (.-pxNonce this)
+                                    (<= expected (.-pxNonce this))
+                                    (< now (+ (or (.-pxSentAt this) 0)
+                                              px-retry-ms)))))
+                       nil
+                       ;; ONE transaction, one nonce, however many markets.
+                       ;; See `torihiki.state/:oracle-submit-batch`.
+                       (let [ex (:machine-state (.-replica this))]
+                         (set! (.-pxNonce this)
+                               (tauth/expected-nonce ex (.-acct this)))
+                         (set! (.-pxSent this) (inc (or (.-pxSent this) 0)))
+                         (set! (.-pxSentAt this) (js/Date.now))
+                         (.signAndSubmit! this {:tx :oracle-submit-batch
+                                                :prices prices}))))))
+                (.catch (fn [e]
+                          ;; A failed poll is a failed poll. It must not become
+                          ;; a price.
+                          (set! (.-pxError this) (str (or (.-message e) e)))
+                          nil))))))))
+
+  ;; `PRICE_FEEDS` as the reader takes it.
+  ;;
+  ;;   1:0xF403...E88c:8:2,2:0x5f4e...8419:8:2
+  ;;
+  ;; market, aggregator address, the FEED's decimals, and this venue's. All
+  ;; four are needed and none can be guessed: the aggregator's precision is a
+  ;; property of the feed (8 for every USD pair today, but a feed that changed
+  ;; it would otherwise move every price by a factor of a hundred with nothing
+  ;; saying so), and the venue's decides where the decimal point lands in a
+  ;; market's own price ladder.
+  (feedSpecs [_ s]
+    (vec (for [e (.split (or s "") ",")
+               :let [[m addr fd pd] (.split (.trim e) ":")
+                     market (js/parseInt m 10)
+                     feed-decimals (js/parseInt fd 10)
+                     px-decimals (js/parseInt pd 10)]
+               :when (and addr (not (js/isNaN market))
+                          (not (js/isNaN feed-decimals))
+                          (not (js/isNaN px-decimals)))]
+           {:market market :feed addr
+            :feed-decimals feed-decimals :px-decimals px-decimals})))
+
   ;; The escrow, watched on Ethereum.
   ;;
   ;; THORChain's own hosts do not answer a Worker — five measured, four
@@ -3211,7 +3369,7 @@
                                       (+ (or (.-ethLogs this) 0) (count ls)))
                                 (set! (.-ethSeen this)
                                       (+ (or (.-ethSeen this) 0) (count txs)))
-                                (reduce (fn [p tx] (.then p (fn [_] (.attest! this tx))))
+                                (reduce (fn [p tx] (.then p (fn [_] (.signAndSubmit! this tx))))
                                         (js/Promise.resolve nil) txs)))))))))
                 (.catch (fn [e]
                           ;; A failed poll is a failed poll. It is not evidence
@@ -3239,7 +3397,11 @@
                    :when (and addr nm (integer? d) (not (js/isNaN d)))]
                [(.toLowerCase addr) {:asset nm :decimals d}])))
 
-  ;; One attestation, signed as this validator's own account.
+  ;; One transaction, signed as this validator's own account.
+  ;;
+  ;; Used by the escrow attestation and by the price feed. The rule it
+  ;; encodes — the nonce — belongs to the account, not to what the account is
+  ;; saying, so there is one of these and not one per caller.
   ;;
   ;; ## The nonce is not a counter
   ;;
@@ -3258,7 +3420,7 @@
   ;;
   ;; The bound is what keeps the second failure recoverable: past it we stop
   ;; signing rather than issue numbers that can never be accepted.
-  (attest! [this tx]
+  (signAndSubmit! [this tx]
     (let [acct (.-acct this)
           ex (:machine-state (.-replica this))
           expected (tauth/expected-nonce ex acct)
@@ -3367,6 +3529,7 @@
       ;; rather than behind the admin route it shares its evidence with.
       (.maybeAdopt! this)
       (.watchEth! this)
+      (.watchPrices! this)
       ;; Why this replica did NOT propose.
       ;;
       ;; Every counter here says what happened. A stall is the absence of
@@ -4054,6 +4217,44 @@
                ;; Worker — a paid node, an allowlisted key, or a proxy we run —
                ;; or the validators need ordinary internet egress, which is
                ;; the ordinary-host deployment.
+               ;; What the price feed is actually doing.
+               ;;
+               ;; `read` alone cannot tell "the aggregators are quiet" from
+               ;; "every answer is being dropped", and `on-chain` is the only
+               ;; thing that says whether what this validator published ever
+               ;; became a price — a submission that never reaches quorum
+               ;; leaves the market on its old number with nothing complaining.
+               "/prices"
+               (let [ex (:machine-state (.-replica this))]
+                 (json {:ok true
+                        :on (boolean (and (.-ETH_RPC env) (.-PRICE_FEEDS env)))
+                        :feeds (.feedSpecs this (.-PRICE_FEEDS env))
+                        :account (.-acct this)
+                        :read (or (.-pxRead this) 0)
+                        :last (js->clj (or (.-pxLast this) #js {}))
+                        :error (.-pxError this)
+                        :publisher? (contains? (set (:oracle-publishers ex))
+                                               (.-acct this))
+                        :quorum (:quorum (:oracle-params ex))
+                        :max-age (:max-age (:oracle-params ex))
+                        :sent (or (.-pxSent this) 0)
+                        :nonce-gate {:px-nonce (.-pxNonce this)
+                                     :expected (when (.-acct this)
+                                                 (tauth/expected-nonce ex (.-acct this)))}
+                        ;; What the CHAIN has recorded, per market: who
+                        ;; submitted and at what ts. `sent` climbing while
+                        ;; this stays empty is a submission that never landed;
+                        ;; this filling while `on-chain` stays put is a quorum
+                        ;; that is not being reached.
+                        :submissions (into {} (for [[m subs] (:oracle-submissions ex)]
+                                                [m (into {} (for [[a v] subs]
+                                                              [a (:ts v)]))]))
+                        :ts (:ts ex)
+                        :publishers (vec (sort (:oracle-publishers ex)))
+                        :on-chain (:oracle ex)
+                        :stale (:oracle-stale ex)}
+                       200))
+
                ;; What the escrow watcher is actually doing.
                ;;
                ;; A watcher with no observable is the failure this session has
@@ -4143,7 +4344,7 @@
                                    (set (.split (or (.-THOR_VAULT env) "") ","))
                                    tip ls
                                    (.assetRegistry this (.-THOR_ASSETS env)))]
-                          (-> (reduce (fn [p tx] (.then p (fn [_] (.attest! this tx))))
+                          (-> (reduce (fn [p tx] (.then p (fn [_] (.signAndSubmit! this tx))))
                                       (js/Promise.resolve nil) txs)
                               (.then (fn [_]
                                        (json {:ok true :attested (vec txs)

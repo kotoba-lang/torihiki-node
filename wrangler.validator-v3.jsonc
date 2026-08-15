@@ -71,6 +71,21 @@
     // Adding a line here is a decision about what counts as money. Anything
     // absent is dropped, which is what stops a token minted this morning from
     // being credited at face value.
-    "THOR_ASSETS": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48:ETH.USDC:6"
+    "THOR_ASSETS": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48:ETH.USDC:6",
+
+    // ── the price feed ────────────────────────────────────────────────────
+    //
+    // market : aggregator : the FEED's decimals : this venue's decimals
+    //
+    // Chainlink mainnet aggregators, read over the same eth_call path the
+    // escrow watcher uses. Verified live before being written here:
+    // BTC/USD 62539.00 and ETH/USD 1865.91766498, both with an updatedAt.
+    //
+    // The venue's 2 decimals put BTC at 6253900 and ETH at 186591 — well
+    // inside the engine's i53 domain, and far from the constant 1000 every
+    // market has carried since it was listed. That jump is safe only because
+    // open interest is zero; on a venue with positions it would be a
+    // repricing, not a configuration change.
+    "PRICE_FEEDS": "1:0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c:8:2,2:0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419:8:2"
   }
 }
