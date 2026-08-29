@@ -1,7 +1,7 @@
 (ns deploy-e2e
   (:require ["node:crypto" :as nc]
-            ["@noble/hashes/sha2.js" :refer [sha256]]
             [promesa.core :as p]
+            [torihiki.address :as addr]
             [torihiki.auth :as auth]
             [torihiki.keccak :as kc]))
 
@@ -16,13 +16,10 @@
   ;; and reads as a key problem.
   (or (some-> js/process .-env .-CHAIN_ID) "torihiki-standalone-1"))
 (defn b64 [b] (.toString b "base64"))
-(defn derive-account [pub]
-  (let [d (sha256 (js/Buffer.from pub "base64"))]
-    (+ 100000 (mod (reduce (fn [a i] (+ (* a 256) (aget d i))) 0 (range 6)) 35184372088832))))
 
 (def kp (nc/generateKeyPairSync "ed25519"))
 (def pub (b64 (.export (.-publicKey kp) #js {:format "der" :type "spki"})))
-(def acct (derive-account pub))
+(def acct (addr/derive pub))
 
 ;; PUSH1 42, PUSH1 0, MSTORE, PUSH1 32, PUSH1 0, RETURN
 (def code "602a60005260206000f3")

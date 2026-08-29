@@ -55,13 +55,14 @@
             ["node:crypto" :as nc]
             ["node:fs" :as fs]
             ["node:http" :as http]
-            ["@noble/hashes/sha2.js" :refer [sha256]]
             [clojure.string :as str]
+            [kotoba.bytes.sha256 :as sha]
             [inga.consensus :as c]
             [inga.net.server :as srv]
             [inga.net.ws :as nws]
             [inga.replica :as r]
             [inga.wire :as wire]
+            [torihiki.address :as addr]
             [torihiki.api :as api]
             [torihiki.auth :as auth]
             [torihiki.clearing :as cl]
@@ -122,8 +123,7 @@
   around. A chain whose keys are derivable is a devnet and says so."
   [w]
   (or (env (str "SEED_" (str/upper-case w)) nil)
-      (.toString (js/Buffer.from (sha256 (js/Buffer.from (str chain-id "/" w) "utf8")))
-                 "hex")))
+      (sha/sha256-hex (str chain-id "/" w))))
 
 (def keys-of (into {} (for [w witnesses] [w (key-from-seed (seed-for w))])))
 
@@ -145,15 +145,6 @@
     (catch :default _ false)))
 
 ;; ── the exchange ────────────────────────────────────────────────────────────
-
-(defn derive-account
-  "The only account id a public key may claim. Same rule as everywhere else in
-  this workspace: 45 bits of SHA-256 above the reserved range, refused rather
-  than silent on collision."
-  [pubkey]
-  (let [d (sha256 (js/Buffer.from pubkey "base64"))]
-    (+ 100000 (mod (reduce (fn [acc i] (+ (* acc 256) (aget d i))) 0 (range 6))
-                   35184372088832))))
 
 (def markets
   [(assoc (cl/market {:id 1 :max-leverage 40 :tick 10 :lot 1})
@@ -201,7 +192,7 @@
                                    :ts (:inga.block/ts block)
                                    :txs (mapv decode-tx (:inga.block/proposals block))}
                                {:chain-id chain-id :verify-fn tx-verify
-                                :derive-account derive-account}))
+                                :derive-account addr/derive}))
    :root-fn st/state-root})
 
 ;; ── the node ────────────────────────────────────────────────────────────────
@@ -221,10 +212,7 @@
                     ;; replicas sat at height 7 with `failures 0` and every
                     ;; peer dropped: nothing had failed to CONNECT, everything
                     ;; had failed to parse.
-                    :hash-fn (fn [b]
-                               (.toString (js/Buffer.from
-                                           (sha256 (js/Buffer.from (c/canonical-block b) "utf8")))
-                                          "hex"))
+                    :hash-fn (fn [b] (sha/sha256-hex (c/canonical-block b)))
                     :chain-id chain-id
                     :sign-fn (sign-as me)
                     :verify-fn verify-fn
@@ -709,7 +697,7 @@
 (defonce watcher-nonce (atom 0))
 
 (defn- attest! [tx]
-  (let [acct (derive-account (pub-of me))
+  (let [acct (addr/derive (pub-of me))
         nonce (swap! watcher-nonce inc)
         tx (assoc tx :account acct)
         payload (auth/signing-payload chain-id acct nonce tx)
@@ -788,13 +776,13 @@
                         (-> (js/fetch (str base (env "THOR_OBSERVE" "/UNSET")))
                             (.then #(.json %))
                             (.then (fn [obs]
-                                     (let [os (js->clj obs)]
+                                       (let [os (js->clj obs)]
                                        (doseq [tx (tc/deposits-in
-                                                   (derive-account (pub-of me))
+                                                   (addr/derive (pub-of me))
                                                    @vaults tip os)]
                                          (attest! tx))
                                        (doseq [tx (tc/payouts-in
-                                                   (derive-account (pub-of me))
+                                                   (addr/derive (pub-of me))
                                                    tip os)]
                                          (attest! tx)))))))))
              (.catch (fn [_]
