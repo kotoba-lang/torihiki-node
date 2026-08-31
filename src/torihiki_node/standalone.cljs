@@ -117,21 +117,65 @@
         sk (nc/createPrivateKey #js {:key der :format "der" :type "pkcs8"})]
     {:private sk :public (nc/createPublicKey sk)}))
 
+(defn- configured-seed [w] (env (str "SEED_" (str/upper-case w)) nil))
+(defn- configured-pub [w] (env (str "PUB_" (str/upper-case w)) nil))
+
 (defn- seed-for
   "A witness's seed. From `SEED_<w>` when it is set — that is how a real set is
   configured, one secret per host — and otherwise derived from the chain id
   and the name, which makes a local run reproducible without secrets lying
   around. A chain whose keys are derivable is a devnet and says so."
   [w]
-  (or (env (str "SEED_" (str/upper-case w)) nil)
-      (sha/sha256-hex (str chain-id "/" w))))
+  (or (configured-seed w) (sha/sha256-hex (str chain-id "/" w))))
 
 (def keys-of (into {} (for [w witnesses] [w (key-from-seed (seed-for w))])))
 
 (defn- b64 [buf] (.toString buf "base64"))
 
-(defn- pub-of [w]
+(defn- derived-pub [w]
   (b64 (.export (:public (get keys-of w)) #js {:format "der" :type "spki"})))
+
+(defn- pub-of
+  "A witness's public key: `PUB_<w>` when the genesis set names it, otherwise
+  derived from the seed.
+
+  **Without `PUB_<w>` this replica cannot run with per-host secrets at all.**
+  Verification goes through here, and a derived public key is the public half
+  of a seed only this process can compute — so a node holding its own real
+  `SEED_W1` and deriving w2's key would reject every message w2 sends. The
+  seed override existed and the matching public half did not, which made
+  `SEED_<w>` a switch that broke the chain rather than one that secured it."
+  [w]
+  (or (configured-pub w) (derived-pub w)))
+
+(def key-provenance
+  "Where every key in this validator set came from, and what that means.
+
+  ADR-2608040600 records the day this mattered: the deployed validators'
+  private keys were computable from the public chain id, the derivation was
+  confirmed against all four live public keys, **the BFT guarantee was zero,
+  and the terminal displayed `4 replicas, agreeing`.**
+
+  `seed-for`'s docstring already said a chain whose keys are derivable is a
+  devnet and says so. Nothing said so. This is that sentence, made into a
+  value the node reports.
+
+  `:bft` is `:none` unless EVERY key is configured, and that is the whole
+  point rather than pedantry: one derived peer key is a peer anybody can
+  impersonate, and a quorum that includes an impersonated witness is not a
+  quorum. A set that is three-quarters real is not three-quarters safe."
+  (let [mine (if (configured-seed me) :configured :derived)
+        peers (into {} (for [w witnesses]
+                         [w (if (configured-pub w) :configured :derived)]))
+        all? (and (= :configured mine) (every? #(= :configured %) (vals peers)))]
+    {:mine mine
+     :peers peers
+     :bft (if all? :real :none)
+     :note (if all?
+             "every key is configured; forging a witness needs its secret"
+             (str "DEVNET — at least one key is derivable from the public chain id, "
+                  "so any observer can sign as that witness. This is not a "
+                  "Byzantine-fault-tolerant chain, whatever the replica count says."))}))
 
 (defn- sign-as [w]
   (fn [payload]
@@ -451,6 +495,11 @@
                       :state-root (st/state-root ex)
                       :pending (count (:pending s))
                       :block-store (store/status block-publisher)
+                      ;; Whether this set is Byzantine-fault-tolerant at all.
+                      ;; ADR-2608040600: four validators whose keys were
+                      ;; computable from the public chain id, displayed as
+                      ;; "4 replicas, agreeing".
+                      :keys key-provenance
                       :msgs-in (:msgs-in @stats)
                       :msgs-out (:msgs-out @stats)
                       :inbound (count @registry)

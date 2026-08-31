@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  One validator, resident, on a murakumo fleet mac-mini.
+
+  `deploy/torihiki@.service` is systemd and the fleet is macOS, so that unit
+  has never been runnable on the hosts it was written for. This is the same
+  intent for the machines that exist.
+
+  Substitutions: __WITNESS__ __HOME__ __CHAIN_ID__ __WITNESSES__ __PEERS__
+                 __LISTEN_PORT__ __HTTP_PORT__ __PUBS__
+
+  KeepAlive rather than RunAtLoad alone: the thing this protects against is a
+  replica that died, and a replica that comes back has a chain log and a
+  checkpoint to come back WITH. Coming back fast enough to matter is the whole
+  reason those exist.
+-->
+<plist version="1.0"><dict>
+  <key>Label</key><string>cloud.murakumo.torihiki.__WITNESS__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string><string>-lc</string>
+    <string>exec "__HOME__/.torihiki/run.sh"</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>WorkingDirectory</key><string>__HOME__/.torihiki</string>
+  <key>StandardOutPath</key><string>__HOME__/.torihiki/out.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/.torihiki/err.log</string>
+  <key>ProcessType</key><string>Background</string>
+  <key>Nice</key><integer>5</integer>
+  <key>EnvironmentVariables</key><dict>
+    <key>W</key><string>__WITNESS__</string>
+    <key>CHAIN_ID</key><string>__CHAIN_ID__</string>
+    <key>WITNESSES</key><string>__WITNESSES__</string>
+    <key>PEERS</key><string>__PEERS__</string>
+    <key>LISTEN_PORT</key><string>__LISTEN_PORT__</string>
+    <key>HTTP_PORT</key><string>__HTTP_PORT__</string>
+    <key>DATA_DIR</key><string>__HOME__/.torihiki/data</string>
+    <key>TICK_MS</key><string>50</string>
+__PUBS__
+  </dict>
+</dict></plist>
