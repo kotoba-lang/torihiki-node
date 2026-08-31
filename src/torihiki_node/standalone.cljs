@@ -53,6 +53,7 @@
 (ns torihiki-node.standalone
   (:require ["ws" :as ws]
             ["node:crypto" :as nc]
+            [torihiki-node.store :as store]
             ["node:fs" :as fs]
             ["node:http" :as http]
             [clojure.string :as str]
@@ -212,7 +213,16 @@
                     ;; replicas sat at height 7 with `failures 0` and every
                     ;; peer dropped: nothing had failed to CONNECT, everything
                     ;; had failed to parse.
-                    :hash-fn (fn [b] (sha/sha256-hex (c/canonical-block b)))
+                    ;; A CIDv1 dag-cbor, the same identity the Worker
+                    ;; deployment uses. It was a bare SHA-256 hex over
+                    ;; `canonical-block`, which was a correct hash and not an
+                    ;; ADDRESS: a hex digest cannot be a tag-42 link, so every
+                    ;; block this replica produced was unpublishable as a DAG
+                    ;; and the two deployments disagreed about what a block is
+                    ;; called. Aligning them costs a genesis restart here and
+                    ;; nothing else, because no standalone chain is deployed;
+                    ;; leaving them apart costs a migration later.
+                    :hash-fn store/block-cid
                     :chain-id chain-id
                     :sign-fn (sign-as me)
                     :verify-fn verify-fn
@@ -325,7 +335,7 @@
 ;; Forward, because the HTTP surface answers with things the log section
 ;; defines and the log section needs the replica the HTTP section serves.
 ;; Declaring is smaller than moving either one.
-(declare newest-checkpoint)
+(declare newest-checkpoint block-publisher)
 
 (defn- json-response [res code body]
   (.writeHead res code #js {"Content-Type" "application/json"
@@ -440,6 +450,7 @@
                       :view (:view (:pm s))
                       :state-root (st/state-root ex)
                       :pending (count (:pending s))
+                      :block-store (store/status block-publisher)
                       :msgs-in (:msgs-in @stats)
                       :msgs-out (:msgs-out @stats)
                       :inbound (count @registry)
@@ -536,6 +547,21 @@
 
 (defonce persisted (atom 0))
 
+(defonce block-publisher
+  ;; Where a CID resolves, for anyone who is not this process.
+  ;;
+  ;; The log below is local and always written; this is the copy that makes a
+  ;; block's identity mean something outside this machine. It is deliberately
+  ;; NOT a local directory and NOT a Durable Object: superproject
+  ;; ADR-2608039000's test is to delete the store and ask whether the data is
+  ;; gone, and both of those fail it. Unconfigured is therefore a real state
+  ;; that `/head` reports by name -- not a fallback that quietly writes the
+  ;; blocks somewhere that looks like replication and is not.
+  (let [cfg (store/config-from-env #(env % nil))]
+    (if-let [ok (:ok cfg)]
+      (store/publisher (store/block-store ok) nil)
+      (store/publisher nil (:unconfigured cfg)))))
+
 (defn- persist!
   "Append every block adopted since the last write.
 
@@ -560,7 +586,18 @@
                                 (js/JSON.stringify
                                  (clj->js (wire/encode {:type :proposal :block b})))))
               "\n"))
-        (reset! persisted (count chain))))))
+        (reset! persisted (count chain))
+        ;; After the append, never inside it. The append is synchronous because
+        ;; ordering is the whole point, and publication is a network call --
+        ;; putting it on that path would mean either blocking the tick or
+        ;; giving the log a queue it does not need.
+        ;;
+        ;; The Promise is not awaited and it never rejects: `publish!` counts
+        ;; its own failures and keeps the last message, so a store that is
+        ;; dropping every block shows up in `/head` as a rising `failed` rather
+        ;; than as silence.
+        (doseq [b new]
+          (store/publish! block-publisher (store/block-cid b) (store/block-bytes b)))))))
 
 (def ^:const checkpoint-every
   "How many blocks between checkpoints. **500.**

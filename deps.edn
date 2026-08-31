@@ -77,4 +77,29 @@
          :git/sha "96f6daf909bd42ecf2045b97192b96f10aef670f"}
         io.github.kotoba-lang/bytes
         {:git/url "https://github.com/kotoba-lang/bytes.git"
-         :git/sha "5f977dd3e8ca73185488302841ade390e1979540"}}}
+         :git/sha "5f977dd3e8ca73185488302841ade390e1979540"}
+        ;; The storage contract `torihiki-node.store` configures, so the chain's
+        ;; blocks are addressable by CID by something that is not this machine.
+        ;;
+        ;; **143b8da9 and not f41e7bd3, which is what `inga` pins.** These are
+        ;; protocols, and `satisfies?` compares the protocol OBJECT: two pins in
+        ;; one bundle give two `IBlockStore`s, and a store built against one is
+        ;; refused by the other with a type error about a value that visibly
+        ;; implements the protocol it is being refused for.
+        ;;
+        ;; So the graph must resolve to one, and it does: f41e7bd3 -> 143b8da9
+        ;; is ahead 15 / behind 0, a straight descendant, and 143b8da9 is what
+        ;; `kotobase-storage-s3` declares. Pinning it here says out loud what
+        ;; tools.deps would pick anyway. When inga's pin moves, this moves with
+        ;; it -- they are one version, not two.
+        io.github.kotoba-lang/kotobase-storage
+        {:git/url "https://github.com/kotoba-lang/kotobase-storage.git"
+         :git/sha "143b8da947a15a10982268ca40fff5ac20827f96"}
+        ;; The provider the blocks actually go to: any S3-compatible endpoint,
+        ;; which is B2, R2, MinIO or AWS. It is here rather than a block store
+        ;; written in this repo because it already exists, already stores blocks
+        ;; under `blocks/<cid>`, and already has the ranged reads a packed store
+        ;; would need later.
+        io.github.kotoba-lang/kotobase-storage-s3
+        {:git/url "https://github.com/kotoba-lang/kotobase-storage-s3.git"
+         :git/sha "a26ad495c1327056b3b168e1922d245fe9a35927"}}}

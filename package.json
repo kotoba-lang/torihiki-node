@@ -11,6 +11,7 @@
     "wrangler": "^4.0.0"
   },
   "dependencies": {
-    "ws": "^8.21.3"
+    "ws": "^8.21.3",
+    "@noble/hashes": "^1.4.0"
   }
 }
