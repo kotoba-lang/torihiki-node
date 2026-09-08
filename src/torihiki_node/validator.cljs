@@ -302,7 +302,7 @@
   - **`setAlarm` was fired and not returned.** A Durable Object may be put to
     sleep as soon as the handler resolves, so a write still in flight is a
     tick that never happens."
-  (:require [clojure.set :as set]
+  (:require [kotoba.lang.text] [clojure.set :as set]
             [goog.object :as gobj]
             [inga.attest :as att]
             [inga.consensus :as c]
@@ -3380,7 +3380,7 @@
                                          ex (:machine-state (.-replica this))
                                          id (:id j)
                                          to (some-> (:to (first (:params j)))
-                                                    clojure.string/lower-case)]
+                                                    kotoba.lang.text/lower)]
                                      (json
                                       (case (:method j)
                                         "eth_chainId" {:jsonrpc "2.0" :id id :result "0x539"}

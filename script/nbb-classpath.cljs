@@ -31,7 +31,7 @@
 ;; short in a way that still loaded, it would run a subset and report a pass.
 (ns nbb-classpath
   (:require [clojure.edn :as edn]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [nbb.core :refer [*file*]]
             ["fs" :as fs]
             ["path" :as path]
