@@ -56,7 +56,7 @@
             [torihiki-node.store :as store]
             ["node:fs" :as fs]
             ["node:http" :as http]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotoba.bytes.sha256 :as sha]
             [inga.consensus :as c]
             [inga.net.server :as srv]
@@ -117,8 +117,8 @@
         sk (nc/createPrivateKey #js {:key der :format "der" :type "pkcs8"})]
     {:private sk :public (nc/createPublicKey sk)}))
 
-(defn- configured-seed [w] (env (str "SEED_" (str/upper-case w)) nil))
-(defn- configured-pub [w] (env (str "PUB_" (str/upper-case w)) nil))
+(defn- configured-seed [w] (env (str "SEED_" (str/upper w)) nil))
+(defn- configured-pub [w] (env (str "PUB_" (str/upper w)) nil))
 
 (defn- seed-for
   "A witness's seed. From `SEED_<w>` when it is set — that is how a real set is
@@ -436,11 +436,11 @@
       "eth_blockNumber" (rpc-result id (hex-quantity (r/height s)))
 
       "eth_getCode"
-      (rpc-result id (str "0x" (get-in ex [:evm (some-> (first params) str/lower-case) :code] "")))
+      (rpc-result id (str "0x" (get-in ex [:evm (some-> (first params) str/lower) :code] "")))
 
       "eth_call"
       (let [{:keys [to data]} (first params)
-            to (some-> to str/lower-case)]
+            to (some-> to str/lower)]
         (if-let [out (or (evm/call ex to data)
                          ;; Deployed bytecode, from CHAIN state — `:evm` is in
                          ;; the state root, so two replicas answering this
