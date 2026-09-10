@@ -434,7 +434,7 @@
   ;; **149.** inga e4974f7 — equivocation を view ごとに判定する。
   ;; 148 で立ち上げた chain は数千 block で止まり、止まり方は equivocators が
   ;; 0 → 4 になることと例外なく相関していた。
-  "149")
+  "150")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
