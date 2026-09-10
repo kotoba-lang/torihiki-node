@@ -31,7 +31,24 @@
         ;; root ADR-2800004800 §1d measured on THIS deployment at 1030/1031.
         io.github.kotoba-lang/inga
         {:git/url "https://github.com/kotoba-lang/inga.git"
-         :git/sha "e4974f757e95d627a0688f162801b922cccce092"}
+         :git/sha "d8e59528085a1e3d148d9d8252218eba0c469d54"}
+        ;; d8e5952 (2026-09-10 main) brings d128b50, which is the reason this
+        ;; deployment stopped. Measured 2026-09-10, twenty-six days in: all four
+        ;; witnesses spinning at view 1,496,141 with `no certificate for the
+        ;; tip`, split 2-2 at height 5616, w1/w4 committed 5614 and w2/w3 5633.
+        ;; `inga.sync` has had the rewind path for a fork below the tip all
+        ;; along and it was never reached, because a replica asked from
+        ;; `tip + 1` and `sync-step` consults `conflicts-with-chain?` only for
+        ;; a segment starting at or below the tip. w1 asked from 5617, was
+        ;; answered 5617-5634, and refused every one `:does-not-link` for
+        ;; roughly 900,000 views.
+        ;;
+        ;; `inga.replica/sync-ask-from` fixed that on 2026-08-31 -- after a
+        ;; linking refusal, ask from `committed + 1` -- and its docstring names
+        ;; THIS chain and THIS height. The fix has been on inga's main for ten
+        ;; days and never reached the thing it was written for, because the pin
+        ;; here did not move. A fix that is landed and not pinned is a fix that
+        ;; has not been delivered.
         ;; e4974f7: equivocation is per VIEW. The voting rule became one vote
         ;; per view and the detector kept grouping by [witness height], so a
         ;; view change — vote again at this height, different block, later
