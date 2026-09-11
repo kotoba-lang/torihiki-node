@@ -1,7 +1,7 @@
 ;; The validator as an ordinary process.
 ;;
 ;;   W=w1 PEERS=w1@ws://127.0.0.1:19401,w2@ws://127.0.0.1:19402,... \
-;;   HTTP_PORT=8801 nbb -cp "src:<deps>" -m torihiki-node.standalone
+;;   HTTP_PORT=8801 kbb --backend sci -cp "src:<deps>" -m torihiki-node.standalone
 ;;
 ;; ## Why this exists, in one measurement
 ;;

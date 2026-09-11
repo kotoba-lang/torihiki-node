@@ -1,6 +1,6 @@
 ;; Every namespace in this node, read and required.
 ;;
-;;   npx nbb -cp "src:$(clojure -Spath)" script/loads.cljk
+;;   kbb --backend sci -cp "src:$(kbb -Spath)" script/loads.cljk
 ;;
 ;; ## Why here and not only in `torihiki`
 ;;
@@ -19,7 +19,7 @@
 ;; `worker.cljs` and `validator.cljs` are Cloudflare Workers: they close over
 ;; `env` and Durable Object globals that do not exist under nbb, so requiring
 ;; them here would fail for a reason that is not the one this checks for.
-;; `shadow-cljs release` is their reader — the point is that it must be RUN,
+;; `amu compile --target wasm32-browser` is their reader — the point is that it must be RUN,
 ;; and `deploy/equivalence-check.sh` plus this file together mean neither half
 ;; ships unread.
 (ns loads

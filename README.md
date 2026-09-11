@@ -69,5 +69,5 @@ running the previous build. **Check `/head` before believing a deploy.**
 npm install
 npm run build
 npx wrangler deploy
-nbb --classpath <path-to>/torihiki/src client.cljk <url>   # signing client
+kbb --backend sci --classpath <path-to>/torihiki/src client.cljk <url>   # signing client
 ```

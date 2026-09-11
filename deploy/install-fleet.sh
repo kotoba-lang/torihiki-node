@@ -35,7 +35,7 @@ LABEL="cloud.murakumo.torihiki.$W"
 UW=$(echo "$W" | tr a-z A-Z)
 PORT_L="${LISTEN_PORT:-19401}"; PORT_H="${HTTP_PORT:-8801}"
 
-test -d "$REPO/.nbb-deps" || { echo "no .nbb-deps -- run: nbb script/nbb-classpath.cljk" >&2; exit 2; }
+test -d "$REPO/.nbb-deps" || { echo "no .nbb-deps -- run: kbb --backend sci script/nbb-classpath.cljk" >&2; exit 2; }
 
 echo "== $HOST: staging source and pinned dependencies"
 ssh "$HOST" 'mkdir -p ~/.torihiki/data ~/Library/LaunchAgents'
@@ -68,7 +68,7 @@ cd "\$HOME/.torihiki"
 CP="src"
 for d in .nbb-deps/*/src; do CP="\$CP:\$d"; done
 export SEED_$UW="\$(cat "\$HOME/.torihiki/seed")"
-exec npx --yes nbb --classpath "\$CP" -m torihiki-node.standalone
+exec npx --yes kbb --backend sci --classpath "\$CP" -m torihiki-node.standalone
 RUN
 ssh "$HOST" 'chmod +x ~/.torihiki/run.sh'
 

@@ -19,7 +19,7 @@ WorkingDirectory=/opt/torihiki
 EnvironmentFile=/etc/torihiki/common.env
 EnvironmentFile=/etc/torihiki/%i.env
 Environment=W=%i
-ExecStart=/usr/bin/npx nbb -cp src:%h/.torihiki/cp -m torihiki-node.standalone
+ExecStart=/usr/bin/npx kbb --backend sci -cp src:%h/.torihiki/cp -m torihiki-node.standalone
 Restart=always
 RestartSec=2
 # The log and the checkpoints. Losing them means a replica that rejoins from

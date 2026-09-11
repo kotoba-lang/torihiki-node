@@ -45,7 +45,7 @@ apt install nodejs npm
 npm i -g nbb
 useradd -r -s /usr/sbin/nologin torihiki
 git clone https://github.com/kotoba-lang/torihiki-node /opt/torihiki
-cd /opt/torihiki && npm ci && clojure -Spath > ~torihiki/.torihiki/cp
+cd /opt/torihiki && npm ci && kbb -Spath > ~torihiki/.torihiki/cp
 
 install -d -m 0750 -o torihiki /etc/torihiki
 install -m 0640 -o torihiki deploy/common.env.example /etc/torihiki/common.env

@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "shadow-cljs release worker",
+    "build": "amu compile --target wasm32-browser worker",
     "deploy": "npm run build && wrangler deploy"
   },
   "devDependencies": {
