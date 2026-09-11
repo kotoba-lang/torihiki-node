@@ -434,7 +434,7 @@
   ;; **149.** inga e4974f7 — equivocation を view ごとに判定する。
   ;; 148 で立ち上げた chain は数千 block で止まり、止まり方は equivocators が
   ;; 0 → 4 になることと例外なく相関していた。
-  "151")
+  "152")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -4105,11 +4105,44 @@
                "/equivocations"
                (let [s (.-replica this)
                      v (:verify-fn s)
+                     ;; The verifier `inga.stake/verify-equivocation-evidence`
+                     ;; takes is `(fn [vote] boolean)`. The replica's
+                     ;; `:verify-fn` is `(fn [witness payload sig] boolean)`.
+                     ;; The first version of this route handed it the second
+                     ;; where the first was wanted, so every record was
+                     ;; checked as `(verify vote-map undefined undefined)`,
+                     ;; came back false, and `/equivocations` reported
+                     ;; `held 1 verified 0` on all four replicas. That was
+                     ;; read -- by me, in ADR-2609111000 -- as "detection
+                     ;; recorded what verification rejects", named the
+                     ;; densest clue to the halt, and given as a reason not
+                     ;; to reset. It was the instrument. CLAUDE.md's sixth
+                     ;; question, verbatim: a check that rejects must be
+                     ;; shown to reject for the reason it names.
+                     ;;
+                     ;; inga has exactly this adapter, `replica/vote-verifier`,
+                     ;; and uses it to verify evidence arriving over the wire
+                     ;; before recording it. It is private, so the five lines
+                     ;; are repeated here rather than the pin bumped and the
+                     ;; chain redeployed for them -- ADR-2609111000 D1 stops
+                     ;; deploys to this chain because each one moves the
+                     ;; pacemaker view backwards. When that lifts, make the
+                     ;; inga one public and delete this.
+                     vote-ok? (fn [vote]
+                                (or (nil? v)
+                                    (boolean
+                                     (v (:inga.vote/witness vote)
+                                        (att/vote-payload (:chain-id s)
+                                                          (or (:inga.vote/view vote) 0)
+                                                          (:inga.vote/height vote)
+                                                          (:inga.vote/block-hash vote)
+                                                          (:inga.vote/witness vote))
+                                        (:inga.vote/sig vote)))))
                      held (vec (:equivocations s))
                      ok (set (map (fn [e] [(:inga.evidence/witness e)
                                            (:inga.evidence/height e)
                                            (:inga.evidence/view e)])
-                                  (r/verified-equivocations s v)))
+                                  (r/verified-equivocations s vote-ok?)))
                      row (fn [e]
                            {:witness (:inga.evidence/witness e)
                             :height (:inga.evidence/height e)
@@ -4118,6 +4151,13 @@
                             :block-b (get-in e [:inga.evidence/vote-b :inga.vote/block-hash])
                             :sig-a? (boolean (get-in e [:inga.evidence/vote-a :inga.vote/sig]))
                             :sig-b? (boolean (get-in e [:inga.evidence/vote-b :inga.vote/sig]))
+                            ;; The votes themselves, signatures included. A
+                            ;; proof is for handing to somebody who did not
+                            ;; see the votes arrive -- `inga.replica/
+                            ;; equivocators` says so -- and a boolean is not
+                            ;; something anybody else can re-check.
+                            :vote-a (:inga.evidence/vote-a e)
+                            :vote-b (:inga.evidence/vote-b e)
                             :verified (contains? ok [(:inga.evidence/witness e)
                                                      (:inga.evidence/height e)
                                                      (:inga.evidence/view e)])})]
