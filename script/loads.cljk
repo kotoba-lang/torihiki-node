@@ -1,6 +1,6 @@
 ;; Every namespace in this node, read and required.
 ;;
-;;   npx nbb -cp "src:$(clojure -Spath)" script/loads.cljs
+;;   npx nbb -cp "src:$(clojure -Spath)" script/loads.cljk
 ;;
 ;; ## Why here and not only in `torihiki`
 ;;

@@ -1,7 +1,7 @@
 ;; This repository's unit tests, on nbb.
 ;;
 ;;   KOTOBA_CHECKOUTS=<dir-of-sibling-checkouts> \
-;;     nbb --classpath "$(nbb script/nbb-classpath.cljs)" script/tests-on-nbb.cljs
+;;     nbb --classpath "$(nbb script/nbb-classpath.cljk)" script/tests-on-nbb.cljk
 ;;
 ;; ## Why this is the first one
 ;;

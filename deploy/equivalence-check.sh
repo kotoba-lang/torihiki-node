@@ -33,7 +33,7 @@ cleanup; rm -rf "$DATA"
 # standalone under nbb, and the Worker through its own compiler. Two builds
 # went out unread on the day this was written, and both would have stopped
 # here.
-if ${NBB:-npx nbb} -cp "src:script:$CP" script/loads.cljs >/dev/null 2>&1; then
+if ${NBB:-npx nbb} -cp "src:script:$CP" script/loads.cljk >/dev/null 2>&1; then
   say() { printf '%-46s %s\n' "$1" "$2"; }
   say "standalone reads on ClojureScript" "PASS"
 else
@@ -72,7 +72,7 @@ fi
 
 # 3. a contract, through consensus
 if TORIHIKI_BASE="http://127.0.0.1:$((BASE_PORT+1))" \
-   ${NBB:-npx nbb} -cp "script:src:$CP" script/deploy_e2e.cljs 2>&1 | grep -q '^PASS'; then
+   ${NBB:-npx nbb} -cp "script:src:$CP" script/deploy_e2e.cljk 2>&1 | grep -q '^PASS'; then
   say "contract deployed and run over eth_call" "PASS"
 else
   say "contract deployed and run over eth_call" "FAIL"; fail=1
