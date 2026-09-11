@@ -2,13 +2,13 @@
 ;; pins without starting a JVM.
 ;;
 ;;   node -e ''                       # nothing to install
-;;   nbb script/nbb-classpath.cljk    # prints one classpath on stdout
-;;   nbb --classpath "$(nbb script/nbb-classpath.cljk)" script/tests-on-nbb.cljk
+;;   kbb --backend sci script/nbb-classpath.cljk    # prints one classpath on stdout
+;;   kbb --backend sci --classpath "$(kbb --backend sci script/nbb-classpath.cljk)" script/tests-on-nbb.cljk
 ;;
-;; ## Why not `clojure -Spath`
+;; ## Why not `kbb -Spath`
 ;;
 ;; Because that is the JVM, and the point of the nbb suite is to run where no
-;; JVM does. `clojure -Spath` also resolves Maven coordinates this classpath
+;; JVM does. `kbb -Spath` also resolves Maven coordinates this classpath
 ;; has no use for.
 ;;
 ;; ## Why the pins and not the checkouts

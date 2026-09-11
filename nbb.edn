@@ -5,7 +5,7 @@
 ;; Measured 2026-09-10: `script/nbb-classpath.cljk` -- the helper whose whole
 ;; job is to build the classpath the offline suite runs on -- could not start.
 ;;
-;;     nbb script/nbb-classpath.cljk
+;;     kbb --backend sci script/nbb-classpath.cljk
 ;;     Could not find namespace: kotoba.lang.text
 ;;
 ;; So `script/tests-on-nbb.cljk` could not run either, and this repository's

@@ -332,7 +332,7 @@
 ;; two different validator sets — which is the one thing a genesis set must
 ;; not be able to do.
 ;;
-;; `shadow-cljs release validator-v2` sets it to "v2". See `validator-keys`.
+;; `amu compile --target wasm32-browser validator-v2` sets it to "v2". See `validator-keys`.
 
 (def ^:const chain-id
   "**Not renamed when the consensus layer moved to inga, on purpose.**

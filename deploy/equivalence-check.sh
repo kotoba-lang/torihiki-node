@@ -22,7 +22,7 @@ BASE_PORT=${BASE_PORT:-8800}
 DATA=${DATA:-/tmp/torihiki-check}
 # `npx nbb` by default so this runs from a checkout with no global install;
 # set NBB=nbb on a host where it is installed.
-CP=$(clojure -Spath)
+CP=$(kbb -Spath)
 PEERS="w1@ws://127.0.0.1:19401,w2@ws://127.0.0.1:19402,w3@ws://127.0.0.1:19403,w4@ws://127.0.0.1:19404"
 
 cleanup() { pkill -f 'torihiki-node.standalone' 2>/dev/null || true; }
