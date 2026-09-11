@@ -2137,7 +2137,7 @@
   ;;
   ;; `att/pending-checks` produces the `[witness payload sig]` triples the
   ;; certificate needs checked, so this does not reimplement the payload
-  ;; format — the same reason `client.cljs` calls `torihiki.auth` rather than
+  ;; format — the same reason `client.cljk` calls `torihiki.auth` rather than
   ;; spelling the signing payload out by hand.
   (verifyCerts [this msgs]
     (set! (.-verified this) (or (.-verified this) #js {}))

@@ -25,7 +25,7 @@
 # ## The dependencies travel with it
 #
 # nbb needs the source of every git dependency, and a fleet node has no
-# sibling checkouts. `script/nbb-classpath.cljs` materialises them into
+# sibling checkouts. `script/nbb-classpath.cljk` materialises them into
 # `.nbb-deps/` from the deps.edn pins; that directory is what ships, so the
 # host runs the pinned code rather than whatever it could reach.
 set -eu
@@ -35,7 +35,7 @@ LABEL="cloud.murakumo.torihiki.$W"
 UW=$(echo "$W" | tr a-z A-Z)
 PORT_L="${LISTEN_PORT:-19401}"; PORT_H="${HTTP_PORT:-8801}"
 
-test -d "$REPO/.nbb-deps" || { echo "no .nbb-deps -- run: nbb script/nbb-classpath.cljs" >&2; exit 2; }
+test -d "$REPO/.nbb-deps" || { echo "no .nbb-deps -- run: nbb script/nbb-classpath.cljk" >&2; exit 2; }
 
 echo "== $HOST: staging source and pinned dependencies"
 ssh "$HOST" 'mkdir -p ~/.torihiki/data ~/Library/LaunchAgents'

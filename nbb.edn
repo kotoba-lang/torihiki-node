@@ -2,13 +2,13 @@
 ;; and the .cljs in `script/` are run as bare `nbb <file>` -- so a coordinate
 ;; declared only in deps.edn is invisible to every one of them.
 ;;
-;; Measured 2026-09-10: `script/nbb-classpath.cljs` -- the helper whose whole
+;; Measured 2026-09-10: `script/nbb-classpath.cljk` -- the helper whose whole
 ;; job is to build the classpath the offline suite runs on -- could not start.
 ;;
-;;     nbb script/nbb-classpath.cljs
+;;     nbb script/nbb-classpath.cljk
 ;;     Could not find namespace: kotoba.lang.text
 ;;
-;; So `script/tests-on-nbb.cljs` could not run either, and this repository's
+;; So `script/tests-on-nbb.cljk` could not run either, and this repository's
 ;; only test that works without a deployed endpoint had been unrunnable since
 ;; the 2026-09-09 migration off clojure.string. Nothing said so: the JVM suite
 ;; reads deps.edn and never loads the .cljs, so it stayed green, which is the

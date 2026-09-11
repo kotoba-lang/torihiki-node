@@ -1,9 +1,9 @@
-;; The classpath `script/tests-on-nbb.cljs` needs, built from the deps.edn
+;; The classpath `script/tests-on-nbb.cljk` needs, built from the deps.edn
 ;; pins without starting a JVM.
 ;;
 ;;   node -e ''                       # nothing to install
-;;   nbb script/nbb-classpath.cljs    # prints one classpath on stdout
-;;   nbb --classpath "$(nbb script/nbb-classpath.cljs)" script/tests-on-nbb.cljs
+;;   nbb script/nbb-classpath.cljk    # prints one classpath on stdout
+;;   nbb --classpath "$(nbb script/nbb-classpath.cljk)" script/tests-on-nbb.cljk
 ;;
 ;; ## Why not `clojure -Spath`
 ;;
