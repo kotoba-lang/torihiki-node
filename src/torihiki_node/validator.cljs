@@ -434,7 +434,7 @@
   ;; **149.** inga e4974f7 — equivocation を view ごとに判定する。
   ;; 148 で立ち上げた chain は数千 block で止まり、止まり方は equivocators が
   ;; 0 → 4 になることと例外なく相関していた。
-  "150")
+  "151")
 
 (defn- do-name
   "The Durable Object id for a witness. NO VERSION IN IT.
@@ -4075,6 +4075,64 @@
                  (json {:account a
                         :balances (get-in c [:balances a] {})
                         :committed (get-in c [:committed a] {})}
+                       200))
+
+               ;; The proofs themselves, not the names of the accused.
+               ;;
+               ;; `/head` reports `equivocators` as a list of witness names and
+               ;; that is all it has ever reported. Measured 2026-09-11: the
+               ;; chain halted with `equivocators ["w1" "w4"]` -- two of four,
+               ;; one more than the fault model tolerates, so by design nothing
+               ;; can certify and nothing recovers. The available evidence was
+               ;; two names. Not the height, not the view, not the two block
+               ;; hashes each witness is supposed to have signed in one view --
+               ;; which are exactly the four fields `inga.stake` keys the crime
+               ;; on, and the only way to tell a real double-vote from the
+               ;; machinery convicting a replica for helping the chain recover.
+               ;; That distinction has already been got wrong twice here: once
+               ;; when detection keyed on [witness height] and slashed every
+               ;; replica that survived a view change (root ADR-2608150300), and
+               ;; once when a rewind cast the second vote itself, which
+               ;; `inga.sync/conflicts-with-chain?` documents as the hazard the
+               ;; rewind path is built around.
+               ;;
+               ;; `inga.replica/verified-equivocations` re-checks each pair
+               ;; against this replica's verifier rather than trusting that
+               ;; detection ran, so `:verified` here means re-verified, and a
+               ;; record that is held but does not re-verify is reported as
+               ;; such instead of being dropped. A proof nobody can read is a
+               ;; conviction nobody can appeal.
+               "/equivocations"
+               (let [s (.-replica this)
+                     v (:verify-fn s)
+                     held (vec (:equivocations s))
+                     ok (set (map (fn [e] [(:inga.evidence/witness e)
+                                           (:inga.evidence/height e)
+                                           (:inga.evidence/view e)])
+                                  (r/verified-equivocations s v)))
+                     row (fn [e]
+                           {:witness (:inga.evidence/witness e)
+                            :height (:inga.evidence/height e)
+                            :view (:inga.evidence/view e)
+                            :block-a (get-in e [:inga.evidence/vote-a :inga.vote/block-hash])
+                            :block-b (get-in e [:inga.evidence/vote-b :inga.vote/block-hash])
+                            :sig-a? (boolean (get-in e [:inga.evidence/vote-a :inga.vote/sig]))
+                            :sig-b? (boolean (get-in e [:inga.evidence/vote-b :inga.vote/sig]))
+                            :verified (contains? ok [(:inga.evidence/witness e)
+                                                     (:inga.evidence/height e)
+                                                     (:inga.evidence/view e)])})]
+                 (json {:witness (.-witness this)
+                        :height (r/height s)
+                        :committed (r/committed-height s)
+                        :quorum (c/quorum-size (count witnesses))
+                        :witnesses (vec witnesses)
+                        ;; Held and re-verified are counted apart on purpose:
+                        ;; equal counts is a fact, and inferring it from one
+                        ;; number is how a dropped proof reads as no proof.
+                        :held (count held)
+                        :verified (count ok)
+                        :verifier? (boolean v)
+                        :records (mapv row held)}
                        200))
 
                "/stake"
