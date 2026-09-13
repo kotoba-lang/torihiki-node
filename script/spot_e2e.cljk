@@ -2,7 +2,7 @@
 (ns spot-e2e
   (:require [torihiki.auth :as auth] [torihiki.address :as addr] [promesa.core :as p]))
 (def base (or (some-> js/process .-env .-BASE)
-              "https://torihiki-validator-v2.04-feasts-minded.workers.dev"))
+              "https://torihiki-validator-v3.04-feasts-minded.workers.dev"))
 (def chain-id "torihiki-engi-devnet-1")
 (defn b64 [b] (js/btoa (.apply js/String.fromCharCode nil (js/Uint8Array. b))))
 (defn GET [p*] (p/let [r (js/fetch (str base p*)) j (.json r)] (js->clj j :keywordize-keys true)))
