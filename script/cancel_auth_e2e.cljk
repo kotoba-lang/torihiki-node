@@ -13,7 +13,7 @@
   ;; the code under test. `TORIHIKI_BASE` overrides for the rare case where
   ;; the old chain IS the subject.
   (or (some-> js/process .-env .-TORIHIKI_BASE)
-      "https://torihiki-validator-v2.04-feasts-minded.workers.dev"))
+      "https://torihiki-validator-v3.04-feasts-minded.workers.dev"))
 (def chain-id "torihiki-engi-devnet-1")
 (def level 50)   ; well below the mark, so it rests instead of crossing
 
