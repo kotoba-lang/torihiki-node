@@ -1,0 +1,156 @@
+;; End-to-end order latency against a DEPLOYED chain, measured on the axis
+;; Hyperliquid publishes for its own: "For an order placed from a
+;; geographically co-located client, end-to-end latency has a median 0.2
+;; seconds and 99th percentile 0.9 seconds", i.e. from "sending request" to
+;; "receiving committed response"
+;; (https://hyperliquid.gitbook.io/hyperliquid-docs/hypercore/overview, read
+;; 2026-09-23; the canonical copy of those figures is torihiki's
+;; bench/torihiki/hyperliquid-reference.edn).
+;;
+;; "Committed" here means the account's nonce was consumed in committed state:
+;; `/account` reports a `next-nonce` past the one the order used. That is true
+;; whether the order was then applied or rejected — both are in a committed
+;; block — which is the same thing Hyperliquid's "committed response" answers.
+;; The clock stops when a poll first SEES it, so each figure over-reads by up
+;; to one poll interval plus one round trip; both are printed with the result.
+;;
+;; This client is not co-located with anything. The round trip to `/head` is
+;; measured first and printed, so the network share is visible rather than
+;; folded silently into the number.
+;;
+;; What it places: post-only bids, qty 1, at half the mark — far from the
+;; touch, so they never trade and move nobody's price. A cancel-all at the end
+;; takes them back off the book.
+;;
+;; It refuses to run against a chain whose id does not say devnet: collateral
+;; there is unbacked (faucet or self-credit), and this probe has no business
+;; anywhere it is not.
+;;
+;; Exit: 0 every order committed · 1 some timed out (partial figures printed)
+;;       2 nothing committed or the account never funded — UNMEASURED, which is
+;;         a statement about the chain, not a latency of zero · 3 refused
+;;
+;;   kbb --backend sci --classpath "$(kbb --backend sci script/nbb-classpath.cljk)" \
+;;     script/latency_probe.cljk [n-orders]
+;;   TORIHIKI_BASE=https://torihiki-node.04-feasts-minded.workers.dev …   # the sequencer
+(ns latency-probe
+  (:require [torihiki.auth :as auth] [torihiki.address :as addr] [promesa.core :as p]))
+
+(def base
+  (or (some-> js/process .-env .-TORIHIKI_BASE)
+      "https://torihiki-validator-v3.04-feasts-minded.workers.dev"))
+(def n-orders (or (some-> (first *command-line-args*) js/parseInt) 20))
+(def poll-ms 50)
+(def commit-timeout-ms 30000)
+(def fund-timeout-ms 60000)
+(def hl {:p50-ms 200 :p99-ms 900})
+
+(defn now [] (.now js/performance))
+(defn b64 [b] (js/btoa (.apply js/String.fromCharCode nil (js/Uint8Array. b))))
+(defn wait [ms] (p/create (fn [r _] (js/setTimeout r ms))))
+(defn GET [p*]
+  (p/let [r (js/fetch (str base p*)) j (.json r)] (js->clj j :keywordize-keys true)))
+(defn POST [p* b]
+  (p/let [r (js/fetch (str base p*) #js {:method "POST" :body (js/JSON.stringify (clj->js b))})
+          s (.-status r)
+          t (.text r)]
+    {:status s :body (try (js->clj (js/JSON.parse t) :keywordize-keys true) (catch :default _ t))}))
+
+(defn exit! [code & lines]
+  (doseq [l lines] (println l))
+  (js/process.exit code))
+
+(defn mk []
+  (p/let [kp (js/crypto.subtle.generateKey #js {:name "Ed25519"} true #js ["sign" "verify"])
+          raw (js/crypto.subtle.exportKey "raw" (.-publicKey kp))]
+    {:sk (.-privateKey kp) :pub (b64 raw)}))
+
+(defn send! [chain-id signer acct nonce t]
+  (p/let [pay (auth/signing-payload chain-id acct nonce t)
+          sig (js/crypto.subtle.sign #js {:name "Ed25519"} (:sk signer) (.encode (js/TextEncoder.) pay))]
+    (POST "/tx?w=w1" {:tx t :account acct :nonce nonce :pubkey (:pub signer) :sig (b64 sig)})))
+
+(defn account [acct] (GET (str "/account?w=w1&id=" acct)))
+
+(defn poll-until
+  "Poll `f` every `poll-ms` until `(done? result)` or the deadline. Returns
+  [result elapsed-ms] or nil on timeout."
+  [f done? t0 timeout]
+  (p/loop []
+    (p/let [r (f)]
+      (cond (done? r) [r (- (now) t0)]
+            (> (- (now) t0) timeout) nil
+            :else (p/do (wait poll-ms) (p/recur))))))
+
+(defn pct [sorted q]
+  (nth sorted (min (dec (count sorted)) (js/Math.floor (* q (dec (count sorted)))))))
+
+(defn fund!
+  "The validator set grants from its bridge (`/faucet`); the single sequencer
+  has no faucet and takes a self-signed deposit. Try the first, fall back."
+  [chain-id me acct]
+  (p/let [f (POST "/faucet?w=w1" {:account acct})]
+    (if (= 200 (:status f))
+      :faucet
+      (p/let [r (send! chain-id me acct 1 {:tx :deposit :account acct :amount 100000000})]
+        (println (str "deposit   " (:status r) " " (pr-str (:body r))))
+        :self-deposit))))
+
+(p/let [head (GET "/head?w=w1")
+        chain-id (:chain-id head)
+        _ (when-not (and (string? chain-id) (re-find #"devnet" chain-id))
+            (exit! 3 (str "REFUSED: chain-id " (pr-str chain-id) " is not a devnet — this probe only runs on unbacked collateral")))
+        rtts (p/loop [i 0 acc []]
+               (if (= i 5) acc
+                   (p/let [t0 (now) _ (GET "/head?w=w1")] (p/recur (inc i) (conj acc (- (now) t0))))))
+        rtt (pct (vec (sort rtts)) 0.5)
+        mkt (GET "/market?w=w1&id=1")
+        level (max 1 (js/Math.floor (/ (or (:mark mkt) (:oracle mkt) 1000) 2)))
+        me (mk)
+        acct (addr/derive (:pub me))
+        _ (println (str "base      " base))
+        _ (println (str "chain     " chain-id " · height " (:height head) " · consensus " (pr-str (:consensus head))))
+        _ (println (str "account   " acct " · /head round trip p50 " (.toFixed rtt 1) " ms"))
+        how (fund! chain-id me acct)
+        funded (poll-until #(account acct) #(pos? (:collateral % 0)) (now) fund-timeout-ms)]
+  (when-not funded
+    (exit! 2 (str "UNMEASURED: the account was never funded (" (name how) ") within "
+                  (/ fund-timeout-ms 1000) " s — the chain is not committing, so there is no latency to report")))
+  (println (str "funded    via " (name how) " in " (.toFixed (second funded) 0) " ms"))
+  (p/let [results
+          (p/loop [i 0 acc []]
+            (if (= i n-orders)
+              acc
+              (p/let [a (account acct)
+                      nonce (:next-nonce a)
+                      t0 (now)
+                      resp (send! chain-id me acct nonce {:tx :order :account acct :market 1
+                                                          :side 0 :level level :qty 1 :flags 2})
+                      done (if (= 200 (:status resp))
+                             (poll-until #(account acct) #(> (:next-nonce % 0) nonce) t0 commit-timeout-ms)
+                             nil)]
+                (p/recur (inc i)
+                         (conj acc (cond (not= 200 (:status resp)) {:refused (:body resp)}
+                                         done {:ms (second done)}
+                                         :else {:timeout true}))))))
+          committed (vec (sort (keep :ms results)))
+          timeouts (count (filter :timeout results))
+          refused (keep :refused results)
+          n (:next-nonce (account acct))
+          _ (send! chain-id me acct n {:tx :cancel-all :account acct :market 1})]
+    (println)
+    (println (str "orders    " n-orders " sent · " (count committed) " committed · "
+                  timeouts " timed out (" (/ commit-timeout-ms 1000) " s) · " (count refused) " refused at the edge"))
+    (doseq [r (take 3 refused)] (println (str "          refused: " (pr-str r))))
+    (if (empty? committed)
+      (exit! 2 "UNMEASURED: no order committed — nothing to compare")
+      (let [p50 (pct committed 0.5) p99 (pct committed 0.99)]
+        (println (str "latency   p50 " (.toFixed p50 0) " ms · p99 " (.toFixed p99 0)
+                      " ms · max " (.toFixed (peek committed) 0) " ms  (send → committed, as seen by a "
+                      poll-ms " ms poll)"))
+        (println (str "network   /head round trip p50 " (.toFixed rtt 1) " ms — this client is not co-located"))
+        (println (str "Hyperliquid, co-located: p50 " (:p50-ms hl) " ms · p99 " (:p99-ms hl) " ms"
+                      "  → ratio p50 " (.toFixed (/ p50 (:p50-ms hl)) 2) "x · p99 " (.toFixed (/ p99 (:p99-ms hl)) 2) "x"))
+        (println (str "MEASURED\t" chain-id "\t" (count committed) "\t" (.toFixed p50 1) "\t" (.toFixed p99 1)
+                      "\t" timeouts "\t" (.toFixed rtt 1)))
+        (js/process.exit (if (pos? timeouts) 1 0))))))

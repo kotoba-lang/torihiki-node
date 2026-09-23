@@ -63,6 +63,38 @@ because this was learned twice in one session: a fix was deployed, verified
 present in the bundle, and then contradicted by the live endpoint still
 running the previous build. **Check `/head` before believing a deploy.**
 
+## End-to-end latency, on Hyperliquid's axis
+
+Hyperliquid publishes one latency figure for itself: from a co-located client,
+send → committed response, median 0.2 s and p99 0.9 s. `script/latency_probe.cljk`
+measures the same interval here — a signed post-only order, far from the touch,
+timed until `/account` shows its nonce consumed — and prints the `/head` round
+trip beside it, because this client is not co-located with anything. It
+refuses any chain whose id does not say devnet, and cleans its orders up with a
+cancel-all.
+
+```bash
+kbb --backend sci --classpath "$(kbb --backend sci script/nbb-classpath.cljk)" \
+    script/latency_probe.cljk 20                       # validator-v3 (default)
+TORIHIKI_BASE=https://torihiki-node.04-feasts-minded.workers.dev …   # the sequencer
+```
+
+Exit 2 means UNMEASURED — nothing committed — which is a statement about the
+chain, not a latency. That is what both deployments gave on 2026-09-23:
+
+- **validator-v3**: the faucet accepted the grant (`200`), and it never
+  committed. Height stayed at 5805 for over 20 minutes, `tip-certificate` nil,
+  `pending 1`, `equivocators ["w1" "w3"]`.
+- **sequencer**: every signature from a current client is refused
+  `bad-signature`. It reports `code-version 12`; the signed payload
+  `torihiki.auth` builds today has 37 fields, and the build it is still running
+  predates that — the section above on Durable Objects not picking up deploys,
+  again.
+
+`script/nbb-classpath.cljk` resolves pins through sibling checkouts, so it
+fails from a worktree whose siblings are not beside it (`unresolvable: io-ipld
+… no checkout`); build the classpath from the main checkout and pass it in.
+
 ## Run
 
 ```bash
