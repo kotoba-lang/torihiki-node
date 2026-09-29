@@ -4116,7 +4116,7 @@
                      ;; read -- by me, in ADR-2609111000 -- as "detection
                      ;; recorded what verification rejects", named the
                      ;; densest clue to the halt, and given as a reason not
-                     ;; to reset. It was the instrument. CLAUDE.md's sixth
+                     ;; to reset. It was the instrument. AGENTS.md's sixth
                      ;; question, verbatim: a check that rejects must be
                      ;; shown to reject for the reason it names.
                      ;;
