@@ -323,7 +323,8 @@
             [torihiki.book :as bk]
             [torihiki.clearing :as cl]
             [torihiki.snapshot :as tsnap]
-            [torihiki.state :as st]))
+            [torihiki.state :as st]
+            [torihiki-node.claims :as claims]))
 
 (goog-define genesis-set "v1")
 ;; Which genesis validator set this BUILD carries. A compile-time constant,
@@ -3416,11 +3417,18 @@
                             "/adopt"
                             (.adoptFromPeers this)
 
+                            "/.well-known/torihiki"
+                            (json (claims/status :validator) 200)
+
                             "/head"
                (let [s (.-replica this)]
                  (json {:witness (.-witness this)
                         :pubkey (.-pub this)
                         :code-version code-version
+                        ;; What this set may claim about itself
+                        ;; (torihiki-node.claims): four replicas agreeing is
+                        ;; not four operators agreeing.
+                        :decentralization (claims/status :validator)
                         ;; So a restart can be READ rather than inferred: the
                         ;; checkpoint this replica last wrote, and whether it
                         ;; booted from one.

@@ -17,9 +17,10 @@
 ;; two numbers otherwise.
 (ns tests-on-nbb
   (:require [cljs.test :as ct]
-            [torihiki-node.store-test]))
+            [torihiki-node.store-test]
+            [torihiki-node.claims-test]))
 
-(def ^:private expected-namespaces 1)
+(def ^:private expected-namespaces 2)
 (defonce ^:private ns-seen (atom 0))
 
 (defmethod ct/report [::ct/default :begin-test-ns] [_] (swap! ns-seen inc))
@@ -39,4 +40,4 @@
       (pos? (+ fail error)) (js/process.exit 1)
       :else (println "TESTS-ON-NBB: pass"))))
 
-(ct/run-tests 'torihiki-node.store-test)
+(ct/run-tests 'torihiki-node.store-test 'torihiki-node.claims-test)
