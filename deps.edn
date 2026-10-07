@@ -31,7 +31,7 @@
         ;; root ADR-2800004800 §1d measured on THIS deployment at 1030/1031.
         io.github.kotoba-lang/inga
         {:git/url "https://github.com/kotoba-lang/inga.git"
-         :git/sha "84967c3cb9927c08b49c0ee4f64f06e7b538ec89"}
+         :git/sha "9eed5458daf568acd52f5e0a24398270b586ff1d"}
         ;; d8e5952 (2026-09-10 main) brings d128b50, which is the reason this
         ;; deployment stopped. Measured 2026-09-10, twenty-six days in: all four
         ;; witnesses spinning at view 1,496,141 with `no certificate for the
@@ -57,7 +57,7 @@
         ;; reset `equivocators` climbed 0 -> 1 -> 4 as views turned over, and
         ;; at four the chain stopped, each replica alone on its own tip.
         ;;
-        ;; 84967c3 (kotoba-lang/inga#24, 2026-10-07) moves this from d8e5952,
+        ;; 9eed545 (kotoba-lang/inga#24, 2026-10-07) moves this from d8e5952,
         ;; which still voted once per HEIGHT. That rule is why validator-v3
         ;; sits at 5805: two blocks at one height, votes split, every replica
         ;; has spent its vote there, permanently. inga main has voted once per
@@ -66,7 +66,7 @@
         ;; the one thing main got wrong for this host: after a single timeout
         ;; the view landed on the one just spent and every block cost a full
         ;; base timeout. Measured, four standalone processes on one machine:
-        ;; d8e5952 25 ms/block, main 86577ed 1,020 ms, 84967c3 22 ms.
+        ;; d8e5952 25 ms/block, main 86577ed 1,020 ms, #24 22 ms.
         ;; The candle fold. The terminal draws from the same library, so
         ;; `/candles` and the chart cannot disagree about what a candle is.
         ;; The IPLD layer: canonical DAG-CBOR and CIDv1. Block identity is a
