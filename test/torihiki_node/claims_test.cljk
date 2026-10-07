@@ -1,0 +1,38 @@
+(ns torihiki-node.claims-test
+  "That the deployment cannot call itself decentralized by accident.
+
+  The values are hand-written, so what is worth testing is the shape around
+  them: every flag carries a gate, the conjunction ignores D0/D5, and the
+  summary never says \"decentralized\" while any D1–D4 flag is false."
+  (:require [cljs.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [torihiki-node.claims :as claims]))
+
+(deftest every-flag-names-its-gate
+  (doseq [f claims/flags]
+    (is (boolean? (:value f)) (str (:key f)))
+    (is (seq (:gate f)) (str (:key f) " has no gate"))))
+
+(deftest nothing-is-claimed-yet
+  (testing "D0 lands with every flag false; each flips in its own reviewed commit"
+    (is (every? false? (map :value claims/flags)))
+    (is (false? (claims/decentralized?)))))
+
+(deftest conjunction-is-d1-through-d4
+  (let [set-all (fn [v] (mapv #(assoc % :value v) claims/flags))
+        only (fn [phases v] (mapv #(if (phases (:phase %)) (assoc % :value v) %)
+                                  (set-all (not v))))]
+    (is (true? (claims/decentralized? (set-all true))))
+    (testing "D0 and D5 false do not block it"
+      (is (true? (claims/decentralized? (only #{"D0" "D5"} false)))))
+    (testing "any one of D1–D4 false blocks it"
+      (doseq [p ["D1" "D2" "D3" "D4"]]
+        (is (false? (claims/decentralized? (only #{p} false))) p)))))
+
+(deftest summary-says-what-it-is
+  (doseq [kind [:sequencer :validator]]
+    (let [s (claims/status kind)]
+      (is (false? (:decentralized s)))
+      (is (str/includes? (:summary s) "single operator") (str kind))
+      (is (= (set (map :key claims/flags)) (set (keys (:flags s)))))
+      (is (= (set (keys (:flags s))) (set (keys (:gates s))))))))

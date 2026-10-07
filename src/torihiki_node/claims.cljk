@@ -1,0 +1,72 @@
+(ns torihiki-node.claims
+  "What this deployment may say about itself, in one place.
+
+  `/head` already states `:consensus` and `:collateral` in its own response,
+  because a service that stays quiet about them will be assumed to be the
+  other thing. That was done per field and per node, and three nodes (the
+  sequencer, the Durable Object validator and the standalone validator) each
+  carried their own wording. This is the list those fields were instances of:
+  the six properties `docs/decentralization-roadmap.md` (kotoba-lang/torihiki)
+  names, each false until its gate passes **in production**.
+
+  ## Why constants and not measurements
+
+  A flag here is a claim the operator makes and anybody can check against the
+  gate it names. None of them is something a node can measure about itself:
+  a replica cannot see that four validator keys sit in one Cloudflare account,
+  and a replica that could would be told so by the same operator. So the
+  values are written by hand, flipped by a reviewed commit, and every flag
+  carries the gate that justifies flipping it — a `true` without its gate
+  written next to it is the thing this namespace exists to prevent.
+
+  ## Until all of D1–D4 are true
+
+  `:decentralized` is the conjunction of the flags, not a seventh flag. Docs
+  and the terminal must not call this chain decentralized while it is false,
+  and `:summary` says what it is instead."
+  )
+
+(def flags
+  "Phase → {:flag bool :gate what-must-pass}. Ordered as the roadmap is."
+  [{:phase "D0" :key :claims-honest :value false
+    :gate "flags served by every node; terminal shows which path it is on; README qualified"}
+   {:phase "D1" :key :bft-live :value false
+    :gate "14 days of blocks on 4 hosts off Cloudflare; one host killed ≥1h; Byzantine replica repaired; zero honest equivocation"}
+   {:phase "D2" :key :operators-independent :value false
+    :gate "≥4 operators other than us; our stake <1/3; set change, key rotation and equivocation slash executed live"}
+   {:phase "D3" :key :collateral-backed :value false
+    :gate "every balance traces to a quorum-attested bridge-contract deposit; faucet mint refused; reserves hold 14 days"}
+   {:phase "D3" :key :exit-live :value false
+    :gate "bridge contract pays a >2/3-signed withdrawal, refuses a 1/3-signed one, and one validator pauses it in the dispute window"}
+   {:phase "D4" :key :oracle-independent :value false
+    :gate "validator-set stake-weighted median; one validator 10% off moves the oracle less than the band"}
+   {:phase "D5" :key :history-public :value false
+    :gate "a third-party full node replays from genesis and stays in sync 7 days"}
+   {:phase "D5" :key :upgrades-governed :value false
+    :gate "a code-version change activated by on-chain >2/3 vote with zero split roots"}])
+
+(def roadmap
+  "https://github.com/kotoba-lang/torihiki/blob/main/docs/decentralization-roadmap.md")
+
+(defn decentralized?
+  "True only when every flag D1–D4 is true. D0 and D5 do not make a chain
+  decentralized; D1–D4 failing does make it not."
+  ([] (decentralized? flags))
+  ([fs]
+   (every? :value (filter #(contains? #{"D1" "D2" "D3" "D4"} (:phase %)) fs))))
+
+(defn status
+  "The map served at `/head` under `:decentralization` and at
+  `/.well-known/torihiki`. `kind` is what this node is — :sequencer or
+  :validator — because the summary differs and a validator in a set run by
+  one operator is not the same claim as a single sequencer."
+  [kind]
+  (let [dec? (decentralized?)]
+    {:decentralized dec?
+     :summary (cond
+                dec? "decentralized: every D1–D4 gate passed in production"
+                (= kind :sequencer) "devnet, single operator — single sequencer, not consensus"
+                :else "devnet, single operator — BFT validator set whose keys one party holds")
+     :flags (into {} (map (juxt :key :value)) flags)
+     :gates (into {} (map (juxt :key (fn [f] {:phase (:phase f) :gate (:gate f)}))) flags)
+     :roadmap roadmap}))
