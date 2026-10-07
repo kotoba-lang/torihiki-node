@@ -35,7 +35,8 @@
             [torihiki.address :as addr]
             [torihiki.book :as bk]
             [torihiki.commit :as cm]
-            [torihiki-chart.candle :as cndl]))
+            [torihiki-chart.candle :as cndl]
+            [torihiki-node.claims :as claims]))
 
 (def ^:const chain-id "torihiki-devnet-1")
 
@@ -406,7 +407,11 @@
                            :bridge-authority (:bridge-authority ex)
                            :collateral (if (:bridge-authority ex)
                                          "bridged"
-                                         "unbacked — any account may credit itself (devnet faucet)")})
+                                         "unbacked — any account may credit itself (devnet faucet)")
+                           ;; The fields above, as the list they are
+                           ;; instances of (torihiki-node.claims).
+                           :decentralization (claims/status :sequencer)})
+                 "/.well-known/torihiki" (json-response (claims/status :sequencer))
                  (json-response {:ok false :reason "not-found"} 404)))))))))
 
 (def handler

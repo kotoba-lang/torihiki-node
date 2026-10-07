@@ -54,6 +54,7 @@
   (:require ["ws" :as ws]
             ["node:crypto" :as nc]
             [torihiki-node.store :as store]
+            [torihiki-node.claims :as claims]
             ["node:fs" :as fs]
             ["node:http" :as http]
             [kotoba.lang.text :as str]
@@ -478,6 +479,10 @@
       "/head"
       (json-response res 200
                      {:witness me
+                      ;; What this set may claim about itself
+                      ;; (torihiki-node.claims). Running on ordinary hosts is
+                      ;; D1's shape; it is not D1's gate.
+                      :decentralization (claims/status :validator)
                       :height (r/height s)
                       ;; `:committed` is the list of committed blocks, not a height —
                       ;; reading it as one reported `null` on a chain that was
@@ -523,6 +528,9 @@
                       :last-proposal (:last-proposal s)
                       :propose-refusal (:propose-refusal s)
                       :substrate "process"})
+
+      "/.well-known/torihiki"
+      (json-response res 200 (claims/status :validator))
 
       ;; The block hash at a given height, which is how two replicas are
       ;; compared. A block header carries no state root here — `canonical-block`
