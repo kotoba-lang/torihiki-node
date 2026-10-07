@@ -358,6 +358,16 @@
           ;; recorded is a vote that can be cast twice.
           false)))))
 
+(defn- ship-kept!
+  "Send `out` once the vote watermark is on disk. If the write fails, the
+  votes stay home and everything else still goes: a new-view or a sync
+  request is sent once per view, and dropping it with the vote would cost a
+  whole timeout for no safety gained."
+  [out]
+  (if (keep-vote!)
+    (ship! out)
+    (ship! (remove #(= :vote (get-in % [:msg :type])) out))))
+
 (defn- feed! [msg]
   (swap! stats update :msgs-in inc)
   (let [[s' out] (r/on-message @state msg (now))]
@@ -368,7 +378,7 @@
     ;; every 150: a reply that waits for a clock adds a clock to every hop.
     ;;
     ;; But only after the watermark is down.
-    (when (keep-vote!) (ship! out))))
+    (ship-kept! out)))
 
 (defn- quantiles [v]
   (when (seq v)
@@ -973,7 +983,27 @@
                                        (:height (first rs)))))))))
           (.catch (fn [_] nil))))))
 
+(defn- config-errors
+  "What is wrong with this replica's configuration, before anything listens.
+
+  `PEERS` names this replica's own listening address, so a replica missing
+  from it has no port. This used to fall through to port 0 with no peers and
+  die later as `Maximum call stack size exceeded`, which reads as a bug in the
+  node rather than a line missing from `common.env`."
+  []
+  (cond-> []
+    (not (some #{me} witnesses))
+    (conj (str "W=" me " is not in WITNESSES=" (str/join "," witnesses)))
+    (not (contains? peer-url me))
+    (conj (str "PEERS has no entry for " me " (expected " me "@ws://host:port)"))
+    (some #(not (contains? peer-url %)) witnesses)
+    (conj (str "PEERS is missing "
+               (str/join "," (remove #(contains? peer-url %) witnesses))))))
+
 (defn -main [& _]
+  (when-let [errs (seq (config-errors))]
+    (doseq [e errs] (js/console.error (str "torihiki: " e)))
+    (js/process.exit 2))
   (let [port (js/parseInt (second (str/split (get peer-url me "x:0") #":(?=[0-9]+$)")) 10)
         wss (ws/WebSocketServer. #js {:port port})
         n (atom 0)]
@@ -1001,14 +1031,19 @@
     (when (= me (c/leader-for witnesses 1))
       (let [[s' out] (r/start @state (now))]
         (reset! state s')
-        (ship! out)))
+        (ship-kept! out)))
     (js/setInterval
      (fn []
        (when-let [nd @out-node] ((:tick! nd)))
        (let [[s' out] (r/on-tick @state (now))]
          (reset! state s')
          (note-height! (r/height s'))
-         (ship! out)
+         ;; The tick votes too — `vote-on-tip` re-casts for an uncertified tip
+         ;; in a fresh view — so the watermark goes down first here exactly as
+         ;; it does in `feed!`. This shipped unconditionally, which left the
+         ;; one-crash window `keep-vote!` exists to close open on every
+         ;; timeout.
+         (ship-kept! out)
          (persist!)
          (checkpoint!)
          (repair!)))

@@ -3201,7 +3201,18 @@
       ;; so the isolate stays alive), and `waitUntil` says so explicitly where
       ;; the runtime offers it. What changes is that the clock stops being
       ;; hostage to them.
-      (let [sends (js/Promise.resolve (.flush! this))
+      ;; The watermark goes down BEFORE the flush, as it does on the message
+      ;; path below. `r/start` and `r/on-tick` vote too — `vote-on-tip`
+      ;; re-casts in a fresh view after every timeout — and this flushed their
+      ;; output with nothing written, the one-crash window the message path
+      ;; closes.
+      (let [vv (r/voted-view (.-replica this))
+            sends (if (> vv (or (.-votedView this) -1))
+                    (-> (.put ^js (.-storage do-state) "voted-view" vv)
+                        (.then (fn [_] (set! (.-votedView this) vv) (.flush! this)))
+                        ;; Not written, so not sent.
+                        (.catch (fn [_] nil)))
+                    (js/Promise.resolve (.flush! this)))
             t0 (js/Date.now)]
         (.then sends (fn [_]
                        (set! (.-deliverMs this)
