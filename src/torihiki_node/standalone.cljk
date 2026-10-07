@@ -965,7 +965,27 @@
                                        (:height (first rs)))))))))
           (.catch (fn [_] nil))))))
 
+(defn- config-errors
+  "What is wrong with this replica's configuration, before anything listens.
+
+  `PEERS` names this replica's own listening address, so a replica missing
+  from it has no port. This used to fall through to port 0 with no peers and
+  die later as `Maximum call stack size exceeded`, which reads as a bug in the
+  node rather than a line missing from `common.env`."
+  []
+  (cond-> []
+    (not (some #{me} witnesses))
+    (conj (str "W=" me " is not in WITNESSES=" (str/join "," witnesses)))
+    (not (contains? peer-url me))
+    (conj (str "PEERS has no entry for " me " (expected " me "@ws://host:port)"))
+    (some #(not (contains? peer-url %)) witnesses)
+    (conj (str "PEERS is missing "
+               (str/join "," (remove #(contains? peer-url %) witnesses))))))
+
 (defn -main [& _]
+  (when-let [errs (seq (config-errors))]
+    (doseq [e errs] (js/console.error (str "torihiki: " e)))
+    (js/process.exit 2))
   (let [port (js/parseInt (second (str/split (get peer-url me "x:0") #":(?=[0-9]+$)")) 10)
         wss (ws/WebSocketServer. #js {:port port})
         n (atom 0)]
@@ -1000,7 +1020,12 @@
        (let [[s' out] (r/on-tick @state (now))]
          (reset! state s')
          (note-height! (r/height s'))
-         (ship! out)
+         ;; The tick votes too — `vote-on-tip` re-casts for an uncertified tip
+         ;; in a fresh view — so the watermark goes down first here exactly as
+         ;; it does in `feed!`. This shipped unconditionally, which left the
+         ;; one-crash window `keep-vote!` exists to close open on every
+         ;; timeout.
+         (when (keep-vote!) (ship! out))
          (persist!)
          (checkpoint!)
          (repair!)))
