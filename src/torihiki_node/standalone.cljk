@@ -56,6 +56,8 @@
             [torihiki-node.store :as store]
             [torihiki-node.claims :as claims]
             [torihiki-node.duties :as duties]
+            [torihiki-node.epoch :as epoch]
+            [inga.attest :as att]
             [torihiki-node.bridge-signer :as bsig]
             ["node:fs" :as fs]
             ["node:http" :as http]
@@ -93,11 +95,35 @@
 (def me (env "W" "w1"))
 
 (def peer-url
-  "`name -> ws://host:port`, parsed from PEERS=w1@ws://…,w2@ws://…"
+  "`name -> ws://host:port`, parsed from PEERS=w1@ws://…,w2@ws://…
+
+  An ADDRESS BOOK, not the validator set: with epochs (`torihiki-node.epoch`)
+  the set is chain state, and a validator that joins later is reached at the
+  address listed here."
   (into {} (for [p (str/split (env "PEERS" "") #",")
                  :when (str/includes? p "@")
                  :let [[n u] (str/split p #"@" 2)]]
              [n u])))
+
+(def http-peer-url
+  "`name -> http://host:port` for asking a peer about its state (`HTTP_PEERS`,
+  same shape as PEERS). Without it, the local-cluster convention 8800 + n."
+  (into {} (for [p (str/split (env "HTTP_PEERS" "") #",")
+                 :when (str/includes? p "@")
+                 :let [[n u] (str/split p #"@" 2)]]
+             [n u])))
+
+(defn- http-of [w]
+  (or (get http-peer-url w)
+      (str "http://127.0.0.1:" (+ 8800 (js/parseInt (subs w 1) 10)))))
+
+;; The consensus segment this node runs (`torihiki-node.epoch`): segment 0 is
+;; the configured chain; each epoch the chain installs starts the next.
+(defonce seg (atom {:n 0 :base 0 :witnesses witnesses :pubkeys {}}))
+;; Every segment so far, for verifying evidence from any of them.
+(defonce segments (atom [{:n 0 :base 0}]))
+
+(defn- current-witnesses [] (:witnesses @seg))
 
 (def tick-ms
   "How often the clock runs. **10 by default, and it is a backstop here.**
@@ -152,7 +178,12 @@
   seed override existed and the matching public half did not, which made
   `SEED_<w>` a switch that broke the chain rather than one that secured it."
   [w]
-  (or (configured-pub w) (derived-pub w)))
+  (or (get-in @seg [:pubkeys w])
+      (configured-pub w)
+      (when (get keys-of w) (derived-pub w))
+      ;; A name outside the configured list (a validator that joined by
+      ;; registering) on a devnet chain, whose keys are derived.
+      (b64 (.export (:public (key-from-seed (seed-for w))) #js {:format "der" :type "spki"}))))
 
 (def key-provenance
   "Where every key in this validator set came from, and what that means.
@@ -185,7 +216,8 @@
 
 (defn- sign-as [w]
   (fn [payload]
-    (b64 (nc/sign nil (js/Buffer.from payload "utf8") (:private (get keys-of w))))))
+    (b64 (nc/sign nil (js/Buffer.from payload "utf8")
+                  (:private (or (get keys-of w) (key-from-seed (seed-for w))))))))
 
 (defn- verify-fn [w payload sig]
   (try
@@ -245,30 +277,42 @@
     ;; a reason that looks like cryptography and is not.
     (update m :tx (fn [t] (cond-> t (string? (:tx t)) (update :tx keyword))))))
 
-(def machine
-  {;; A THUNK. The book is a struct of typed arrays, so a ready-made exchange
-   ;; in this map would be ONE book shared by every replica in a process.
-   :init-fn genesis-exchange
+(defn- machine-for
+  "The machine for segment `sg`. `init-fn` builds its first state (the genesis
+  exchange for segment 0, the state at the boundary after that).
+
+  Engine heights are the segment's base plus inga's, and a segment whose
+  engine has moved to a later epoch applies nothing more: see
+  `torihiki-node.epoch`."
+  [sg init-fn segs]
+  {:init-fn init-fn
    :apply-fn (fn [ex block]
-               ;; The block header is the clock. Nothing below may read a real
-               ;; one: two replicas applying the same block at different wall
-               ;; times would compute different funding and diverge.
-               (st/apply-block ex {:height (:inga.block/height block)
+               (if (or (epoch/frozen? ex (:n sg))
+                       ;; A later segment's genesis IS the boundary block,
+                       ;; already applied by the segment before. Applying it
+                       ;; again re-ran the boundary and turned the epoch once
+                       ;; more, every block. Segment 0 is left as it was.
+                       (and (pos? (:n sg)) (zero? (:inga.block/height block))))
+                 ex
+               (st/apply-block ex {:height (epoch/engine-height sg (:inga.block/height block))
                                    :ts (:inga.block/ts block)
                                    :txs (mapv decode-tx (:inga.block/proposals block))}
                                {:chain-id chain-id :verify-fn tx-verify
                                 :derive-account addr/derive
-                                ;; Equivocation evidence is votes, verified
-                                ;; under the consensus key the chain records.
-                                :vote-verify-fn (duties/vote-verifier chain-id tx-verify)}))
+                                ;; From the chain's own epochs, not this node's
+                                ;; list: every replica derives the same table.
+                                :vote-verify-fn (epoch/vote-verifier chain-id (epoch/segments-of ex)
+                                                                     tx-verify)})))
    :root-fn st/state-root})
 
-;; ── the node ────────────────────────────────────────────────────────────────
+(defonce segment-init (atom genesis-exchange))
 
 (defn- replica-opts []
+  (let [sg @seg]
+  (cond->
   {:witness me
-                    :witnesses witnesses
-                    :quorum (c/quorum-size (count witnesses))
+                    :witnesses (:witnesses sg)
+                    :quorum (c/quorum-size (count (:witnesses sg)))
                     ;; hex of SHA-256 over the canonical block.
                     ;;
                     ;; This was `wire/wire-id` applied to the canonical block,
@@ -290,10 +334,11 @@
                     ;; nothing else, because no standalone chain is deployed;
                     ;; leaving them apart costs a migration later.
                     :hash-fn store/block-cid
-                    :chain-id chain-id
+                    :chain-id (epoch/segment-chain-id chain-id (:n sg))
                     :sign-fn (sign-as me)
                     :verify-fn verify-fn
-                    :machine machine})
+                    :machine (machine-for sg @segment-init @segments)}
+    (:genesis sg) (assoc :genesis (:genesis sg)))))
 
 ;; One definition of what this replica IS. `resume` needs exactly the options
 ;; `replica` took — the injected seams are functions and a snapshot cannot
@@ -380,15 +425,28 @@
           ;; recorded is a vote that can be cast twice.
           false)))))
 
+(def ^:private member-only
+  "Messages only a member of the current set may send or be heard sending."
+  #{:vote :new-view :proposal})
+
+(defn- member? [w] (boolean (some #{w} (:witnesses @seg))))
+
 (defn- ship-kept!
   "Send `out` once the vote watermark is on disk. If the write fails, the
   votes stay home and everything else still goes: a new-view or a sync
   request is sent once per view, and dropping it with the vote would cost a
-  whole timeout for no safety gained."
+  whole timeout for no safety gained.
+
+  An OBSERVER — a node outside the current set — sends none of the member
+  messages. Its votes verify (it holds a real key) and inga folds a verified
+  vote into a certificate; a certificate naming a non-member is then refused
+  everywhere as `:not-admitted`, and the chain stalled on exactly that with
+  w5 observing."
   [out]
-  (if (keep-vote!)
-    (ship! out)
-    (ship! (remove #(= :vote (get-in % [:msg :type])) out))))
+  (let [out (if (member? me) out (remove #(member-only (get-in % [:msg :type])) out))]
+    (if (keep-vote!)
+      (ship! out)
+      (ship! (remove #(= :vote (get-in % [:msg :type])) out)))))
 
 (defonce halted (atom nil))
 
@@ -402,7 +460,12 @@
 
 (defn- feed! [msg]
   (swap! stats update :msgs-in inc)
-  (when-not @halted
+  (when-not (or @halted
+                ;; The receiving half of the same rule: a vote, new-view or
+                ;; proposal from outside the current set is not consensus.
+                (and (member-only (:type msg))
+                     (let [w (or (:witness msg) (get-in msg [:block :inga.block/proposer]))]
+                       (and w (not (member? (wire/wire-id w)))))))
   (let [[s' out] (r/on-message @state msg (now))]
     (reset! state s')
     (note-height! (r/height s'))
@@ -513,7 +576,7 @@
 
       (rpc-error id -32601 (str "method not found: " method)))))
 
-(declare bridge-signatures duty-status)
+(declare bridge-signatures duty-status epoch-answer)
 
 (defn- handle-http [^js req ^js res]
   (let [url (js/URL. (.-url req) "http://x")
@@ -578,6 +641,10 @@
       "/.well-known/torihiki"
       (json-response res 200 (claims/status :validator))
 
+      ;; A segment this node holds, for a peer that missed the handoff.
+      "/epoch"
+      (json-response res 200 (epoch-answer (js/parseInt (or (q "n") "0") 10)))
+
       ;; What this validator does besides voting, and whether it may.
       "/duties"
       (json-response res 200 (duty-status))
@@ -609,6 +676,9 @@
       ;; current — which is what a replica being repaired needs.
       (json-response res 200
                      {:ok true
+                      ;; Which segment this is: a replica repairs only from
+                      ;; peers in its own (`repair!`).
+                      :segment (:n @seg)
                       :height (r/height s)
                       :root (st/state-root ex)
                       :edn (tsnap/write-string
@@ -653,7 +723,15 @@
 
 (def data-dir (env "DATA_DIR" (str ".torihiki/" me)))
 
-(def ^:private log-path (str data-dir "/chain.jsonl"))
+(defn- seg-dir
+  "Where the current segment's log, checkpoints and vote watermark live:
+  DATA_DIR itself for segment 0, so an existing node's files are where they
+  were; `epoch-<n>/` under it after that."
+  []
+  (let [n (:n @seg)]
+    (if (zero? n) data-dir (str data-dir "/epoch-" n))))
+
+(defn- log-path [] (str (seg-dir) "/chain.jsonl"))
 
 (defonce persisted (atom 0))
 
@@ -691,7 +769,7 @@
     (when (< from (count chain))
       (let [new (subvec chain (min from (count chain)))]
         (fs/appendFileSync
-         log-path
+         (log-path)
          (str (str/join "\n" (for [b new]
                                 (js/JSON.stringify
                                  (clj->js (wire/encode {:type :proposal :block b})))))
@@ -732,7 +810,7 @@
 (defonce last-ckpt (atom -1))
 
 (defn- ckpt-path [h]
-  (str data-dir "/snap-" (.padStart (str h) 12 "0") ".edn"))
+  (str (seg-dir) "/snap-" (.padStart (str h) 12 "0") ".edn"))
 
 (defn- checkpoint!
   "The replica as data, so a restart does not have to fold the whole log.
@@ -759,8 +837,8 @@
         (doseq [f (drop checkpoints-kept
                         (sort (fn [a b] (compare b a))
                               (filter #(str/starts-with? % "snap-")
-                                      (array-seq (fs/readdirSync data-dir)))))]
-          (fs/unlinkSync (str data-dir "/" f)))
+                                      (array-seq (fs/readdirSync (seg-dir))))))]
+          (fs/unlinkSync (str (seg-dir) "/" f)))
         (catch :default _
           ;; A checkpoint that fails is a slower restart, not a broken
           ;; replica. It must never take the tick with it.
@@ -773,16 +851,16 @@
   parse is skipped rather than fatal — it is one slower start, and the older
   ones behind it are exactly what `checkpoints-kept` is for."
   []
-  (when (fs/existsSync data-dir)
+  (when (fs/existsSync (seg-dir))
     (some (fn [f]
             (try
               (let [h (js/parseInt (subs f 5 (- (count f) 4)) 10)
-                    snap (tsnap/read-string* (fs/readFileSync (str data-dir "/" f) "utf8"))]
+                    snap (tsnap/read-string* (fs/readFileSync (str (seg-dir) "/" f) "utf8"))]
                 [h (update snap :machine-state tsnap/restore)])
               (catch :default _ nil)))
           (sort (fn [a b] (compare b a))
                 (filter #(str/starts-with? % "snap-")
-                        (array-seq (fs/readdirSync data-dir)))))))
+                        (array-seq (fs/readdirSync (seg-dir))))))))
 
 (defn- restore!
   "Replay the log into the replica.
@@ -799,8 +877,8 @@
   blocks after a hole do not attach to anything, so continuing would build a
   chain this replica never agreed to out of the pieces of one it did."
   []
-  (fs/mkdirSync data-dir #js {:recursive true})
-  (reset! voted-view-path (str data-dir "/voted-view"))
+  (fs/mkdirSync (seg-dir) #js {:recursive true})
+  (reset! voted-view-path (str (seg-dir) "/voted-view"))
   ;; The watermark first. The log says what this replica ADOPTED; it does not
   ;; say what it voted for, so `replay` alone comes back believing it has never
   ;; voted — which is exactly the window the contract closes.
@@ -821,8 +899,8 @@
       (swap! state (fn [_] (r/resume (replica-opts) snap)))
       (reset! last-ckpt ck)
       (println (str "  resumed from checkpoint " ck)))
-    (when (fs/existsSync log-path)
-      (let [lines (remove str/blank? (str/split (fs/readFileSync log-path "utf8") #"\n"))
+    (when (fs/existsSync (log-path))
+      (let [lines (remove str/blank? (str/split (fs/readFileSync (log-path) "utf8") #"\n"))
             blocks (reduce (fn [acc l]
                              (let [[msg] (wire/decode (js->clj (js/JSON.parse l)))]
                                (if-let [b (:block msg)]
@@ -982,8 +1060,13 @@
     (when (and (vals/enabled? (:machine-state @state))
                (> t (+ @last-evidence-check 1000)))
       (reset! last-evidence-check t)
-      (doseq [tx (duties/evidence-to-submit (:machine-state @state)
-                                            (:equivocations @state) @evidence-sent)]
+      (doseq [tx (duties/evidence-to-submit
+                  (:machine-state @state)
+                  ;; inga counts heights within the segment; the engine,
+                  ;; across all of them.
+                  (map #(update % :inga.evidence/height (partial epoch/engine-height @seg))
+                       (:equivocations @state))
+                  @evidence-sent)]
         (swap! evidence-sent conj (vals/evidence-key tx))
         (attest! tx)))))
 
@@ -1148,12 +1231,208 @@
      :binary-knows duties/max-protocol
      :halted @halted
      :validator-set (when (vals/enabled? ex) (mapv :witness (vals/active-set ex)))
-     :set-mismatch (duties/set-mismatch ex witnesses pub-of)
+     :segment (select-keys @seg [:n :base :witnesses])
+     :set-mismatch (duties/set-mismatch ex (current-witnesses) pub-of)
      :genesis-root @genesis-root
      :evidence-sent (count @evidence-sent)
      :own-pending (count @own-pending)
      :bridge (when (:bridge ex) (select-keys @bridge-state [:from :tip :errors :unsettled]))
      :oracle @oracle-state}))
+
+;; ── epochs (torihiki-node.epoch) ───────────────────────────────────────────
+
+(defn- epoch-file [dir] (str dir "/epoch.edn"))
+(defn- machine-file [dir] (str dir "/machine.edn"))
+(defn- boundary-file [dir] (str dir "/boundary.edn"))
+
+(defn- install-segment!
+  "Run segment `sg` from now on: a new replica on its set and genesis, its own
+  log and watermark, starting from `machine-state` (the state at its base)."
+  [sg machine-data]
+  (reset! seg sg)
+  (swap! segments (fn [ss] (vec (distinct (conj ss (select-keys sg [:n :base]))))))
+  (reset! segment-init (fn [] (tsnap/restore machine-data)))
+  (reset! state (r/replica (replica-opts)))
+  (reset! persisted 0)
+  (reset! last-ckpt -1)
+  (fs/mkdirSync (seg-dir) #js {:recursive true})
+  (reset! voted-view-path (str (seg-dir) "/voted-view"))
+  (reset! voted-view-on-disk -1))
+
+(defn- descriptor
+  "What a segment is, as data a peer can compare: everything but the machine
+  state, plus that state's root."
+  [sg machine-data]
+  {:n (:n sg) :base (:base sg) :witnesses (:witnesses sg) :pubkeys (:pubkeys sg)
+   :genesis-parent (:inga.block/parent-hash (:genesis sg))
+   :genesis-ts (:inga.block/ts (:genesis sg))
+   :root (st/state-root (tsnap/restore machine-data))})
+
+(declare catch-up!)
+
+(defn- bootstrap-segment!
+  "Propose a fresh segment's first block, if this node leads height 1. Every
+  other member waits for exactly this proposal (inga's `start`), so every path
+  into a segment has to make it — the handoff, a catch-up, and a restart. A
+  leader that caught up without it left the new set at height 0 for good."
+  []
+  (when (and (zero? (r/height @state)) (= me (c/leader-for (:witnesses @seg) 1)))
+    (let [[s' out] (r/start @state (now))]
+      (reset! state s')
+      (ship-kept! out))))
+
+(defn- handoff!
+  "Leave the frozen segment for the one the chain installed. Called once the
+  engine has applied a boundary block — on every replica at the same block,
+  since the engine decides it."
+  []
+  (let [s @state
+        ex (:machine-state s)
+        old @seg
+        nxt (epoch/next-segment ex)
+        b-inga (- (:base nxt) (:base old))
+        b-block (some #(when (= b-inga (:inga.block/height %)) %) (:chain s))]
+    (if-not b-block
+      ;; B is not in this replica's chain (a resumed chain keeps only a short
+      ;; tail). Inventing a parent would derive a genesis nobody else has and
+      ;; strand this node; its peers have the handoff, so ask them.
+      (catch-up!)
+    (let [parent (store/block-cid b-block)
+        nxt (assoc nxt :genesis (epoch/genesis-block nxt parent (:ts ex)))
+        data (tsnap/capture ex)
+        boundary {:block b-block :qc (get (:qcs s) parent)}
+        carried (concat (:pending s) (epoch/abandoned-proposals (:chain s) b-inga))]
+    (reset! last-evidence-check 0)
+    (submit-evidence!)
+    (install-segment! nxt data)
+    (fs/writeFileSync (machine-file (seg-dir)) (tsnap/write-string data))
+    (fs/writeFileSync (boundary-file (seg-dir)) (tsnap/write-string boundary))
+    (fs/writeFileSync (epoch-file (seg-dir)) (tsnap/write-string (descriptor nxt data)))
+    (doseq [t carried] (swap! state r/submit t))
+    (println (str "torihiki " me ": epoch " (:n nxt) " from height " (:base nxt)
+                  ", set " (str/join "," (:witnesses nxt))
+                  (when-not (some #{me} (:witnesses nxt)) " (this node observes)")))
+    (bootstrap-segment!)))))
+
+(defn- local-pub
+  "The public half of the key this node actually signs with."
+  []
+  (b64 (.export (:public (or (get keys-of me) (key-from-seed (seed-for me))))
+                #js {:format "der" :type "spki"})))
+
+(defn- check-own-key!
+  "After an on-chain key rotation the set expects a key this node may not
+  hold. Signing with the old one would only produce votes nobody accepts and
+  transactions from an account the chain no longer associates with it; stop
+  and say which key to install instead."
+  []
+  (when-let [k (get-in @seg [:pubkeys me])]
+    (when (and (not= k (local-pub)) (not @halted))
+      (reset! halted (str "the chain's consensus key for " me " is " k
+                          " and this node signs with " (local-pub)
+                          "; configure SEED_" (str/upper me) " for the rotated key"))
+      (js/console.error (str "torihiki " me ": HALTED — " @halted)))))
+
+(defn- load-latest-segment!
+  "On start: resume the newest segment this node has on disk."
+  []
+  (when (fs/existsSync data-dir)
+    (let [ns* (sort > (keep #(some->> (re-matches #"epoch-([0-9]+)" %) second (js/parseInt))
+                            (array-seq (fs/readdirSync data-dir))))]
+      ;; The newest complete one; the ones before it only matter as
+      ;; history, which the engine's own epochs already carry.
+      (when-let [n (first (filter #(let [dir (str data-dir "/epoch-" %)]
+                                     (and (fs/existsSync (epoch-file dir)) (fs/existsSync (machine-file dir))))
+                                  ns*))]
+        (let [dir (str data-dir "/epoch-" n)
+              d (tsnap/read-string* (fs/readFileSync (epoch-file dir) "utf8"))
+              data (tsnap/read-string* (fs/readFileSync (machine-file dir) "utf8"))
+              sg (-> (select-keys d [:n :base :witnesses :pubkeys])
+                     (assoc :genesis (epoch/genesis-block d (:genesis-parent d) (:genesis-ts d))))]
+          (install-segment! sg data))))))
+
+(defonce next-catch-up (atom 0))
+
+(defn- boundary-ok?
+  "Is `b` ({:block :qc}) the boundary `d` names, certified by the current
+  segment's set under its own chain id?"
+  [d b]
+  (let [sg @seg
+        blk (:block b)
+        qc (:qc b)]
+    (boolean
+     (and blk qc
+          (= (:genesis-parent d) (store/block-cid blk))
+          (= (- (:base d) (:base sg)) (:inga.block/height blk))
+          (= (:genesis-parent d) (:inga.qc/block-hash qc))
+          (nil? (att/verify-certificate qc (epoch/segment-chain-id chain-id (:n sg))
+                                        (c/quorum-size (count (:witnesses sg)))
+                                        verify-fn (set (:witnesses sg))))))))
+
+(defn- catch-up!
+  "A node that missed a boundary — down while the set handed off — takes the
+  next segment from its peers, on f + 1 identical descriptors and a machine
+  state whose root matches them."
+  []
+  (let [t (now)
+        want (inc (:n @seg))]
+    (when (>= t @next-catch-up)
+      (reset! next-catch-up (+ t 10000))
+      ;; Only members of the segment this node is leaving: f + 1 of THEM
+      ;; includes an honest one. Counting the whole address book let f
+      ;; members and one observer agree on a forgery.
+      (let [peers (remove #{me} (current-witnesses))
+            need (inc (quot (dec (count (current-witnesses))) 3))]
+        (-> (js/Promise.all
+             (clj->js (for [p peers]
+                        (-> (js/fetch (str (http-of p) "/epoch?n=" want)
+                                      #js {:signal (js/AbortSignal.timeout 5000)})
+                            (.then #(.json %))
+                            (.then #(js->clj % :keywordize-keys true))
+                            (.catch (fn [_] nil))))))
+            (.then (fn [rs]
+                     (let [rs (->> (array-seq rs)
+                                   (remove #(or (nil? %) (:error %)))
+                                   ;; Through JSON every map key came back a
+                                   ;; keyword; witness names are strings.
+                                   (map #(update-in % [:descriptor :pubkeys]
+                                                    (fn [m] (into {} (map (fn [[k v]] [(name k) v])) m))))
+                                   (map #(update % :boundary
+                                                 (fn [b] (when (string? b)
+                                                           (try (tsnap/read-string* b) (catch :default _ nil)))))))
+                           d (epoch/agreed-handoff (map :descriptor rs) need)
+                           ;; And the boundary block itself, certified by the
+                           ;; set being left: the new genesis's parent is a
+                           ;; block that set actually agreed on.
+                           src (some #(when (and (= d (:descriptor %)) (boundary-ok? d (:boundary %))) %) rs)]
+                       (when (and d src (= want (:n d)) (> want (:n @seg)))
+                         (fs/mkdirSync (str data-dir "/epoch-" want) #js {:recursive true})
+                         (let [data (tsnap/read-string* (:machine src))]
+                           (when (= (:root d) (st/state-root (tsnap/restore data)))
+                             (let [sg (-> (select-keys d [:n :base :witnesses :pubkeys])
+                                          (assoc :genesis (epoch/genesis-block d (:genesis-parent d)
+                                                                               (:genesis-ts d))))]
+                               (install-segment! sg data)
+                               (fs/writeFileSync (machine-file (seg-dir)) (tsnap/write-string data))
+                               (fs/writeFileSync (boundary-file (seg-dir)) (tsnap/write-string (:boundary src)))
+                               (fs/writeFileSync (epoch-file (seg-dir)) (tsnap/write-string d))
+                               (println (str "torihiki " me ": caught up to epoch " want
+                                             " from " (count rs) " peers"))
+                               (bootstrap-segment!))))))))
+            (.catch (fn [_] nil)))))))
+
+(defn- epoch-answer
+  "Segment `n` as this node holds it, for a peer catching up."
+  [n]
+  (let [dir (str data-dir "/epoch-" n)]
+    (if (and (pos? n) (fs/existsSync (epoch-file dir)))
+      {:descriptor (tsnap/read-string* (fs/readFileSync (epoch-file dir) "utf8"))
+       :machine (fs/readFileSync (machine-file dir) "utf8")
+       ;; Sent as EDN text: a block and a certificate have namespaced keys and
+       ;; sets that JSON would flatten.
+       :boundary (when (fs/existsSync (boundary-file dir))
+                   (fs/readFileSync (boundary-file dir) "utf8"))}
+      {:error "no such segment here"})))
 
 (defonce next-repair (atom 0))
 (defonce stall (atom {:at -1 :since 0}))
@@ -1215,16 +1494,18 @@
                (> (- now (:since @stall)) stall-ms))
       (reset! next-repair (+ now 5000))
       (-> (js/Promise.all
-           (clj->js (for [p (remove #{me} witnesses)]
-                      (-> (js/fetch (str "http://127.0.0.1:"
-                                         (+ 8800 (js/parseInt (subs p 1) 10)) "/snapshot"))
+           (clj->js (for [p (remove #{me} (current-witnesses))]
+                      (-> (js/fetch (str (http-of p) "/snapshot"))
                           (.then #(.json %))
                           (.then #(js->clj % :keywordize-keys true))
                           (.catch (fn [_] nil))))))
           (.then (fn [rs]
                    (let [rs (remove nil? (array-seq rs))]
-                     (when (and (= (count rs) (dec (count witnesses)))
+                     ;; Every OTHER member: for an observer that is all of
+                     ;; them, and counting `(dec n)` left it never repaired.
+                     (when (and (= (count rs) (count (remove #{me} (current-witnesses))))
                                 (every? :ok rs)
+                                (every? #(= (:n @seg) (:segment %)) rs)
                                 (apply = (map :height rs))
                                 (apply = (map :root rs))
                                 ;; Only forward. A quorum snapshot at or below
@@ -1235,7 +1516,7 @@
                        (let [snap (-> (tsnap/read-string* (:edn (first rs)))
                                       (update :machine-state tsnap/restore))]
                          (reset! state (r/resume (replica-opts) snap))
-                         (fs/writeFileSync log-path "")
+                         (fs/writeFileSync (log-path) "")
                          (reset! persisted 0)
                          (reset! last-ckpt -1)
                          (println (str "  repaired from the quorum at height "
@@ -1251,8 +1532,10 @@
   node rather than a line missing from `common.env`."
   []
   (cond-> []
-    (not (some #{me} witnesses))
-    (conj (str "W=" me " is not in WITNESSES=" (str/join "," witnesses)))
+    ;; A node outside the genesis set may run as an observer, and join the set
+    ;; later by registering; it still needs an address.
+    (not (or (some #{me} witnesses) (contains? peer-url me)))
+    (conj (str "W=" me " is neither in WITNESSES=" (str/join "," witnesses) " nor in PEERS"))
     (not (contains? peer-url me))
     (conj (str "PEERS has no entry for " me " (expected " me "@ws://host:port)"))
     (some #(not (contains? peer-url %)) witnesses)
@@ -1306,9 +1589,13 @@
     ;; BEFORE dialling. A replica that starts talking at genesis while its own
     ;; history is still on disk is a replica proposing against a chain it is
     ;; about to discover it already has.
+    (load-latest-segment!)
     (restore!)
     (reset! out-node
-            (nws/make-node {:peers (vec (remove #{me} witnesses))
+            ;; Everybody in the address book, not just the current set: the
+            ;; set changes at epoch boundaries and the sockets should not have
+            ;; to.
+            (nws/make-node {:peers (vec (remove #{me} (keys peer-url)))
                             :url-of peer-url
                             :on-message (fn [_ m] (feed! m))}))
     (.listen (http/createServer handle-http)
@@ -1317,10 +1604,7 @@
     ;; it is the one proposal made without one — every other replica waits for
     ;; it rather than proposing its own, which is what stops four replicas from
     ;; each starting a different chain.
-    (when (= me (c/leader-for witnesses 1))
-      (let [[s' out] (r/start @state (now))]
-        (reset! state s')
-        (ship-kept! out)))
+    (bootstrap-segment!)
     (js/setInterval
      (fn []
        (when-let [nd @out-node] ((:tick! nd)))
@@ -1340,7 +1624,14 @@
          (when-not @halted
            (persist!)
            (checkpoint!)
-           (repair!)
+           (check-own-key!)
+           (if (epoch/handoff-due? (:machine-state @state) @seg)
+             (handoff!)
+             (do (repair!)
+                 ;; Asked every few seconds, not only when stalled: an
+                 ;; observer that syncs slowly is never stalled, and it may be
+                 ;; a member of the next set the others are waiting for.
+                 (catch-up!)))
            (submit-evidence!)
            (resend-lost!)))))
      tick-ms)
