@@ -146,5 +146,13 @@ convention 8800 + n.
 w5 registers and bonds, w4 retires; at the boundary every node hands off,
 w1 w2 w3 w5 certify, w4 observes, and all replicas agree on the chain.
 
+Catch-up counts only members of the segment being left, needs f + 1 of them
+to agree, and checks the boundary block against that set's certificate. A node
+whose consensus key was rotated on chain halts until it is given the new key.
+
+**Upgrading:** every node of a chain with `CHAIN_VALIDATORS=1` must run this
+before the chain's first epoch boundary; a node that crosses one on an older
+build keeps applying blocks the others no longer apply.
+
 **Not wired:** the Durable Object validator (`validator.cljk`) has none of
 these duties and does not follow epochs.

@@ -48,3 +48,9 @@
 (deftest a-late-node-takes-the-handoff-on-f-plus-one
   (is (= {:n 1} (e/agreed-handoff [{:n 1} {:n 1} {:n 9}] 2)))
   (is (nil? (e/agreed-handoff [{:n 1} {:n 9} nil] 2))))
+
+(deftest the-segment-table-comes-from-the-chain
+  (is (= [{:n 0 :base 0}] (e/segments-of {})))
+  (is (= [{:n 0 :base 0} {:n 1 :base 100} {:n 2 :base 250}]
+         (e/segments-of {:prev-epoch {:n 1 :from 101} :epoch {:n 2 :from 251}}))))
+

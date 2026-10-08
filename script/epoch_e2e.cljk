@@ -68,17 +68,21 @@
             (fail! "the new set is not w1 w2 w3 w5"))
         ;; A node that missed the boundary catches up from its peers; give it
         ;; the time that takes before judging progress.
-        _ (wait 15000)
+        _ (wait 30000)
         h1 (p/all (for [w (keys nodes)] (GET w "/head")))
         _ (wait 10000)
         h2 (p/all (for [w (keys nodes)] (GET w "/head")))
         _ (doseq [[w a b] (map vector (keys nodes) h1 h2)]
             (println " " w "inga height" (:height a) "->" (:height b) "equivocators" (:equivocators b)))
         moved (map (fn [a b] (- (:height b) (:height a))) h1 h2)
-        common (- (apply min (map :height h2)) 20)
-        hashes (p/all (for [w (keys nodes)] (GET w (str "/hash-at?h=" common))))
-        _ (println "  hashes at" common ":" (count (set (map :hash hashes))) "distinct")]
+        ;; Near the tip: a resumed or caught-up replica keeps only a tail of
+        ;; its chain, and a height it does not hold answers null, which is
+        ;; absence, not disagreement.
+        common (- (apply min (map :height h2)) 3)
+        answers (p/all (for [w (keys nodes)] (GET w (str "/hash-at?h=" common))))
+        hashes (keep :hash answers)
+        _ (println "  hashes at" common ":" (count hashes) "reported," (count (set hashes)) "distinct")]
   (cond
     (not (every? #(> % 20) moved)) (fail! (str "the chain did not keep up after the handoff: " (vec moved)))
-    (not= 1 (count (set (map :hash hashes)))) (fail! (str "replicas disagree at " common))
+    (or (< (count hashes) 3) (not= 1 (count (set hashes)))) (fail! (str "replicas disagree at " common))
     :else (println "PASS: consensus follows the set the chain installed")))

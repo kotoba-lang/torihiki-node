@@ -61,6 +61,16 @@
   (c/make-block {:height 0 :parent-hash parent-cid :proposals []
                  :proposer (first (:witnesses seg)) :ts ts :justify nil}))
 
+(defn segments-of
+  "The segment table as the CHAIN records it: segment 0, and the current and
+  previous engine epochs with their bases. Every replica derives the same one
+  from the same state, which a node-local list cannot promise."
+  [ex]
+  (vec (distinct (concat [{:n 0 :base 0}]
+                         (for [e [(:prev-epoch ex) (:epoch ex)]
+                               :when (and e (pos? (:n e 0)))]
+                           {:n (:n e) :base (dec (:from e))})))))
+
 (defn engine-height [seg inga-height] (+ (:base seg) inga-height))
 
 (defn segment-of-height
