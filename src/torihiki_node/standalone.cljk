@@ -80,6 +80,8 @@
             [torihiki.bridge :as br]
             [torihiki.governance :as gov]
             [torihiki.validators :as vals]
+            [torihiki.light :as light]
+            [torihiki.commit :as cm]
             [torihiki.state :as st]))
 
 (defn- env [k d] (or (some-> js/process .-env (aget k)) d))
@@ -92,7 +94,15 @@
   read the same list in the same order or they lead different rounds."
   (vec (str/split (env "WITNESSES" "w1,w2,w3,w4") #",")))
 
-(def me (env "W" "w1"))
+(def observer?
+  "`OBSERVER=1`: a full node anybody can run. It is in nobody's address book,
+  listens for no peer connections, never votes, and follows the chain by
+  asking members for blocks over plain HTTP (`/blocks`) — verified by inga's
+  own sync checks (every certificate, every link) before its engine applies
+  them. Nothing about it depends on where the validators run."
+  (boolean (env "OBSERVER" nil)))
+
+(def me (env "W" (if (env "OBSERVER" nil) "observer" "w1")))
 
 (def peer-url
   "`name -> ws://host:port`, parsed from PEERS=w1@ws://…,w2@ws://…
@@ -277,6 +287,31 @@
     ;; a reason that looks like cryptography and is not.
     (update m :tx (fn [t] (cond-> t (string? (:tx t)) (update :tx keyword))))))
 
+;; ── root attestations (D5 light clients) ────────────────────────────────────
+
+(def ^:private attest-every
+  "Engine heights a validator signs its state root at. A root costs a pass over
+  the state, so not every block; often enough that a light client never waits
+  long for one."
+  (js/parseInt (env "ATTEST_EVERY" "20") 10))
+
+(defonce attestations (atom (sorted-map)))
+(defonce attested-leaves (atom (sorted-map)))
+
+(declare sign-as)
+
+(defn- record-attestation!
+  "Sign `(chain, height, root)` for an engine state at an attestation height,
+  and keep its leaves a while so a proof can be served for the same height."
+  [ex]
+  (let [h (:height ex 0)]
+    (when (and (pos? h) (zero? (mod h attest-every)) (not (contains? @attestations h)))
+      (let [leaves (st/canonical-leaves ex)
+            root (:hash (:root (cm/tree leaves)))]
+        (swap! attestations (fn [m] (into (sorted-map) (take-last 64 (assoc m h {:root root
+                                                                                 :sig ((sign-as me) (light/root-payload chain-id h root))})))))
+        (swap! attested-leaves (fn [m] (into (sorted-map) (take-last 3 (assoc m h leaves)))))))))
+
 (defn- machine-for
   "The machine for segment `sg`. `init-fn` builds its first state (the genesis
   exchange for segment 0, the state at the boundary after that).
@@ -294,7 +329,8 @@
                        ;; more, every block. Segment 0 is left as it was.
                        (and (pos? (:n sg)) (zero? (:inga.block/height block))))
                  ex
-               (st/apply-block ex {:height (epoch/engine-height sg (:inga.block/height block))
+               (doto
+                (st/apply-block ex {:height (epoch/engine-height sg (:inga.block/height block))
                                    :ts (:inga.block/ts block)
                                    :txs (mapv decode-tx (:inga.block/proposals block))}
                                {:chain-id chain-id :verify-fn tx-verify
@@ -302,7 +338,10 @@
                                 ;; From the chain's own epochs, not this node's
                                 ;; list: every replica derives the same table.
                                 :vote-verify-fn (epoch/vote-verifier chain-id (epoch/segments-of ex)
-                                                                     tx-verify)})))
+                                                                     tx-verify)})
+                 ;; A side record only: what the engine computed is returned
+                 ;; unchanged.
+                 record-attestation!)))
    :root-fn st/state-root})
 
 (defonce segment-init (atom genesis-exchange))
@@ -623,7 +662,7 @@
                       ;; whose peers are quiet look identical from the outside,
                       ;; and the first run could not tell them apart.
                       :live-peers (vec (map str (some-> @out-node :live (apply []))))
-                      :peer-status (into {} (for [[k v] (:peers @(:state @out-node))]
+                      :peer-status (into {} (for [[k v] (some-> @out-node :state deref :peers)]
                                               [(str k) {:state (str (:state v))
                                                         :failures (:failures v)
                                                         :next-in (when (:next-attempt v)
@@ -640,6 +679,43 @@
 
       "/.well-known/torihiki"
       (json-response res 200 (claims/status :validator))
+
+      ;; This validator's signature on its state root at an engine height
+      ;; (`torihiki.light`); `h` omitted, the newest it has.
+      "/attestation"
+      (let [h (some-> (q "h") (js/parseInt 10))
+            [h a] (if h [h (get @attestations h)] (last @attestations))]
+        (if a
+          (json-response res 200 {:chain chain-id :witness me :height h :root (:root a) :sig (:sig a)
+                                  :pubkey (pub-of me)})
+          (json-response res 404 {:error "no attestation at that height here"})))
+
+      ;; An account's merkle-sum proof at an attested height: what a light
+      ;; client checks against a root the set signed.
+      "/proof"
+      (let [a (js/parseInt (or (q "a") "-1") 10)
+            h (some-> (q "h") (js/parseInt 10))
+            [h leaves] (if h [h (get @attested-leaves h)] (last @attested-leaves))
+            p (when leaves (cm/proof leaves (cm/account-leaf-id a)))]
+        (if p
+          (json-response res 200 (assoc p :account a :height h))
+          (json-response res 404 {:error "no proof for that account at that height here"})))
+
+      ;; Committed history of the current segment, for a node that follows by
+      ;; HTTP (an observer). The blocks carry their certificates; the reader
+      ;; verifies them, so this server is trusted for nothing.
+      "/blocks"
+      (let [sgn (js/parseInt (or (q "segment") "0") 10)
+            from (js/parseInt (or (q "from") "1") 10)
+            to (+ from 255)]
+        (json-response res 200
+                       (if (not= sgn (:n @seg))
+                         {:segment (:n @seg) :blocks []}
+                         {:segment (:n @seg)
+                          :blocks (vec (for [b (:chain s)
+                                             :let [h (:inga.block/height b)]
+                                             :when (<= from h to)]
+                                         (wire/encode {:type :proposal :block b})))})))
 
       ;; A segment this node holds, for a peer that missed the handoff.
       "/epoch"
@@ -1180,6 +1256,7 @@
                        :sig (bsig/sign-digest key d)}))})))
 
 (defonce oracle-state (atom {:last nil :errors 0}))
+(defonce follow-state (atom {:busy false :from-peer 0 :errors 0 :fetched 0}))
 
 (def ^:private venues
   "Public spot endpoints, by asset. A validator chooses which of these it
@@ -1232,6 +1309,12 @@
      :halted @halted
      :validator-set (when (vals/enabled? ex) (mapv :witness (vals/active-set ex)))
      :segment (select-keys @seg [:n :base :witnesses])
+     ;; The set's consensus keys as this node runs them, for a light client
+     ;; comparing what several nodes say (script/light_client.cljk).
+     :segment-keys (into (sorted-map) (for [w (current-witnesses)] [w (pub-of w)]))
+     :observer observer?
+     :follow (when observer? (select-keys @follow-state [:fetched :errors]))
+     :attestations (count @attestations)
      :set-mismatch (duties/set-mismatch ex (current-witnesses) pub-of)
      :genesis-root @genesis-root
      :evidence-sent (count @evidence-sent)
@@ -1523,6 +1606,40 @@
                                        (:height (first rs)))))))))
           (.catch (fn [_] nil))))))
 
+(defn- follow-by-http!
+  "How a node outside the set keeps up: every 300 ms, ask one member of the
+  current segment (round robin) for the blocks above this node's tip, and
+  hand them to inga as a sync response — inga checks every certificate and
+  every link before anything is adopted, and the engine applies only what
+  commits. A member that lies or is down costs one poll; the next asks
+  another.
+
+  An `OBSERVER` has nothing else. Every other node runs it too and it does
+  nothing while the node is a member; a validator that retired, or has not
+  joined yet, follows over WebSocket sync as well, and that alone was seen
+  to leave one behind."
+  []
+  (js/setInterval
+   (fn []
+     (when-not (or @halted (:busy @follow-state) (and (not observer?) (member? me)))
+       (let [ms (vec (current-witnesses))
+             i (mod (:from-peer @follow-state) (count ms))
+             w (nth ms i)
+             from (inc (r/height @state))]
+         (swap! follow-state assoc :busy true :from-peer (inc i))
+         (-> (js/fetch (str (http-of w) "/blocks?segment=" (:n @seg) "&from=" from)
+                       #js {:signal (js/AbortSignal.timeout 5000)})
+             (.then #(.json %))
+             (.then (fn [j]
+                      (let [bs (keep #(:block (first (wire/decode (js->clj %))))
+                                     (array-seq (.-blocks j)))]
+                        (when (seq bs)
+                          (swap! follow-state update :fetched + (count bs))
+                          (feed! {:type :sync-response :blocks (vec bs)})))))
+             (.catch (fn [_] (swap! follow-state update :errors inc)))
+             (.finally (fn [] (swap! follow-state assoc :busy false)))))))
+   300))
+
 (defn- config-errors
   "What is wrong with this replica's configuration, before anything listens.
 
@@ -1534,11 +1651,15 @@
   (cond-> []
     ;; A node outside the genesis set may run as an observer, and join the set
     ;; later by registering; it still needs an address.
-    (not (or (some #{me} witnesses) (contains? peer-url me)))
+    (not (or observer? (some #{me} witnesses) (contains? peer-url me)))
     (conj (str "W=" me " is neither in WITNESSES=" (str/join "," witnesses) " nor in PEERS"))
-    (not (contains? peer-url me))
+    (and (not observer?) (not (contains? peer-url me)))
     (conj (str "PEERS has no entry for " me " (expected " me "@ws://host:port)"))
-    (some #(not (contains? peer-url %)) witnesses)
+    (and observer? (some #(not (contains? http-peer-url %)) witnesses))
+    (conj (str "an observer follows by HTTP: HTTP_PEERS is missing "
+               (str/join "," (remove #(contains? http-peer-url %) witnesses))))
+
+    (and (not observer?) (some #(not (contains? peer-url %)) witnesses))
     (conj (str "PEERS is missing "
                (str/join "," (remove #(contains? peer-url %) witnesses))))
 
@@ -1577,27 +1698,30 @@
                              " — this host's genesis parameters differ from the set's"))
       (js/process.exit 2)))
   (let [port (js/parseInt (second (str/split (get peer-url me "x:0") #":(?=[0-9]+$)")) 10)
-        wss (ws/WebSocketServer. #js {:port port})
+        wss (when-not observer? (ws/WebSocketServer. #js {:port port}))
         n (atom 0)]
+    (when wss
     (.on wss "connection"
          (fn [sock]
            (let [peer (str "in-" (swap! n inc))
                  handle (srv/attach! registry peer sock
                                      {:add-listener (fn [s ev f] (.on s ev f))
                                       :on-message (fn [_ m] (feed! m))})]
-             (swap! registry update peer merge handle))))
+             (swap! registry update peer merge handle)))))
     ;; BEFORE dialling. A replica that starts talking at genesis while its own
     ;; history is still on disk is a replica proposing against a chain it is
     ;; about to discover it already has.
     (load-latest-segment!)
     (restore!)
+    (follow-by-http!)
+    (when-not observer?
     (reset! out-node
             ;; Everybody in the address book, not just the current set: the
             ;; set changes at epoch boundaries and the sockets should not have
             ;; to.
             (nws/make-node {:peers (vec (remove #{me} (keys peer-url)))
                             :url-of peer-url
-                            :on-message (fn [_ m] (feed! m))}))
+                            :on-message (fn [_ m] (feed! m))})))
     (.listen (http/createServer handle-http)
              (js/parseInt (env "HTTP_PORT" "8801") 10))
     ;; The height-1 leader bootstraps. Genesis has no certificate to extend, so

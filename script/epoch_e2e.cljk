@@ -69,12 +69,18 @@
         ;; A node that missed the boundary catches up from its peers; give it
         ;; the time that takes before judging progress.
         _ (wait 30000)
-        h1 (p/all (for [w (keys nodes)] (GET w "/head")))
+        ;; ENGINE heights (segment base + inga height): with short epochs
+        ;; another boundary can pass inside the window, and inga's heights
+        ;; start again at 0 in every segment.
+        engine (fn [] (p/all (for [w (keys nodes)]
+                               (p/let [hd (GET w "/head") du (GET w "/duties")]
+                                 (assoc hd :engine (+ (:height hd 0) (get-in du [:segment :base] 0)))))))
+        h1 (engine)
         _ (wait 10000)
-        h2 (p/all (for [w (keys nodes)] (GET w "/head")))
+        h2 (engine)
         _ (doseq [[w a b] (map vector (keys nodes) h1 h2)]
-            (println " " w "inga height" (:height a) "->" (:height b) "equivocators" (:equivocators b)))
-        moved (map (fn [a b] (- (:height b) (:height a))) h1 h2)
+            (println " " w "engine height" (:engine a) "->" (:engine b) "equivocators" (:equivocators b)))
+        moved (map (fn [a b] (- (:engine b) (:engine a))) h1 h2)
         ;; Near the tip: a resumed or caught-up replica keeps only a tail of
         ;; its chain, and a height it does not hold answers null, which is
         ;; absence, not disagreement.

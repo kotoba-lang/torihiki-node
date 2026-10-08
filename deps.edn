@@ -107,7 +107,7 @@
         ;; rather than by a keeper, and cancel-all / amend.
         io.github.kotoba-lang/torihiki
         {:git/url "https://github.com/kotoba-lang/torihiki.git"
-         :git/sha "d298fb519c10716ba138744a98d5e5ffdab50b74"}
+         :git/sha "75abf441207f7424cfe925c05ed60c0ca40763bf"}
         io.github.kotoba-lang/bytes
         {:git/url "https://github.com/kotoba-lang/bytes.git"
          :git/sha "5f977dd3e8ca73185488302841ade390e1979540"}

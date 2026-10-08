@@ -1,0 +1,73 @@
+;; A light client: one account's collateral, proved, from nodes it does not
+;; trust individually (roadmap D5).
+;;
+;;   NODES=http://h1:8801,http://h2:8801,... ACCOUNT=<id> CHAIN_ID=... \
+;;   [SET=w1=<base64 spki>,w2=...]   # the validator set, if you hold it
+;;     kbb --backend sci -cp "src:$CP" script/light_client.cljk
+;;
+;; 1. The set: SET if given; otherwise the set (names AND keys) that more than
+;;    half the nodes asked report identically at /duties. Holding SET is the
+;;    stronger position — it is what a client that tracks epochs would carry.
+;; 2. A height every node can attest: the newest attestation height at least
+;;    two thirds of the set have, asked for at /attestation?h=.
+;; 3. torihiki.light/attested-root: signatures from more than 2/3 of the set
+;;    on one (height, root). Ed25519, verified here with node:crypto.
+;; 4. A proof of the account's leaf at that height, from any node, checked
+;;    against that root (torihiki.light/verify-account).
+;;
+;; Exits 0 printing the proved collateral, or 1 saying which step failed.
+(ns light-client
+  (:require ["node:crypto" :as nc]
+            [kotoba.lang.text :as str]
+            [promesa.core :as p]
+            [torihiki.light :as light]))
+
+(defn- env [k d] (or (aget js/process.env k) d))
+(def nodes (remove str/blank? (str/split (env "NODES" "") #",")))
+(def account (js/parseInt (env "ACCOUNT" "0") 10))
+(def chain-id (env "CHAIN_ID" "torihiki-standalone-1"))
+
+(defn- verify [pubkey payload sig]
+  (try (nc/verify nil (js/Buffer.from payload "utf8")
+                  (nc/createPublicKey #js {:key (js/Buffer.from pubkey "base64") :format "der" :type "spki"})
+                  (js/Buffer.from sig "base64"))
+       (catch :default _ false)))
+
+(defn- GET [url]
+  (-> (js/fetch url #js {:signal (js/AbortSignal.timeout 5000)})
+      (.then #(when (.-ok %) (.json %)))
+      (.then #(some-> % (js->clj :keywordize-keys true)))
+      (.catch (fn [_] nil))))
+
+(defn- fail! [what] (println "NOT VERIFIED:" what) (js/process.exit 1))
+
+(defn- configured-set []
+  (when-let [s (env "SET" nil)]
+    (into {} (for [p (str/split s #",") :let [[w k] (str/split p #"=" 2)]]
+               [w {:pubkey k :weight 1}]))))
+
+(p/let [duties (p/all (map #(GET (str % "/duties")) nodes))
+        reported (frequencies (keep #(some-> % :segment-keys) duties))
+        set* (or (configured-set)
+                 ;; the set more than half the nodes agree on
+                 (some (fn [[s n]] (when (> (* 2 n) (count nodes)) s)) reported))
+        _ (when-not (seq set*) (fail! "no validator set that a majority of nodes agree on (or pass SET)"))
+        members (into {} (map (fn [[w k]] [(name w) (if (map? k) k {:pubkey k :weight 1})])) set*)
+        latest (p/all (map #(GET (str % "/attestation")) nodes))
+        heights (sort > (distinct (keep :height latest)))
+        ;; the newest height some node has, walking down until 2/3 can attest it
+        found (p/loop [hs heights]
+                (if (empty? hs)
+                  nil
+                  (p/let [h (first hs)
+                          as (p/all (map #(GET (str % "/attestation?h=" h)) nodes))
+                          r (light/attested-root (remove nil? as) members chain-id verify)]
+                    (if r r (p/recur (rest hs))))))
+        _ (when-not found (fail! "no root signed by more than 2/3 of the set"))
+        proofs (p/all (map #(GET (str % "/proof?a=" account "&h=" (:height found))) nodes))
+        ok (some #(light/verify-account % found account) (remove nil? proofs))]
+  (if ok
+    (println (str "VERIFIED account " account " collateral " (:collateral ok)
+                  " at height " (:height ok) ", root signed by " (count (:signers ok)) "/"
+                  (count members) " validators " (vec (sort (:signers ok)))))
+    (fail! (str "no node served a proof for account " account " that checks against the signed root"))))
