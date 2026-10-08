@@ -82,6 +82,7 @@
             [torihiki.validators :as vals]
             [torihiki.light :as light]
             [torihiki.commit :as cm]
+            [merkle-sum.core :as ms]
             [torihiki.state :as st]))
 
 (defn- env [k d] (or (some-> js/process .-env (aget k)) d))
@@ -125,7 +126,8 @@
 
 (defn- http-of [w]
   (or (get http-peer-url w)
-      (str "http://127.0.0.1:" (+ 8800 (js/parseInt (subs w 1) 10)))))
+      (when-let [d (second (re-matches #"[^0-9]*([0-9]+)" w))]
+        (str "http://127.0.0.1:" (+ 8800 (js/parseInt d 10))))))
 
 ;; The consensus segment this node runs (`torihiki-node.epoch`): segment 0 is
 ;; the configured chain; each epoch the chain installs starts the next.
@@ -296,21 +298,40 @@
   (js/parseInt (env "ATTEST_EVERY" "20") 10))
 
 (defonce attestations (atom (sorted-map)))
-(defonce attested-leaves (atom (sorted-map)))
+;; The trees themselves, so a proof is a path lookup and not a rebuild of the
+;; whole state per request.
+(defonce attested-trees (atom (sorted-map)))
 
-(declare sign-as)
+(declare sign-as member?)
 
 (defn- record-attestation!
-  "Sign `(chain, height, root)` for an engine state at an attestation height,
-  and keep its leaves a while so a proof can be served for the same height."
+  "At an attestation height, keep the state's tree (any node, so observers
+  can serve proofs too) and, as a member of the set, sign `(chain, epoch,
+  height, root)`. Never allowed to break the block it rides on: it runs in
+  the machine's apply, and a throw there would abort the commit."
   [ex]
-  (let [h (:height ex 0)]
-    (when (and (pos? h) (zero? (mod h attest-every)) (not (contains? @attestations h)))
-      (let [leaves (st/canonical-leaves ex)
-            root (:hash (:root (cm/tree leaves)))]
-        (swap! attestations (fn [m] (into (sorted-map) (take-last 64 (assoc m h {:root root
-                                                                                 :sig ((sign-as me) (light/root-payload chain-id h root))})))))
-        (swap! attested-leaves (fn [m] (into (sorted-map) (take-last 3 (assoc m h leaves)))))))))
+  (try
+    (let [h (:height ex 0)]
+      (when (and (pos? h) (zero? (mod h attest-every)) (not (contains? @attested-trees h)))
+        (let [t (cm/tree (st/canonical-leaves ex))
+              root (:hash (:root t))
+              e (get-in ex [:epoch :n] 0)]
+          (swap! attested-trees (fn [m] (into (sorted-map) (take-last 8 (assoc m h t)))))
+          (when (member? me)
+            (swap! attestations
+                   (fn [m] (into (sorted-map)
+                                 (take-last 64 (assoc m h {:root root :epoch e
+                                                           :sig ((sign-as me) (light/root-payload chain-id e h root))})))))))))
+    (catch :default e
+      (js/console.error (str "torihiki " me ": attestation skipped: " (.-message e))))))
+
+(defn- proof-at
+  "`torihiki.commit/proof`'s answer, from a kept tree."
+  [t id]
+  (when-let [p (ms/inclusion-proof t id)]
+    (when-let [l (first (filter #(= id (:id %)) (:leaves t)))]
+      {:id id :bytes (vec (:bytes l)) :sum (:sum l 0) :proof p
+       :root (:hash (:root t)) :reserves (:sum (:root t))})))
 
 (defn- machine-for
   "The machine for segment `sg`. `init-fn` builds its first state (the genesis
@@ -683,23 +704,27 @@
       ;; This validator's signature on its state root at an engine height
       ;; (`torihiki.light`); `h` omitted, the newest it has.
       "/attestation"
-      (let [h (some-> (q "h") (js/parseInt 10))
-            [h a] (if h [h (get @attestations h)] (last @attestations))]
-        (if a
-          (json-response res 200 {:chain chain-id :witness me :height h :root (:root a) :sig (:sig a)
-                                  :pubkey (pub-of me)})
-          (json-response res 404 {:error "no attestation at that height here"})))
+      (let [h (some-> (q "h") (js/parseInt 10))]
+        (if (and h (js/isNaN h))
+          (json-response res 400 {:error "h must be an integer"})
+          (let [[h a] (if h [h (get @attestations h)] (last @attestations))]
+            (if a
+              (json-response res 200 {:chain chain-id :witness me :epoch (:epoch a) :height h
+                                      :root (:root a) :sig (:sig a) :pubkey (pub-of me)})
+              (json-response res 404 {:error "no attestation at that height here"})))))
 
       ;; An account's merkle-sum proof at an attested height: what a light
       ;; client checks against a root the set signed.
       "/proof"
-      (let [a (js/parseInt (or (q "a") "-1") 10)
-            h (some-> (q "h") (js/parseInt 10))
-            [h leaves] (if h [h (get @attested-leaves h)] (last @attested-leaves))
-            p (when leaves (cm/proof leaves (cm/account-leaf-id a)))]
-        (if p
-          (json-response res 200 (assoc p :account a :height h))
-          (json-response res 404 {:error "no proof for that account at that height here"})))
+      (let [a (js/parseInt (or (q "a") "") 10)
+            h (some-> (q "h") (js/parseInt 10))]
+        (if (or (js/isNaN a) (and h (js/isNaN h)))
+          (json-response res 400 {:error "a (and h, if given) must be integers"})
+          (let [[h t] (if h [h (get @attested-trees h)] (last @attested-trees))
+                p (when t (proof-at t (cm/account-leaf-id a)))]
+            (if p
+              (json-response res 200 (assoc p :account a :height h))
+              (json-response res 404 {:error "no proof for that account at that height here"})))))
 
       ;; Committed history of the current segment, for a node that follows by
       ;; HTTP (an observer). The blocks carry their certificates; the reader
@@ -707,15 +732,19 @@
       "/blocks"
       (let [sgn (js/parseInt (or (q "segment") "0") 10)
             from (js/parseInt (or (q "from") "1") 10)
-            to (+ from 255)]
-        (json-response res 200
-                       (if (not= sgn (:n @seg))
-                         {:segment (:n @seg) :blocks []}
-                         {:segment (:n @seg)
-                          :blocks (vec (for [b (:chain s)
-                                             :let [h (:inga.block/height b)]
-                                             :when (<= from h to)]
-                                         (wire/encode {:type :proposal :block b})))})))
+            chain (:chain s)
+            first-h (:inga.block/height (first chain) 0)
+            ;; The chain is contiguous by height, so the window is an index
+            ;; range, not a scan per poll.
+            i (- from first-h)]
+        (if (or (js/isNaN sgn) (js/isNaN from))
+          (json-response res 400 {:error "segment and from must be integers"})
+          (json-response res 200
+                         (if (or (not= sgn (:n @seg)) (neg? i) (>= i (count chain)))
+                           {:segment (:n @seg) :blocks []}
+                           {:segment (:n @seg)
+                            :blocks (mapv #(wire/encode {:type :proposal :block %})
+                                          (subvec chain i (min (count chain) (+ i 256))))}))))
 
       ;; A segment this node holds, for a peer that missed the handoff.
       "/epoch"
@@ -1312,6 +1341,9 @@
      ;; The set's consensus keys as this node runs them, for a light client
      ;; comparing what several nodes say (script/light_client.cljk).
      :segment-keys (into (sorted-map) (for [w (current-witnesses)] [w (pub-of w)]))
+     ;; The engine epoch whose set those keys are, which a root attestation
+     ;; names (torihiki.light/root-payload).
+     :epoch (get-in ex [:epoch :n] 0)
      :observer observer?
      :follow (when observer? (select-keys @follow-state [:fetched :errors]))
      :attestations (count @attestations)
@@ -1621,7 +1653,8 @@
   []
   (js/setInterval
    (fn []
-     (when-not (or @halted (:busy @follow-state) (and (not observer?) (member? me)))
+     (when-not (or @halted (:busy @follow-state) (and (not observer?) (member? me))
+                   (empty? (current-witnesses)))
        (let [ms (vec (current-witnesses))
              i (mod (:from-peer @follow-state) (count ms))
              w (nth ms i)
@@ -1629,9 +1662,13 @@
          (swap! follow-state assoc :busy true :from-peer (inc i))
          (-> (js/fetch (str (http-of w) "/blocks?segment=" (:n @seg) "&from=" from)
                        #js {:signal (js/AbortSignal.timeout 5000)})
-             (.then #(.json %))
-             (.then (fn [j]
-                      (let [bs (keep #(:block (first (wire/decode (js->clj %))))
+             ;; Bounded: a member that answers with a huge body costs this
+             ;; poll, not this node's memory.
+             (.then #(.text %))
+             (.then (fn [txt]
+                      (when (> (count txt) 16000000) (throw (js/Error. "answer too large")))
+                      (let [j (js/JSON.parse txt)
+                            bs (keep #(:block (first (wire/decode (js->clj %))))
                                      (array-seq (.-blocks j)))]
                         (when (seq bs)
                           (swap! follow-state update :fetched + (count bs))
@@ -1671,6 +1708,9 @@
     (and (env "CHAIN_VALIDATORS" nil)
          (not (every? #(re-matches #"[1-9][0-9]*" (env % "1")) ["EPOCH_LENGTH" "MIN_STAKE"])))
     (conj "EPOCH_LENGTH and MIN_STAKE must be positive integers")
+
+    (not (re-matches #"[1-9][0-9]*" (env "ATTEST_EVERY" "20")))
+    (conj "ATTEST_EVERY must be a positive integer")
 
     (and (env "BRIDGE_CONTRACT" nil)
          (not (re-matches #"0x[0-9a-fA-F]{40}" (env "BRIDGE_CONTRACT" ""))))
