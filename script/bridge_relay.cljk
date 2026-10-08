@@ -17,7 +17,8 @@
 (ns bridge-relay
   (:require ["node:child_process" :as cp]
             [kotoba.lang.text :as str]
-            [promesa.core :as p]))
+            [promesa.core :as p]
+            [torihiki-node.bridge-signer :as bs]))
 
 (defn- env [k d] (or (aget js/process.env k) d))
 
@@ -31,10 +32,29 @@
 
 (defn- requested? [claim]
   ;; withdrawals(claim) -> (dest, amount, requestedAt, finalized, invalidated)
-  (let [out (cast! "call" contract "withdrawals(uint64)(address,uint256,uint64,bool,bool)"
-                   (str claim) "--rpc-url" rpc)
-        requested-at (nth (str/split out #"\s+") 2 "0")]
-    (not= "0" requested-at)))
+  (let [out (js->clj (js/JSON.parse
+                      (cast! "call" contract "withdrawals(uint64)(address,uint256,uint64,bool,bool)"
+                             (str claim) "--rpc-url" rpc "--json")))]
+    (not= "0" (str (nth out 2 "0")))))
+
+(defn- contract-signers []
+  (set (map str/lower (first (js->clj (js/JSON.parse
+                                       (cast! "call" contract "currentSigners()(address[])"
+                                              "--rpc-url" rpc "--json")))))))
+
+(defn- usable
+  "The signatures the contract will count, decided here: recovered locally
+  (a validator's word about whose signature it served is not evidence), in the
+  contract's current set, one per signer, in ascending address order. One
+  endpoint serving a wrong or copied signature used to make every attempt
+  revert; now it is just one signature fewer."
+  [digest sigs members]
+  (->> sigs
+       (keep (fn [c] (let [who (bs/recover-address digest (:sig c))]
+                       (when (and who (contains? members who)) (assoc c :signer who)))))
+       (reduce (fn [m c] (if (contains? m (:signer c)) m (assoc m (:signer c) c))) {})
+       vals
+       (sort-by :signer)))
 
 (defn relay! []
   (p/let [epoch (js/parseInt (cast! "call" contract "epoch()(uint64)" "--rpc-url" rpc) 10)
@@ -49,10 +69,11 @@
                                (assoc c :signer (str/lower (:signer a)))))]
     (println (str "epoch " epoch ", " (count (filter :signer answers)) "/" (count validators)
                   " validators answered, " (count by-claim) " pending claims"))
-    (doseq [[claim sigs] (sort-by key by-claim)
+    (doseq [:let [members (contract-signers)]
+            [claim sigs] (sort-by key by-claim)
             :let [digests (frequencies (map :digest sigs))
                   [digest _] (last (sort-by val digests))
-                  agreed (sort-by :signer (filter #(= digest (:digest %)) sigs))
+                  agreed (usable digest (filter #(= digest (:digest %)) sigs) members)
                   {:keys [dest amount]} (first agreed)
                   sig-list (str "[" (str/join "," (map :sig agreed)) "]")]]
       (cond

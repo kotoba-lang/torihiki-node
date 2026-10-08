@@ -35,9 +35,19 @@
   under the old rules while its peers produce them under the new ones — a
   fork that looks like a bug. Stopped, it is an operator who has to upgrade."
   [ex]
-  (when-not (gov/supported? ex max-protocol)
-    (str "protocol version " (gov/active-version ex) " is active and this binary knows "
-         max-protocol "; install a release that implements it")))
+  (let [s (get-in ex [:protocol :scheduled])]
+    (cond
+      (not (gov/supported? ex max-protocol))
+      (str "protocol version " (gov/active-version ex) " is active and this binary knows "
+           max-protocol "; install a release that implements it")
+
+      ;; BEFORE the activation block, not after it: `gov/activate` switches
+      ;; the version at the start of block `at`, and a binary that applied
+      ;; that block with the old rules would have written a state the
+      ;; upgraded binary then resumes from.
+      (and s (> (:version s) max-protocol) (>= (inc (:height ex 0)) (:at s)))
+      (str "protocol version " (:version s) " activates at height " (:at s)
+           " and this binary knows " max-protocol "; install a release that implements it"))))
 
 ;; ── genesis and the set ─────────────────────────────────────────────────────
 
@@ -99,6 +109,25 @@
 
 ;; ── transactions ────────────────────────────────────────────────────────────
 
+(defn resubmit
+  "Which of this node's own envelopes to send again: every one at or above
+  the chain's expected nonce, in order, once the chain has not moved for
+  `stuck-blocks` since the lowest was sent.
+
+  A transaction can be lost without being refused — inga drops submissions
+  past its queue bound, and a proposal abandoned on a view change takes its
+  transactions with it. Lose nonce n and every later one is `:bad-nonce`
+  forever, because only an applied transaction moves the nonce. Keeping the
+  signed bytes and sending them again closes the gap without re-signing
+  anything. Returns `[pending' to-send]`."
+  [pending expected height stuck-blocks]
+  (let [pending (into (sorted-map) (filter (fn [[n _]] (>= n expected))) pending)
+        lowest (get pending expected)]
+    (if (and lowest (>= (- height (:sent-at lowest)) stuck-blocks))
+      [(into (sorted-map) (map (fn [[n e]] [n (assoc e :sent-at height)])) pending)
+       (mapv (comp :envelope val) pending)]
+      [pending []])))
+
 (defn next-nonce
   "The nonce for this account's next transaction: the chain's, unless this
   node has already sent ones the chain has not committed yet.
@@ -115,20 +144,45 @@
   [(get l :transactionHash (get l "transactionHash"))
    (get l :logIndex (get l "logIndex"))])
 
+(def ^:private log-fields
+  [:address :topics :data :blockNumber :blockHash :transactionHash :logIndex :removed])
+
+(defn- normal
+  "A log reduced to the fields that are the event. Providers add their own
+  (`blockTimestamp`, `transactionIndex` spellings), and comparing whole maps
+  made two honest providers disagree forever."
+  [l]
+  (into {} (for [k log-fields
+                 :let [v (get l k (get l (name k)))]
+                 :when (some? v)]
+             [k (if (string? v) (.toLowerCase v) v)])))
+
 (defn agreed-logs
   "Logs that at least `k` of the RPC providers' answers contain, identically.
 
   One provider is one party's word about what the chain says. A lying or
   lagging one cannot credit a deposit here, because an attestation needs the
-  same log from `k` of them; it can only delay one. Compared whole, not just
-  by id, so a provider cannot keep the id and change the amount."
+  same log from `k` of them. Compared on every field of the event, not just
+  the id, so a provider cannot keep the id and change the amount."
   [answers k]
-  (let [counts (frequencies (mapcat (fn [logs] (distinct (map #(vector (log-id %) %) logs))) answers))]
+  (let [counts (frequencies (mapcat (fn [logs] (distinct (map normal logs))) answers))]
     (->> counts
          (filter (fn [[_ n]] (>= n k)))
-         (map (comp second key))
+         (map key)
          (sort-by log-id)
          vec)))
+
+(defn window-settled?
+  "May the watcher move past this window? Only when every log ANY provider
+  reported is one `k` of them agree on.
+
+  Moving on whenever enough answers came back let one provider that was
+  lagging, or lying, drop a log out of agreement — and then the window was
+  passed and the deposit never attested: censorship by one provider, not a
+  delay. Unsettled, the window is read again."
+  [answers k]
+  (let [agreed (set (map log-id (agreed-logs answers k)))]
+    (every? #(contains? agreed (log-id %)) (mapcat identity answers))))
 
 (defn agreed-height
   "The highest block at least `k` providers have reached: the k-th largest."
@@ -143,7 +197,7 @@
   or nil below `min-sources`. A validator that publishes one venue's number
   hands that venue a vote."
   [prices min-sources]
-  (let [ps (vec (sort (remove nil? prices)))]
+  (let [ps (vec (sort (filter #(and (number? %) (js/isFinite %) (pos? %)) prices)))]
     (when (>= (count ps) min-sources)
       (nth ps (quot (dec (count ps)) 2)))))
 

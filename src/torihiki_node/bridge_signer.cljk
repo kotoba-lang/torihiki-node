@@ -34,3 +34,20 @@
         rs (u8->hex (.toCompactRawBytes sig))
         v (+ 27 (.-recovery sig))]
     (str "0x" rs (.toString v 16))))
+
+(defn recover-address
+  "The address that produced `sig` (0x r||s||v) over `digest`, or nil. A
+  relayer checks this itself rather than trusting the validator that served
+  the signature to say whose it is."
+  [digest sig]
+  (try
+    (let [h (str/replace sig #"^0x" "")
+          rs (hex->u8 (subs h 0 128))
+          v (js/parseInt (subs h 128 130) 16)
+          pub (-> (.fromCompact (.-Signature secp256k1) rs)
+                  (.addRecoveryBit (- v 27))
+                  (.recoverPublicKey (hex->u8 digest))
+                  (.toRawBytes false))
+          body (vec (rest (array-seq (js/Array.from pub))))]
+      (str "0x" (subs (kc/digest-hex body) 24)))
+    (catch :default _ nil)))
