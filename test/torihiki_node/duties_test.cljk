@@ -1,0 +1,79 @@
+(ns torihiki-node.duties-test
+  "The arithmetic behind a validator's duties, and the bridge key checked
+  against Foundry's `cast` (independent implementation, pinned values)."
+  (:require [cljs.test :refer [deftest is testing]]
+            [torihiki.clearing :as cl]
+            [torihiki.state :as st]
+            [torihiki-node.bridge-signer :as bs]
+            [torihiki-node.duties :as d]))
+
+(def genesis [{:witness "w1" :pubkey "k1" :account 101}
+              {:witness "w2" :pubkey "k2" :account 102}
+              {:witness "w3" :pubkey "k3" :account 103}
+              {:witness "w4" :pubkey "k4" :account 104}])
+
+(defn- chain []
+  (st/new-exchange {:market (cl/market {:id 1 :max-leverage 40 :tick 1 :lot 1})
+                    :book-opts {:n-levels 64 :cap 1024 :ev-cap 1024}
+                    :validators {:genesis genesis :epoch-length 100}
+                    :protocol {}}))
+
+(deftest the-binary-stops-on-a-version-it-does-not-know
+  (is (nil? (d/halt-reason (chain))))
+  (is (string? (d/halt-reason (assoc-in (chain) [:protocol :version] 2)))))
+
+(deftest genesis-from-the-consensus-witnesses
+  (is (= [{:witness "w1" :pubkey "P-w1" :account 11}]
+         (d/genesis-validators ["w1"] #(str "P-" %) (constantly 11)))))
+
+(deftest a-set-the-chain-turned-to-is-reported
+  (let [pub-of {"w1" "k1" "w2" "k2" "w3" "k3" "w4" "k4"}]
+    (is (nil? (d/set-mismatch (chain) ["w1" "w2" "w3" "w4"] pub-of)))
+    (is (= ["w4"] (:only-in-consensus
+                   (d/set-mismatch (update-in (chain) [:epoch :set] (comp vec butlast))
+                                   ["w1" "w2" "w3" "w4"] pub-of))))
+    (is (= ["w2"] (:rotated (d/set-mismatch (chain) ["w1" "w2" "w3" "w4"]
+                                            (assoc pub-of "w2" "new")))))))
+
+(def ev {:inga.evidence/witness "w3" :inga.evidence/height 9 :inga.evidence/view 4
+         :inga.evidence/vote-a {:inga.vote/block-hash "a" :inga.vote/sig "sa"}
+         :inga.evidence/vote-b {:inga.vote/block-hash "b" :inga.vote/sig "sb"}})
+
+(deftest evidence-is-sent-once-and-not-after-the-slash
+  (is (= [{:tx :equivocation-evidence :witness "w3" :evidence-height 9 :view 4
+           :hash-a "a" :sig-a "sa" :hash-b "b" :sig-b "sb"}]
+         (d/evidence-to-submit (chain) [ev] #{})))
+  (is (empty? (d/evidence-to-submit (chain) [ev] #{["w3" 9 4]})))
+  (is (empty? (d/evidence-to-submit (assoc-in (chain) [:slashed ["w3" 9 4]] {}) [ev] #{}))))
+
+(deftest the-verifier-signs-consensus-payloads
+  (let [seen (atom nil)
+        f (d/vote-verifier "c" (fn [k p s] (reset! seen [k p s]) true))]
+    (is (true? (f "K" "w1" 5 2 "h" "S")))
+    (is (= ["K" "engi/vote/v1\nchain=c\nview=2\nheight=5\nblock=h\nwitness=w1\n" "S"] @seen))))
+
+(deftest nonces-survive-a-restart
+  (is (= 1 (d/next-nonce (chain) 101 nil)))
+  (is (= 6 (d/next-nonce (assoc-in (chain) [:nonces 101] 5) 101 0)) "the chain's, after a restart")
+  (is (= 8 (d/next-nonce (assoc-in (chain) [:nonces 101] 5) 101 7)) "ours, while ahead"))
+
+(deftest only-logs-a-quorum-of-providers-agrees-on
+  (let [l1 {:transactionHash "0x1" :logIndex "0x0" :data "a"}
+        l2 {:transactionHash "0x2" :logIndex "0x0" :data "b"}
+        forged (assoc l2 :data "B")]
+    (is (= [l1] (d/agreed-logs [[l1 l2] [l1 forged] [l1]] 2)))
+    (is (= [l1 l2] (d/agreed-logs [[l1 l2] [l1 l2] [l1]] 2)))
+    (is (= 100 (d/agreed-height [105 100 90] 2)))
+    (is (nil? (d/agreed-height [105] 2)))))
+
+(deftest a-validators-price-is-its-own-median
+  (is (= 101 (d/source-median [100 101 150] 3)))
+  (is (nil? (d/source-median [100 nil 101] 3)) "two venues are not three")
+  (is (= 600000 (d/usd->units 60000 0.1))))
+
+(deftest the-bridge-key-agrees-with-cast
+  (let [k "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"]
+    (is (= "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23" (bs/address-of k)))
+    (is (= (str "0xe7e8ad8b1ba9d757cd3e58b1857441617eacfc11909a40a8b0d56e982de7b75a"
+                "5f3e7a8bae0198d03be5eaf1e4fb0bcfdf225121818b17c4b3277a86447403381c")
+           (bs/sign-digest k "0x8c963d59eb6fe8d941f8f833d737fada5ad2105d1b2cbff97696cdffc1e03223")))))

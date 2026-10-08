@@ -1,0 +1,98 @@
+;; The bridge, end to end, against a local EVM (anvil) and four standalone
+;; validators in bridge mode (roadmap D3):
+;;
+;;   deposit on the contract -> validators attest -> collateral on torihiki
+;;   -> :withdraw with a destination -> validators sign -> relay requests
+;;   -> dispute period -> finalize pays -> validators attest -> claim settled
+;;
+;;   NODE=http://127.0.0.1:18821 VALIDATORS=...4 urls... CHAIN_ID=... \
+;;   BRIDGE_CONTRACT=0x.. TOKEN=0x.. BRIDGE_RPC=http://127.0.0.1:8546 \
+;;   USER_KEY=0x.. RELAY_KEY=0x.. CP=<classpath for the relay> \
+;;     kbb --backend sci -cp "src:$CP" script/bridge_e2e.cljk
+;;
+;; Uses anvil's well-known test keys and `evm_increaseTime`; it is not a
+;; script for a network anybody else is on. Exits non-zero, with the step that
+;; failed, unless the claim is settled on torihiki AND the tokens arrived.
+(ns bridge-e2e
+  (:require ["node:child_process" :as cp]
+            ["node:crypto" :as nc]
+            [kotoba.lang.text :as str]
+            [promesa.core :as p]
+            [torihiki.address :as addr]
+            [torihiki.auth :as auth]))
+
+(defn- env [k] (or (aget js/process.env k) (throw (js/Error. (str "set " k)))))
+(def node (env "NODE"))
+(def contract (env "BRIDGE_CONTRACT"))
+(def token (env "TOKEN"))
+(def rpc (env "BRIDGE_RPC"))
+(def chain-id (env "CHAIN_ID"))
+
+(defn- cast! [& args]
+  (str/trim (str (cp/execFileSync "cast" (clj->js args) #js {:encoding "utf8"}))))
+(defn- num! [s] (js/parseInt (first (str/split s #"\s")) 10))
+
+(defn- fail! [step what]
+  (println (str "FAIL at " step ": " what))
+  (js/process.exit 1))
+
+(defn- wait [ms] (p/create (fn [r _] (js/setTimeout r ms))))
+
+(defn- poll
+  "Ask `f` every second until `ok?` holds or `secs` pass; the last answer."
+  [f ok? secs]
+  (p/loop [i 0]
+    (p/let [v (f)]
+      (if (or (ok? v) (>= i secs)) v (p/do (wait 1000) (p/recur (inc i)))))))
+
+(defn- GET [path]
+  (-> (js/fetch (str node path)) (.then #(.json %)) (.then #(js->clj % :keywordize-keys true))))
+
+(def kp (nc/generateKeyPairSync "ed25519"))
+(def pub (.toString (.export (.-publicKey kp) #js {:type "spki" :format "der"}) "base64"))
+(def account (addr/derive pub))
+
+(defn- send-tx! [nonce t]
+  (let [t (assoc t :account account)
+        payload (auth/signing-payload chain-id account nonce t)
+        sig (.toString (nc/sign nil (js/Buffer.from payload "utf8") (.-privateKey kp)) "base64")]
+    (js/fetch (str node "/tx") #js {:method "POST"
+                                    :body (js/JSON.stringify
+                                           (clj->js {:tx t :account account :nonce nonce
+                                                     :pubkey pub :sig sig}))})))
+
+(def user-key (env "USER_KEY"))
+(def user (str/lower (cast! "wallet" "address" "--private-key" user-key)))
+(defn- usdc [] (num! (cast! "call" token "balanceOf(address)(uint256)" user "--rpc-url" rpc)))
+(defn- mine! [n] (cast! "rpc" "anvil_mine" (str n) "--rpc-url" rpc))
+
+(p/let [_ (println "account" account "user" user)
+        before (usdc)
+        _ (cast! "send" token "approve(address,uint256)" contract "1000000" "--rpc-url" rpc "--private-key" user-key)
+        _ (cast! "send" contract "deposit(uint64,uint256)" (str account) "1000000" "--rpc-url" rpc "--private-key" user-key)
+        _ (mine! 15)
+        a (poll #(GET (str "/account?a=" account)) #(= 1000000 (:collateral %)) 60)
+        _ (when-not (= 1000000 (:collateral a)) (fail! "deposit" (pr-str a)))
+        _ (println "1. deposit credited by the set:" (:collateral a))
+        _ (send-tx! 1 {:tx :withdraw :amount 400000 :dest user})
+        s (poll #(GET "/bridge/signatures?epoch=0") #(seq (:claims %)) 30)
+        claim (:claim (first (:claims s)))
+        _ (when-not claim (fail! "withdraw" (pr-str s)))
+        _ (println "2. claim" claim "pending, signed by" (:signer s))
+        _ (cp/execFileSync "kbb" #js ["--backend" "sci" "-cp" (str "src:" (env "CP")) "script/bridge_relay.cljk"]
+                           #js {:stdio "inherit"
+                                :env (js/Object.assign #js {} js/process.env
+                                                       #js {:VALIDATORS (env "VALIDATORS")
+                                                            :BRIDGE_RPC rpc
+                                                            :RELAY_KEY (env "RELAY_KEY")})})
+        _ (cast! "rpc" "evm_increaseTime" "61" "--rpc-url" rpc)
+        _ (mine! 1)
+        _ (cast! "send" contract "finalizeWithdrawal(uint64)" (str claim) "--rpc-url" rpc "--private-key" (env "RELAY_KEY"))
+        paid (- (usdc) (- before 1000000))
+        _ (when-not (= 400000 paid) (fail! "finalize" (str "paid " paid)))
+        _ (println "3. contract paid" paid "to" user)
+        _ (mine! 15)
+        done (poll #(GET "/bridge/signatures?epoch=0") #(empty? (:claims %)) 60)]
+  (if (seq (:claims done))
+    (fail! "settle" (pr-str done))
+    (println "4. claim settled on torihiki by the set's attestation\nPASS")))

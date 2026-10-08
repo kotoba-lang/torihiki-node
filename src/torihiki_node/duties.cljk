@@ -1,0 +1,155 @@
+(ns torihiki-node.duties
+  "What a validator does besides voting: the decisions behind the D2-D5 duties,
+  kept pure so they can be tested without a network.
+
+  The engine decides what each duty MEANS (`torihiki.validators`,
+  `torihiki.bridge`, `torihiki.governance`, `torihiki.oracle`). The node's loops
+  in `standalone` hold the sockets, the keys and the clock. This namespace is
+  the arithmetic in between: which transactions to send, which logs a quorum of
+  RPC providers agrees on, which price to publish, and whether this binary may
+  keep running at all.
+
+  ## The rule it all rests on
+
+  A duty may only ever SUBMIT a signed transaction. Nothing here changes state
+  directly: an attestation, a price, a proof of equivocation all go through
+  consensus like a trade does, and the engine refuses whatever the set does
+  not agree on. A node whose duty logic is wrong costs its own votes, not the
+  chain's correctness."
+  (:require [inga.attest :as att]
+            [torihiki.auth :as auth]
+            [torihiki.governance :as gov]
+            [torihiki.validators :as vals]))
+
+;; ── protocol version ────────────────────────────────────────────────────────
+
+(def ^:const max-protocol
+  "The highest protocol version this binary implements. A chain that has voted
+  past it is running rules this code does not have."
+  1)
+
+(defn halt-reason
+  "Why this binary must stop following `ex`, or nil.
+
+  Halting is the safe failure: a replica that kept going would produce roots
+  under the old rules while its peers produce them under the new ones — a
+  fork that looks like a bug. Stopped, it is an operator who has to upgrade."
+  [ex]
+  (when-not (gov/supported? ex max-protocol)
+    (str "protocol version " (gov/active-version ex) " is active and this binary knows "
+         max-protocol "; install a release that implements it")))
+
+;; ── genesis and the set ─────────────────────────────────────────────────────
+
+(defn genesis-validators
+  "The genesis set for a chain whose consensus witnesses are `witnesses`, each
+  operating the account its own consensus key derives to — so the key that
+  votes is the key that attests, and a fresh chain needs no second secret."
+  [witnesses pub-of derive]
+  (vec (for [w witnesses]
+         {:witness w :pubkey (pub-of w) :account (derive (pub-of w))})))
+
+(defn set-mismatch
+  "How the set the CHAIN has installed differs from the one CONSENSUS runs on,
+  or nil.
+
+  Consensus does not follow epoch turns yet: inga runs the witness list it
+  was started with. Until it does, a turn that changes the set leaves blocks
+  certified by a group the chain no longer recognises — and that is said here,
+  in `/head`, rather than discovered."
+  [ex witnesses pub-of]
+  (when (vals/enabled? ex)
+    (let [chain (into {} (map (juxt :witness :pubkey)) (vals/active-set ex))
+          running (into {} (map (fn [w] [w (pub-of w)])) witnesses)]
+      (when (not= chain running)
+        {:chain-epoch (get-in ex [:epoch :n])
+         :only-on-chain (vec (sort (remove (set (keys running)) (keys chain))))
+         :only-in-consensus (vec (sort (remove (set (keys chain)) (keys running))))
+         :rotated (vec (sort (for [[w k] chain :when (and (running w) (not= k (running w)))] w)))}))))
+
+;; ── equivocation ────────────────────────────────────────────────────────────
+
+(defn vote-verifier
+  "The `:vote-verify-fn` `apply-block` asks about evidence: does `sig` verify
+  as `witness`'s vote at `height`/`view` for `hash`, under `pubkey`? The
+  payload is consensus's own (`inga.attest/vote-payload`), so the engine
+  never has to know the vote format."
+  [chain-id verify-raw]
+  (fn [pubkey witness height view hash sig]
+    (boolean (verify-raw pubkey (att/vote-payload chain-id view height hash witness) sig))))
+
+(defn evidence-tx
+  "An `:equivocation-evidence` transaction from one of inga's proofs."
+  [{:inga.evidence/keys [witness height view vote-a vote-b]}]
+  {:tx :equivocation-evidence
+   :witness witness :evidence-height height :view view
+   :hash-a (:inga.vote/block-hash vote-a) :sig-a (:inga.vote/sig vote-a)
+   :hash-b (:inga.vote/block-hash vote-b) :sig-b (:inga.vote/sig vote-b)})
+
+(defn evidence-to-submit
+  "Proofs from `equivocations` the chain has not acted on and this node has not
+  already sent."
+  [ex equivocations sent]
+  (->> equivocations
+       (map evidence-tx)
+       (filter #(and (:sig-a %) (:sig-b %)))
+       (remove #(contains? (:slashed ex {}) (vals/evidence-key %)))
+       (remove #(contains? sent (vals/evidence-key %)))
+       vec))
+
+;; ── transactions ────────────────────────────────────────────────────────────
+
+(defn next-nonce
+  "The nonce for this account's next transaction: the chain's, unless this
+  node has already sent ones the chain has not committed yet.
+
+  It was a counter from zero in memory, so after a restart every attestation
+  carried a nonce the chain had already spent and was refused as a replay —
+  silently, since nothing reads an attestation's rejection."
+  [ex account local]
+  (max (auth/expected-nonce ex account) (inc (or local 0))))
+
+;; ── the bridge ──────────────────────────────────────────────────────────────
+
+(defn- log-id [l]
+  [(get l :transactionHash (get l "transactionHash"))
+   (get l :logIndex (get l "logIndex"))])
+
+(defn agreed-logs
+  "Logs that at least `k` of the RPC providers' answers contain, identically.
+
+  One provider is one party's word about what the chain says. A lying or
+  lagging one cannot credit a deposit here, because an attestation needs the
+  same log from `k` of them; it can only delay one. Compared whole, not just
+  by id, so a provider cannot keep the id and change the amount."
+  [answers k]
+  (let [counts (frequencies (mapcat (fn [logs] (distinct (map #(vector (log-id %) %) logs))) answers))]
+    (->> counts
+         (filter (fn [[_ n]] (>= n k)))
+         (map (comp second key))
+         (sort-by log-id)
+         vec)))
+
+(defn agreed-height
+  "The highest block at least `k` providers have reached: the k-th largest."
+  [heights k]
+  (let [hs (vec (sort > (remove nil? heights)))]
+    (when (>= (count hs) k) (nth hs (dec k)))))
+
+;; ── the oracle ──────────────────────────────────────────────────────────────
+
+(defn source-median
+  "This validator's price from its own venues: the median of what answered,
+  or nil below `min-sources`. A validator that publishes one venue's number
+  hands that venue a vote."
+  [prices min-sources]
+  (let [ps (vec (sort (remove nil? prices)))]
+    (when (>= (count ps) min-sources)
+      (nth ps (quot (dec (count ps)) 2)))))
+
+(defn usd->units
+  "A USD price as the integer the oracle carries, at `usd-per-unit`."
+  [usd usd-per-unit]
+  (when (and (number? usd) (pos? usd) (pos? usd-per-unit))
+    (let [n (Math/round (double (/ usd usd-per-unit)))]
+      (when (pos? n) n))))
