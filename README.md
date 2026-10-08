@@ -124,6 +124,27 @@ decides what the set agrees on. `GET /duties` reports all of them.
 may run it). `script/bridge_e2e.cljk` runs deposit → credit → withdraw →
 sign → relay → finalize → settle against anvil and four local validators.
 
-**Not wired:** consensus does not follow epoch turns yet (inga runs the witness
-list it started with; `/duties :set-mismatch` says when they differ), and the
-Durable Object validator (`validator.cljk`) has none of these duties.
+### Epochs: consensus follows the set (`src/torihiki_node/epoch.cljk`)
+
+When the engine turns the validator set at a boundary B, consensus moves to a
+new SEGMENT: an inga chain of its own, run by the new set, whose genesis every
+member derives from B (parent = B's CID, time = B's), with votes signed under
+`<CHAIN_ID>/epoch-<n>`. Engine height = B + inga height. The old segment is
+frozen at B — it applies nothing more, so every replica holds exactly the
+state at B — and transactions it ordered after B are carried into the new
+mempool. Each segment lives in `DATA_DIR/epoch-<n>/` (descriptor, the state at
+B, its own log and checkpoints), and a restart resumes the newest. A node that
+missed the boundary takes it from peers (`GET /epoch?n=`) on f + 1 identical
+descriptors whose state root matches.
+
+`PEERS` is an address book: a node outside the set runs as an OBSERVER, sends
+no votes, new-views or proposals, and members ignore any it sends. `HTTP_PEERS`
+(same shape) tells a node where to ask its peers; without it, the local
+convention 8800 + n.
+
+`script/epoch_e2e.cljk`: five local nodes, genesis set w1..w4, w5 observing;
+w5 registers and bonds, w4 retires; at the boundary every node hands off,
+w1 w2 w3 w5 certify, w4 observes, and all replicas agree on the chain.
+
+**Not wired:** the Durable Object validator (`validator.cljk`) has none of
+these duties and does not follow epochs.

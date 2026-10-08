@@ -1,0 +1,50 @@
+(ns torihiki-node.epoch-test
+  "Segments: what a node decides at an epoch handoff."
+  (:require [cljs.test :refer [deftest is testing]]
+            [torihiki-node.epoch :as e]))
+
+(def ex {:validator-params {:epoch-length 100}
+         :epoch {:n 1 :from 101 :set [{:witness "w1" :pubkey "k1" :account 1}
+                                      {:witness "w2" :pubkey "k2" :account 2}
+                                      {:witness "w3" :pubkey "k3" :account 3}
+                                      {:witness "w5" :pubkey "k5" :account 5}]}})
+
+(deftest a-segment-freezes-once-its-engine-moved-on
+  (is (e/frozen? ex 0))
+  (is (not (e/frozen? ex 1)))
+  (is (not (e/frozen? {} 0)) "a chain without a set never hands off"))
+
+(deftest the-next-segment-starts-at-the-boundary
+  (is (= {:n 1 :base 100 :witnesses ["w1" "w2" "w3" "w5"]
+          :pubkeys {"w1" "k1" "w2" "k2" "w3" "k3" "w5" "k5"}}
+         (e/next-segment ex))))
+
+(deftest every-member-derives-the-same-genesis
+  (let [sg (e/next-segment ex)]
+    (is (= (e/genesis-block sg "bafy-B" 7) (e/genesis-block sg "bafy-B" 7)))
+    (is (not= (e/genesis-block sg "bafy-B" 7) (e/genesis-block sg "bafy-C" 7)))))
+
+(deftest votes-are-signed-per-segment
+  (is (= "c" (e/segment-chain-id "c" 0)) "segment 0 keeps the chain id")
+  (is (= "c/epoch-2" (e/segment-chain-id "c" 2))))
+
+(deftest heights-map-to-the-segment-that-voted
+  (let [segs [{:n 0 :base 0} {:n 1 :base 100} {:n 2 :base 250}]]
+    (is (= 0 (:n (e/segment-of-height segs 100))) "B itself was voted on by the old set")
+    (is (= 1 (:n (e/segment-of-height segs 101))))
+    (is (= 2 (:n (e/segment-of-height segs 300))))
+    (testing "the verifier rebuilds the segment's payload"
+      (let [seen (atom nil)
+            f (e/vote-verifier "c" segs (fn [_ p _] (reset! seen p) true))]
+        (f "K" "w1" 105 3 "h" "S")
+        (is (= "engi/vote/v1\nchain=c/epoch-1\nview=3\nheight=5\nblock=h\nwitness=w1\n" @seen))))))
+
+(deftest what-the-old-set-ordered-after-the-boundary-is-carried
+  (is (= ["t3" "t4"] (e/abandoned-proposals [{:inga.block/height 9 :inga.block/proposals ["t1"]}
+                                             {:inga.block/height 10 :inga.block/proposals ["t2"]}
+                                             {:inga.block/height 11 :inga.block/proposals ["t3" "t4"]}]
+                                            10))))
+
+(deftest a-late-node-takes-the-handoff-on-f-plus-one
+  (is (= {:n 1} (e/agreed-handoff [{:n 1} {:n 1} {:n 9}] 2)))
+  (is (nil? (e/agreed-handoff [{:n 1} {:n 9} nil] 2))))

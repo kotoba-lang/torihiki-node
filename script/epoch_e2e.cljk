@@ -1,0 +1,84 @@
+;; An epoch handoff, end to end, on a local devnet (keys derived from the
+;; chain id, so this script can sign as every validator):
+;;
+;;   genesis set w1..w4, w5 running as an observer
+;;   -> every operator funds and bonds itself; w5 registers; w4 retires
+;;   -> the engine turns the set at the boundary
+;;   -> consensus hands off: w1 w2 w3 w5 certify, w4 observes, height goes on
+;;
+;;   NODES=w1@http://127.0.0.1:18841,...,w5@http://127.0.0.1:18845 \
+;;   CHAIN_ID=... EPOCH_LENGTH=600 \
+;;     kbb --backend sci -cp "src:$CP" script/epoch_e2e.cljk
+(ns epoch-e2e
+  (:require ["node:crypto" :as nc]
+            [kotoba.lang.text :as str]
+            [kotoba.bytes.sha256 :as sha]
+            [promesa.core :as p]
+            [torihiki.address :as addr]
+            [torihiki.auth :as auth]))
+
+(defn- env [k] (or (aget js/process.env k) (throw (js/Error. (str "set " k)))))
+(def chain-id (env "CHAIN_ID"))
+(def epoch-length (js/parseInt (env "EPOCH_LENGTH") 10))
+(def nodes (into (sorted-map) (for [p (str/split (env "NODES") #",")
+                                    :let [[w u] (str/split p #"@" 2)]] [w u])))
+
+(def ^:private pkcs8 (js/Buffer.from "302e020100300506032b657004220420" "hex"))
+(defn- keypair [w]
+  (let [sk (nc/createPrivateKey #js {:key (js/Buffer.concat #js [pkcs8 (js/Buffer.from (sha/sha256-hex (str chain-id "/" w)) "hex")])
+                                     :format "der" :type "pkcs8"})]
+    {:sk sk :pub (.toString (.export (nc/createPublicKey sk) #js {:format "der" :type "spki"}) "base64")}))
+
+(defn- account [w] (addr/derive (:pub (keypair w))))
+
+(defn- send! [w nonce t]
+  (let [{:keys [sk pub]} (keypair w)
+        a (account w)
+        t (assoc t :account a)
+        sig (.toString (nc/sign nil (js/Buffer.from (auth/signing-payload chain-id a nonce t) "utf8") sk) "base64")]
+    (js/fetch (str (get nodes "w1") "/tx")
+              #js {:method "POST" :body (js/JSON.stringify (clj->js {:tx t :account a :nonce nonce :pubkey pub :sig sig}))})))
+
+(defn- GET [w path]
+  (-> (js/fetch (str (get nodes w) path)) (.then #(.json %))
+      (.then #(js->clj % :keywordize-keys true)) (.catch (fn [_] nil))))
+
+(defn- wait [ms] (p/create (fn [r _] (js/setTimeout r ms))))
+(defn- fail! [what] (println "FAIL:" what) (js/process.exit 1))
+
+(p/let [_ (p/all (for [w (keys nodes)]
+                   (p/do (send! w 1 {:tx :deposit :amount 1000})
+                         (send! w 2 {:tx :bond :validator (account w) :amount 100}))))
+        _ (send! "w5" 3 {:tx :validator-register :witness "w5" :pubkey (:pub (keypair "w5"))})
+        _ (send! "w4" 3 {:tx :validator-retire :witness "w4"})
+        _ (println "funded, bonded; w5 registered, w4 retiring; boundary at" epoch-length)
+        d0 (GET "w1" "/duties")
+        _ (when-not (= 0 (get-in d0 [:segment :n])) (fail! (str "not in segment 0: " (pr-str d0))))
+        ;; until every node is in segment 1 (or a minute passes)
+        _ (p/loop [i 0]
+            (p/let [ds (p/all (for [w (keys nodes)] (GET w "/duties")))]
+              (when-not (or (every? #(= 1 (get-in % [:segment :n])) ds) (> i 300))
+                (p/do (wait 1000) (p/recur (inc i))))))
+        ds (p/all (for [w (keys nodes)] (GET w "/duties")))
+        _ (doseq [[w d] (map vector (keys nodes) ds)]
+            (println " " w "segment" (get-in d [:segment :n]) "base" (get-in d [:segment :base])
+                     "set" (get-in d [:segment :witnesses]) "mismatch" (:set-mismatch d)))
+        _ (when-not (every? #(= 1 (get-in % [:segment :n])) ds) (fail! "not every node handed off"))
+        _ (when-not (= ["w1" "w2" "w3" "w5"] (get-in (first ds) [:segment :witnesses]))
+            (fail! "the new set is not w1 w2 w3 w5"))
+        ;; A node that missed the boundary catches up from its peers; give it
+        ;; the time that takes before judging progress.
+        _ (wait 15000)
+        h1 (p/all (for [w (keys nodes)] (GET w "/head")))
+        _ (wait 10000)
+        h2 (p/all (for [w (keys nodes)] (GET w "/head")))
+        _ (doseq [[w a b] (map vector (keys nodes) h1 h2)]
+            (println " " w "inga height" (:height a) "->" (:height b) "equivocators" (:equivocators b)))
+        moved (map (fn [a b] (- (:height b) (:height a))) h1 h2)
+        common (- (apply min (map :height h2)) 20)
+        hashes (p/all (for [w (keys nodes)] (GET w (str "/hash-at?h=" common))))
+        _ (println "  hashes at" common ":" (count (set (map :hash hashes))) "distinct")]
+  (cond
+    (not (every? #(> % 20) moved)) (fail! (str "the chain did not keep up after the handoff: " (vec moved)))
+    (not= 1 (count (set (map :hash hashes)))) (fail! (str "replicas disagree at " common))
+    :else (println "PASS: consensus follows the set the chain installed")))

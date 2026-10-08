@@ -1,0 +1,100 @@
+(ns torihiki-node.epoch
+  "Consensus follows the validator set the chain installs.
+
+  `torihiki.validators` turns the set at an epoch boundary B: the set that
+  certifies blocks after B is decided by the state B ends in. inga runs one
+  fixed witness list from a genesis at height 0, and it is not changed here.
+  Instead consensus runs in SEGMENTS:
+
+  - Segment n is an inga chain of its own, with its own genesis, run by the
+    set of engine epoch n. Engine height = segment base + inga height.
+  - Segment 0 is the chain as it always was: base 0, the configured chain id,
+    the configured witnesses.
+  - When the engine has applied a boundary block, the segment that applied it
+    is FROZEN: every later block it orders is a no-op for the engine. Every
+    replica therefore holds exactly the state at B, whatever else the old set
+    went on ordering while it committed B.
+  - The next segment's genesis is a block every new member derives alike: its
+    parent is B's CID, its time is B's, its proposer the first name in the new
+    set. Votes are signed under `<chain-id>/epoch-<n>`, so a vote from one
+    segment is never a vote in another.
+  - Transactions the old set ordered after B were never applied. They are
+    handed to the new segment's mempool, not lost.
+
+  Everything here is pure: the decisions a node makes at the handoff, so they
+  can be checked without four processes."
+  (:require [inga.attest :as att]
+            [inga.consensus :as c]
+            [torihiki.validators :as vals]))
+
+(defn segment-chain-id
+  "The chain id consensus signs votes under in segment `n`. Segment 0 keeps the
+  configured one, so an existing chain's votes still verify."
+  [chain-id n]
+  (if (zero? n) chain-id (str chain-id "/epoch-" n)))
+
+(defn frozen?
+  "Has the engine already moved to a later epoch than segment `n` runs?"
+  [ex n]
+  (and (vals/enabled? ex) (> (get-in ex [:epoch :n] 0) n)))
+
+(defn handoff-due?
+  "Must this node leave segment `seg` for the next one?"
+  [ex seg]
+  (frozen? ex (:n seg)))
+
+(defn next-segment
+  "The segment that runs the epoch `ex` has installed. Its base is the
+  boundary block B, the last height the previous segment applied."
+  [ex]
+  (let [{:keys [n from set]} (:epoch ex)]
+    {:n n
+     :base (dec from)
+     :witnesses (mapv :witness set)
+     :pubkeys (into {} (map (juxt :witness :pubkey)) set)}))
+
+(defn genesis-block
+  "The new segment's genesis. Built from things every member already agrees
+  on — B's identity and time, and the set itself — so no message has to carry
+  it and none can forge it."
+  [seg parent-cid ts]
+  (c/make-block {:height 0 :parent-hash parent-cid :proposals []
+                 :proposer (first (:witnesses seg)) :ts ts :justify nil}))
+
+(defn engine-height [seg inga-height] (+ (:base seg) inga-height))
+
+(defn segment-of-height
+  "The segment that voted at engine height `h`: the newest whose base is BELOW
+  h. A segment's genesis sits at its base and is never voted on; height B
+  itself was voted on by the segment before."
+  [segments h]
+  (last (filter #(< (:base %) h) (sort-by :n segments))))
+
+(defn vote-verifier
+  "The engine's `:vote-verify-fn` across segments. A proof names an engine
+  height; the vote it carries was signed under that height's segment chain id
+  and at its inga height. Same answer on every replica: the segment table is
+  the chain's own history."
+  [chain-id segments verify-raw]
+  (fn [pubkey witness height view hash sig]
+    (boolean
+     (when-let [seg (segment-of-height segments height)]
+       (verify-raw pubkey
+                   (att/vote-payload (segment-chain-id chain-id (:n seg)) view
+                                     (- height (:base seg)) hash witness)
+                   sig)))))
+
+(defn abandoned-proposals
+  "Transactions the old segment ordered after the boundary: in blocks above
+  inga height `last-applied`, never applied, to be handed to the next segment."
+  [chain last-applied]
+  (vec (mapcat :inga.block/proposals
+               (filter #(> (:inga.block/height %) last-applied) chain))))
+
+(defn agreed-handoff
+  "The handoff descriptor at least `need` peers report identically, or nil. A
+  node that fell behind takes the next segment from its peers, and only on
+  f + 1 matching answers: one of them is honest."
+  [answers need]
+  (some (fn [[d n]] (when (>= n need) d))
+        (sort-by (comp - val) (frequencies (remove nil? answers)))))
