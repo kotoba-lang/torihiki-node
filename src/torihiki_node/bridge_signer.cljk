@@ -1,0 +1,53 @@
+(ns torihiki-node.bridge-signer
+  "A validator's secp256k1 BRIDGE key: the one `TorihikiBridge.sol` counts.
+
+  Separate from the Ed25519 consensus key on purpose — the EVM verifies one
+  cheaply and not the other — and separate in custody: `BRIDGE_SIGNER_KEY`
+  belongs to this host alone, exactly like `SEED_<W>`. It signs only digests
+  `torihiki.bridge` computes from chain state, so the key never decides
+  anything; it attests that this validator saw the claim.
+
+  Signatures are what the contract's `_recover` accepts: 65 bytes, r || s || v
+  with v in {27, 28} and s in the lower half (noble signs low-s by default, and
+  the contract refuses the other twin)."
+  (:require ["@noble/curves/secp256k1.js" :refer [secp256k1]]
+            [torihiki.keccak :as kc]
+            [kotoba.lang.text :as str]))
+
+(defn- hex->u8 [h]
+  (js/Uint8Array.from (clj->js (kc/hex->bytes (str/replace h #"^0x" "")))))
+
+(defn- u8->hex [u8] (kc/bytes->hex (vec (array-seq (js/Array.from u8)))))
+
+(defn address-of
+  "The Ethereum address of private key `key-hex`: the last 20 bytes of the
+  keccak of the uncompressed public key without its 0x04 prefix."
+  [key-hex]
+  (let [pub (.getPublicKey secp256k1 (hex->u8 key-hex) false)
+        body (vec (rest (array-seq (js/Array.from pub))))]
+    (str "0x" (subs (kc/digest-hex body) 24))))
+
+(defn sign-digest
+  "Sign a 32-byte `digest` (0x hex) as the contract expects."
+  [key-hex digest]
+  (let [sig (.sign secp256k1 (hex->u8 digest) (hex->u8 key-hex) #js {:lowS true})
+        rs (u8->hex (.toCompactRawBytes sig))
+        v (+ 27 (.-recovery sig))]
+    (str "0x" rs (.toString v 16))))
+
+(defn recover-address
+  "The address that produced `sig` (0x r||s||v) over `digest`, or nil. A
+  relayer checks this itself rather than trusting the validator that served
+  the signature to say whose it is."
+  [digest sig]
+  (try
+    (let [h (str/replace sig #"^0x" "")
+          rs (hex->u8 (subs h 0 128))
+          v (js/parseInt (subs h 128 130) 16)
+          pub (-> (.fromCompact (.-Signature secp256k1) rs)
+                  (.addRecoveryBit (- v 27))
+                  (.recoverPublicKey (hex->u8 digest))
+                  (.toRawBytes false))
+          body (vec (rest (array-seq (js/Array.from pub))))]
+      (str "0x" (subs (kc/digest-hex body) 24)))
+    (catch :default _ nil)))

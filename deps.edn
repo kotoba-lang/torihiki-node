@@ -31,7 +31,7 @@
         ;; root ADR-2800004800 §1d measured on THIS deployment at 1030/1031.
         io.github.kotoba-lang/inga
         {:git/url "https://github.com/kotoba-lang/inga.git"
-         :git/sha "9eed5458daf568acd52f5e0a24398270b586ff1d"}
+         :git/sha "cd961d7fe2b260096f00e571f2915204bddca673"}
         ;; d8e5952 (2026-09-10 main) brings d128b50, which is the reason this
         ;; deployment stopped. Measured 2026-09-10, twenty-six days in: all four
         ;; witnesses spinning at view 1,496,141 with `no certificate for the
@@ -57,7 +57,7 @@
         ;; reset `equivocators` climbed 0 -> 1 -> 4 as views turned over, and
         ;; at four the chain stopped, each replica alone on its own tip.
         ;;
-        ;; 9eed545 (kotoba-lang/inga#24, 2026-10-07) moves this from d8e5952,
+        ;; cd961d7 (main, the merge of kotoba-lang/inga#24) moves this from d8e5952,
         ;; which still voted once per HEIGHT. That rule is why validator-v3
         ;; sits at 5805: two blocks at one height, votes split, every replica
         ;; has spent its vote there, permanently. inga main has voted once per
@@ -107,7 +107,7 @@
         ;; rather than by a keeper, and cancel-all / amend.
         io.github.kotoba-lang/torihiki
         {:git/url "https://github.com/kotoba-lang/torihiki.git"
-         :git/sha "96f6daf909bd42ecf2045b97192b96f10aef670f"}
+         :git/sha "d298fb519c10716ba138744a98d5e5ffdab50b74"}
         io.github.kotoba-lang/bytes
         {:git/url "https://github.com/kotoba-lang/bytes.git"
          :git/sha "5f977dd3e8ca73185488302841ade390e1979540"}

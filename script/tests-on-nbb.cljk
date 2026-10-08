@@ -18,9 +18,10 @@
 (ns tests-on-nbb
   (:require [cljs.test :as ct]
             [torihiki-node.store-test]
-            [torihiki-node.claims-test]))
+            [torihiki-node.claims-test]
+            [torihiki-node.duties-test]))
 
-(def ^:private expected-namespaces 2)
+(def ^:private expected-namespaces 3)
 (defonce ^:private ns-seen (atom 0))
 
 (defmethod ct/report [::ct/default :begin-test-ns] [_] (swap! ns-seen inc))
@@ -40,4 +41,4 @@
       (pos? (+ fail error)) (js/process.exit 1)
       :else (println "TESTS-ON-NBB: pass"))))
 
-(ct/run-tests 'torihiki-node.store-test 'torihiki-node.claims-test)
+(ct/run-tests 'torihiki-node.store-test 'torihiki-node.claims-test 'torihiki-node.duties-test)

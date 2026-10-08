@@ -55,6 +55,8 @@
             ["node:crypto" :as nc]
             [torihiki-node.store :as store]
             [torihiki-node.claims :as claims]
+            [torihiki-node.duties :as duties]
+            [torihiki-node.bridge-signer :as bsig]
             ["node:fs" :as fs]
             ["node:http" :as http]
             [kotoba.lang.text :as str]
@@ -73,6 +75,9 @@
             [torihiki.keccak :as kc]
             [torihiki.snapshot :as tsnap]
             [torihiki.thorchain :as tc]
+            [torihiki.bridge :as br]
+            [torihiki.governance :as gov]
+            [torihiki.validators :as vals]
             [torihiki.state :as st]))
 
 (defn- env [k d] (or (some-> js/process .-env (aget k)) d))
@@ -206,8 +211,22 @@
   ;; slabs were absent and the first `state-root` walked into a null:
   ;; `Cannot read properties of null` out of `book/best`. Every book a
   ;; genesis declares gets `book-opts`, which is what `:markets` is for.
-  (-> (st/new-exchange {:markets markets
-                        :book-opts {:n-levels 65536 :cap 16384 :ev-cap 8192}})
+  (-> (st/new-exchange
+       (cond-> {:markets markets
+                :book-opts {:n-levels 65536 :cap 16384 :ev-cap 8192}}
+         ;; `CHAIN_VALIDATORS=1`: the validator set, the oracle, upgrades and
+         ;; (with `BRIDGE_CONTRACT`) the bridge are chain state (roadmap
+         ;; D2-D5). A NEW chain: its genesis, and so its root, differs from a
+         ;; chain without them, so give it its own `CHAIN_ID`.
+         (env "CHAIN_VALIDATORS" nil)
+         (assoc :validators {:genesis (duties/genesis-validators witnesses pub-of addr/derive)
+                             :epoch-length (js/parseInt (env "EPOCH_LENGTH" "1000") 10)
+                             :min-stake (js/parseInt (env "MIN_STAKE" "1") 10)}
+                :protocol {})
+         (and (env "CHAIN_VALIDATORS" nil) (env "BRIDGE_CONTRACT" nil))
+         (assoc :bridge {:contract (str/lower (env "BRIDGE_CONTRACT" ""))
+                         :evm-chain-id (js/parseInt (env "BRIDGE_EVM_CHAIN_ID" "0") 10)
+                         :asset (env "BRIDGE_ASSET" "USDC")})))
       (as-> ex (reduce (fn [e m] (st/apply-tx e {:tx :oracle :market (:id m) :price 1000}))
                        ex markets))))
 
@@ -238,7 +257,10 @@
                                    :ts (:inga.block/ts block)
                                    :txs (mapv decode-tx (:inga.block/proposals block))}
                                {:chain-id chain-id :verify-fn tx-verify
-                                :derive-account addr/derive}))
+                                :derive-account addr/derive
+                                ;; Equivocation evidence is votes, verified
+                                ;; under the consensus key the chain records.
+                                :vote-verify-fn (duties/vote-verifier chain-id tx-verify)}))
    :root-fn st/state-root})
 
 ;; ── the node ────────────────────────────────────────────────────────────────
@@ -368,8 +390,19 @@
     (ship! out)
     (ship! (remove #(= :vote (get-in % [:msg :type])) out))))
 
+(defonce halted (atom nil))
+
+(defn- check-halt!
+  "Stop following the chain when it has voted past this binary's protocol."
+  []
+  (when-not @halted
+    (when-let [why (duties/halt-reason (:machine-state @state))]
+      (reset! halted why)
+      (js/console.error (str "torihiki " me ": HALTED — " why)))))
+
 (defn- feed! [msg]
   (swap! stats update :msgs-in inc)
+  (when-not @halted
   (let [[s' out] (r/on-message @state msg (now))]
     (reset! state s')
     (note-height! (r/height s'))
@@ -378,7 +411,8 @@
     ;; every 150: a reply that waits for a clock adds a clock to every hop.
     ;;
     ;; But only after the watermark is down.
-    (ship-kept! out)))
+    (ship-kept! out)
+    (check-halt!))))
 
 (defn- quantiles [v]
   (when (seq v)
@@ -479,6 +513,8 @@
 
       (rpc-error id -32601 (str "method not found: " method)))))
 
+(declare bridge-signatures duty-status)
+
 (defn- handle-http [^js req ^js res]
   (let [url (js/URL. (.-url req) "http://x")
         path (.-pathname url)
@@ -541,6 +577,13 @@
 
       "/.well-known/torihiki"
       (json-response res 200 (claims/status :validator))
+
+      ;; What this validator does besides voting, and whether it may.
+      "/duties"
+      (json-response res 200 (duty-status))
+
+      "/bridge/signatures"
+      (json-response res 200 (bridge-signatures (js/parseInt (or (q "epoch") "0") 10)))
 
       ;; The block hash at a given height, which is how two replicas are
       ;; compared. A block header carries no state root here — `canonical-block`
@@ -800,15 +843,41 @@
 
 (defonce watcher-nonce (atom 0))
 
+(declare halted)
+
+;; This node's own signed transactions the chain has not applied yet, by
+;; nonce, so a lost one can be sent again (`duties/resubmit`).
+(defonce own-pending (atom (sorted-map)))
+
 (defn- attest! [tx]
-  (let [acct (addr/derive (pub-of me))
-        nonce (swap! watcher-nonce inc)
-        tx (assoc tx :account acct)
-        payload (auth/signing-payload chain-id acct nonce tx)
-        env {:tx tx :account acct :nonce nonce
-             :pubkey (pub-of me)
-             :sig ((sign-as me) payload)}]
-    (swap! state r/submit (js/JSON.stringify (clj->js env)))))
+  (when-not @halted
+    (let [acct (addr/derive (pub-of me))
+          nonce (swap! watcher-nonce
+                       (fn [local] (duties/next-nonce (:machine-state @state) acct local)))
+          tx (assoc tx :account acct)
+          payload (auth/signing-payload chain-id acct nonce tx)
+          env (js/JSON.stringify
+               (clj->js {:tx tx :account acct :nonce nonce
+                         :pubkey (pub-of me)
+                         :sig ((sign-as me) payload)}))]
+      (swap! own-pending assoc nonce {:envelope env :sent-at (r/height @state)})
+      (swap! state r/submit env))))
+
+(defonce last-nonce-check (atom 0))
+
+(defn- resend-lost!
+  "Send our own transactions again when the chain has stopped consuming our
+  nonces for 20 blocks — one was lost, and every later one waits on it."
+  []
+  (let [t (now)]
+    (when (and (seq @own-pending) (> t (+ @last-nonce-check 2000)))
+      (reset! last-nonce-check t)
+      (let [acct (addr/derive (pub-of me))
+            [p' send] (duties/resubmit @own-pending
+                                       (auth/expected-nonce (:machine-state @state) acct)
+                                       (r/height @state) 20)]
+        (reset! own-pending p')
+        (doseq [e send] (swap! state r/submit e))))))
 
 (defn- watch-thorchain!
   "Poll THORChain and attest what this validator sees.
@@ -895,6 +964,196 @@
                        ;; attestation, so there is nothing to do but try again.
                        nil))))
        every))))
+
+;; ── the duties (roadmap D2-D4) ──────────────────────────────────────────────
+;;
+;; Each one only ever SUBMITS a signed transaction (`attest!`); the engine
+;; decides what the set agrees on. The pure half is `torihiki-node.duties`.
+
+(defonce evidence-sent (atom #{}))
+(defonce last-evidence-check (atom 0))
+
+(defn- submit-evidence!
+  "Send every equivocation proof this replica holds and the chain has not acted
+  on. inga already broadcasts proofs to its peers; this is what turns one into
+  a slash, by anybody who saw it, without an operator choosing to."
+  []
+  (let [t (now)]
+    (when (and (vals/enabled? (:machine-state @state))
+               (> t (+ @last-evidence-check 1000)))
+      (reset! last-evidence-check t)
+      (doseq [tx (duties/evidence-to-submit (:machine-state @state)
+                                            (:equivocations @state) @evidence-sent)]
+        (swap! evidence-sent conj (vals/evidence-key tx))
+        (attest! tx)))))
+
+(defn- rpc! [url method params]
+  (-> (js/fetch url #js {:method "POST" :headers #js {"content-type" "application/json"}
+                         ;; A provider that hangs must cost one poll, not
+                         ;; a promise per interval forever.
+                         :signal (js/AbortSignal.timeout 10000)
+                         :body (js/JSON.stringify
+                                (clj->js {:jsonrpc "2.0" :id 1 :method method :params params}))})
+      (.then #(.json %))
+      (.then #(js->clj (.-result %) :keywordize-keys true))
+      (.catch (fn [_] nil))))
+
+(defn- hex->int [h] (when (string? h) (js/parseInt (str/replace h #"^0x" "") 16)))
+
+(defonce bridge-state (atom {:from nil :sent #{} :tip nil :errors 0 :busy false :unsettled 0}))
+
+(defn- cursor-path [] (str data-dir "/bridge-cursor"))
+
+(defn- load-cursor
+  "Where to read from: the cursor this node saved, else `BRIDGE_FROM_BLOCK`
+  (the contract's deploy block). It used to start a thousand blocks behind
+  the tip, so a node that came back after a long outage never read the
+  deposits made while it was away."
+  []
+  (or (when (fs/existsSync (cursor-path))
+        (let [n (js/parseInt (fs/readFileSync (cursor-path) "utf8") 10)]
+          (when-not (js/isNaN n) n)))
+      (some-> (env "BRIDGE_FROM_BLOCK" nil) (js/parseInt 10))))
+
+(defn- save-cursor! [n]
+  (try (fs/writeFileSync (cursor-path) (str n)) (catch :default _ nil)))
+
+(defn- watch-bridge!
+  "Read `TorihikiBridge` logs and attest what a quorum of RPC providers agrees
+  on (`duties/agreed-logs`), from blocks deep enough not to be taken back.
+
+  Off unless the chain is in bridge mode and `BRIDGE_RPCS` names providers.
+  `BRIDGE_RPC_QUORUM` (default: all of them, at most 2) is how many must
+  report a log identically before this validator attests it."
+  []
+  (let [rpcs (remove str/blank? (str/split (env "BRIDGE_RPCS" "") #","))
+        k (js/parseInt (env "BRIDGE_RPC_QUORUM" (str (min 2 (max 1 (count rpcs))))) 10)
+        every (js/parseInt (env "BRIDGE_POLL_MS" "5000") 10)
+        window (js/parseInt (env "BRIDGE_WINDOW" "500") 10)
+        cfg (:bridge (:machine-state @state))]
+    (swap! bridge-state assoc :from (load-cursor))
+    (when (and cfg (seq rpcs))
+      (println (str "  bridge: watching " (:contract cfg) " via " (count rpcs) " RPCs, quorum " k))
+      (js/setInterval
+       (fn []
+         (when-not (or @halted (:busy @bridge-state))
+         (swap! bridge-state assoc :busy true)
+         (-> (js/Promise.all (clj->js (map #(rpc! % "eth_blockNumber" []) rpcs)))
+             (.then
+              (fn [heights]
+                (let [tip (duties/agreed-height (map hex->int (array-seq heights)) k)
+                      safe (when tip (- tip br/min-confirmations))
+                      from (:from @bridge-state)]
+                  (swap! bridge-state assoc :tip tip)
+                  (when (and safe from (<= from safe))
+                    (let [to (min safe (+ from (dec window)))
+                          q {:address (:contract cfg)
+                             :fromBlock (str "0x" (.toString from 16))
+                             :toBlock (str "0x" (.toString to 16))}]
+                      (-> (js/Promise.all (clj->js (map #(rpc! % "eth_getLogs" [q]) rpcs)))
+                          (.then
+                           (fn [answers]
+                             (let [answers (keep #(when % (vec %)) (array-seq answers))]
+                               ;; Too few answers is not "no logs": the window
+                               ;; is retried rather than skipped.
+                               (when (>= (count answers) k)
+                                 (doseq [tx (br/attestations (addr/derive (pub-of me)) cfg tip
+                                                             (duties/agreed-logs answers k))
+                                         :let [id [(:tx tx) (or (:txid tx) (:claim tx))]]
+                                         :when (not ((:sent @bridge-state) id))]
+                                   (swap! bridge-state update :sent conj id)
+                                   (attest! tx))
+                                 (if (duties/window-settled? answers k)
+                                   (do (swap! bridge-state assoc :from (inc to))
+                                       (save-cursor! (inc to)))
+                                   (swap! bridge-state update :unsettled inc))))))))))))
+             (.catch (fn [_] (swap! bridge-state update :errors inc)))
+             (.finally (fn [] (swap! bridge-state assoc :busy false))))))
+       every))))
+
+(defn- bridge-signatures
+  "This validator's signatures for every pending claim, for a relayer to
+  collect (`script/bridge_relay.cljk`). Off without `BRIDGE_SIGNER_KEY`.
+
+  `epoch` is the CONTRACT's validator epoch the signatures are for — pass it
+  as `?epoch=` (read `epoch()` on the contract); a signature for another epoch
+  simply fails to count there."
+  [contract-epoch]
+  (let [ex (:machine-state @state)
+        cfg (:bridge ex)
+        key (env "BRIDGE_SIGNER_KEY" nil)]
+    (cond
+      @halted {:error (str "halted: " @halted)}
+      (nil? cfg) {:error "not in bridge mode"}
+      (nil? key) {:error "no BRIDGE_SIGNER_KEY on this validator"}
+      (not (and (integer? contract-epoch) (not (neg? contract-epoch)))) {:error "epoch must be a non-negative integer"}
+      :else
+      {:signer (bsig/address-of key)
+       :epoch contract-epoch
+       :claims (vec (for [{:keys [claim dest amount]} (take 100 (br/pending-withdrawals ex))
+                          :let [d (br/withdrawal-digest cfg {:chain chain-id :claim claim :dest dest
+                                                             :amount amount :epoch contract-epoch})]]
+                      {:claim claim :dest dest :amount amount :digest d
+                       :sig (bsig/sign-digest key d)}))})))
+
+(defonce oracle-state (atom {:last nil :errors 0}))
+
+(def ^:private venues
+  "Public spot endpoints, by asset. A validator chooses which of these it
+  trusts with `ORACLE_VENUES`; the point of the set being the oracle is that
+  they do not all choose the same ones."
+  {"coinbase" (fn [a] [(str "https://api.coinbase.com/v2/prices/" a "-USD/spot")
+                       #(some-> % (aget "data") (aget "amount") js/parseFloat)])
+   "kraken" (fn [a] [(str "https://api.kraken.com/0/public/Ticker?pair=" (if (= a "BTC") "XBT" a) "USD")
+                     #(some-> % (aget "result") js/Object.values first (aget "c") first js/parseFloat)])
+   "bitstamp" (fn [a] [(str "https://www.bitstamp.net/api/v2/ticker/" (str/lower a) "usd/")
+                       #(some-> % (aget "last") js/parseFloat)])})
+
+(defn- feed-oracle!
+  "Publish this validator's price for each market in `ORACLE_MARKETS`
+  (`1=BTC,2=ETH`), the median of `ORACLE_VENUES`, every `ORACLE_EVERY_MS`.
+  Off unless set, and only on a chain whose set is the oracle."
+  []
+  (let [markets (for [p (remove str/blank? (str/split (env "ORACLE_MARKETS" "") #","))
+                      :let [[m a] (str/split p #"=")]]
+                  [(js/parseInt m 10) a])
+        chosen (remove str/blank? (str/split (env "ORACLE_VENUES" "coinbase,kraken,bitstamp") #","))
+        per-unit (js/parseFloat (env "ORACLE_USD_PER_UNIT" "1"))
+        min-sources (js/parseInt (env "ORACLE_MIN_SOURCES" "3") 10)]
+    (when (and (seq markets) (vals/enabled? (:machine-state @state)))
+      (println (str "  oracle: " (count markets) " markets from " (str/join "," chosen)))
+      (js/setInterval
+       (fn []
+         (when-not @halted
+         (doseq [[m a] markets]
+           (-> (js/Promise.all
+                (clj->js (for [v chosen :let [src (get venues v)] :when src
+                               :let [[url pick] (src a)]]
+                           (-> (js/fetch url #js {:signal (js/AbortSignal.timeout 10000)})
+                               (.then #(.json %)) (.then pick)
+                               (.catch (fn [_] nil))))))
+               (.then (fn [ps]
+                        (when-let [p (some-> (duties/source-median (array-seq ps) min-sources)
+                                             (duties/usd->units per-unit))]
+                          (swap! oracle-state assoc :last {:market m :price p :at (now)})
+                          (attest! {:tx :oracle-submit :market m :price p}))))
+               (.catch (fn [_] (swap! oracle-state update :errors inc)))))))
+       (js/parseInt (env "ORACLE_EVERY_MS" "5000") 10)))))
+
+(defonce genesis-root (atom nil))
+
+(defn- duty-status []
+  (let [ex (:machine-state @state)]
+    {:protocol-version (gov/active-version ex)
+     :binary-knows duties/max-protocol
+     :halted @halted
+     :validator-set (when (vals/enabled? ex) (mapv :witness (vals/active-set ex)))
+     :set-mismatch (duties/set-mismatch ex witnesses pub-of)
+     :genesis-root @genesis-root
+     :evidence-sent (count @evidence-sent)
+     :own-pending (count @own-pending)
+     :bridge (when (:bridge ex) (select-keys @bridge-state [:from :tip :errors :unsettled]))
+     :oracle @oracle-state}))
 
 (defonce next-repair (atom 0))
 (defonce stall (atom {:at -1 :since 0}))
@@ -998,12 +1257,42 @@
     (conj (str "PEERS has no entry for " me " (expected " me "@ws://host:port)"))
     (some #(not (contains? peer-url %)) witnesses)
     (conj (str "PEERS is missing "
-               (str/join "," (remove #(contains? peer-url %) witnesses))))))
+               (str/join "," (remove #(contains? peer-url %) witnesses))))
+
+    ;; Genesis parameters come from each host's environment and every one of
+    ;; them is under the state root. Blocks carry no root, so hosts that
+    ;; disagree here keep agreeing on blocks while their states split. Bad
+    ;; values are refused; GENESIS_ROOT (below) catches values that are
+    ;; merely different.
+    (and (env "CHAIN_VALIDATORS" nil)
+         (not (every? #(re-matches #"[1-9][0-9]*" (env % "1")) ["EPOCH_LENGTH" "MIN_STAKE"])))
+    (conj "EPOCH_LENGTH and MIN_STAKE must be positive integers")
+
+    (and (env "BRIDGE_CONTRACT" nil)
+         (not (re-matches #"0x[0-9a-fA-F]{40}" (env "BRIDGE_CONTRACT" ""))))
+    (conj "BRIDGE_CONTRACT must be a 20-byte 0x address")
+
+    (and (env "BRIDGE_CONTRACT" nil)
+         (not (re-matches #"[1-9][0-9]*" (env "BRIDGE_EVM_CHAIN_ID" "0"))))
+    (conj "BRIDGE_EVM_CHAIN_ID must be the EVM chain id (a positive integer); it is part of every signature")
+
+    (and (env "BRIDGE_RPCS" nil)
+         (not (re-matches #"[0-9]+" (env "BRIDGE_FROM_BLOCK" ""))))
+    (conj "BRIDGE_FROM_BLOCK (the contract's deploy block) is required to watch the bridge")))
 
 (defn -main [& _]
   (when-let [errs (seq (config-errors))]
     (doseq [e errs] (js/console.error (str "torihiki: " e)))
     (js/process.exit 2))
+  ;; Every host must start from the same state. Shown at /duties, and with
+  ;; GENESIS_ROOT set, a host whose environment built anything else refuses
+  ;; to start rather than fork silently.
+  (reset! genesis-root (st/state-root (genesis-exchange)))
+  (when-let [want (env "GENESIS_ROOT" nil)]
+    (when (not= want @genesis-root)
+      (js/console.error (str "torihiki: genesis root " @genesis-root " is not GENESIS_ROOT " want
+                             " — this host's genesis parameters differ from the set's"))
+      (js/process.exit 2)))
   (let [port (js/parseInt (second (str/split (get peer-url me "x:0") #":(?=[0-9]+$)")) 10)
         wss (ws/WebSocketServer. #js {:port port})
         n (atom 0)]
@@ -1035,6 +1324,7 @@
     (js/setInterval
      (fn []
        (when-let [nd @out-node] ((:tick! nd)))
+       (when-not @halted
        (let [[s' out] (r/on-tick @state (now))]
          (reset! state s')
          (note-height! (r/height s'))
@@ -1044,10 +1334,18 @@
          ;; one-crash window `keep-vote!` exists to close open on every
          ;; timeout.
          (ship-kept! out)
-         (persist!)
-         (checkpoint!)
-         (repair!)))
+         ;; Before anything is written: a state this binary must not have
+         ;; produced is not one to persist.
+         (check-halt!)
+         (when-not @halted
+           (persist!)
+           (checkpoint!)
+           (repair!)
+           (submit-evidence!)
+           (resend-lost!)))))
      tick-ms)
     (watch-thorchain!)
+    (watch-bridge!)
+    (feed-oracle!)
     (println (str "torihiki " me " · peers " port " · http " (env "HTTP_PORT" "8801")
                   " · tick " tick-ms "ms"))))

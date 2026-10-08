@@ -103,3 +103,27 @@ npm run build
 npx wrangler deploy
 kbb --backend sci --classpath <path-to>/torihiki/src client.cljk <url>   # signing client
 ```
+
+## Validator duties (standalone)
+
+`src/torihiki_node/duties.cljk` decides; `standalone.cljk` holds the sockets
+and keys. Every duty only ever submits a signed transaction — the engine
+decides what the set agrees on. `GET /duties` reports all of them.
+
+| env | duty |
+|---|---|
+| `CHAIN_VALIDATORS=1` (+ `EPOCH_LENGTH`, `MIN_STAKE`) | genesis with the validator set, oracle and upgrades as chain state (a new chain — give it its own `CHAIN_ID`) |
+| always, with a set | proofs of equivocation inga holds are submitted as `:equivocation-evidence` |
+| always | a chain that voted past `duties/max-protocol` HALTS this binary (`/duties :halted`) |
+| `BRIDGE_CONTRACT`, `BRIDGE_EVM_CHAIN_ID`, `BRIDGE_ASSET` | bridge mode at genesis |
+| `BRIDGE_RPCS`, `BRIDGE_RPC_QUORUM`, `BRIDGE_FROM_BLOCK` | attest `TorihikiBridge` logs that `k` providers report identically, 12 blocks deep |
+| `BRIDGE_SIGNER_KEY` | sign pending claims; `GET /bridge/signatures?epoch=N` |
+| `ORACLE_MARKETS=1=BTC,...`, `ORACLE_VENUES`, `ORACLE_USD_PER_UNIT` | publish the median of ≥3 venues as `:oracle-submit` |
+
+`script/bridge_relay.cljk` collects signatures and requests withdrawals (anyone
+may run it). `script/bridge_e2e.cljk` runs deposit → credit → withdraw →
+sign → relay → finalize → settle against anvil and four local validators.
+
+**Not wired:** consensus does not follow epoch turns yet (inga runs the witness
+list it started with; `/duties :set-mismatch` says when they differ), and the
+Durable Object validator (`validator.cljk`) has none of these duties.

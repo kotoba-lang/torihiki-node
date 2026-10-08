@@ -1,0 +1,96 @@
+;; Collect validators' bridge signatures and request the withdrawals on the
+;; contract (roadmap D3).
+;;
+;;   VALIDATORS=http://h1:8801,http://h2:8801,... \
+;;   BRIDGE_CONTRACT=0x... BRIDGE_RPC=http://... \
+;;   [RELAY_KEY=0x...]   # an EVM key that pays gas; omitted, the commands are printed
+;;     kbb --backend sci -cp "src:$(...)" script/bridge_relay.cljk
+;;
+;; Anybody may relay. The signatures fix the destination and the amount, so a
+;; relayer can only choose WHEN to submit, not what; and it needs no trust from
+;; anybody, which is why this is a script and not a validator duty.
+;;
+;; Reads the contract's `epoch()` (the validator set the signatures must come
+;; from), asks every validator for its signatures for that epoch, keeps the
+;; ones whose digest agrees, sorts them by signer address (the contract
+;; refuses any other order) and submits claims the contract has not seen.
+(ns bridge-relay
+  (:require ["node:child_process" :as cp]
+            [kotoba.lang.text :as str]
+            [promesa.core :as p]
+            [torihiki-node.bridge-signer :as bs]))
+
+(defn- env [k d] (or (aget js/process.env k) d))
+
+(def validators (remove str/blank? (str/split (env "VALIDATORS" "") #",")))
+(def contract (env "BRIDGE_CONTRACT" nil))
+(def rpc (env "BRIDGE_RPC" "http://127.0.0.1:8545"))
+(def relay-key (env "RELAY_KEY" nil))
+
+(defn- cast! [& args]
+  (str/trim (str (cp/execFileSync "cast" (clj->js args) #js {:encoding "utf8"}))))
+
+(defn- requested? [claim]
+  ;; withdrawals(claim) -> (dest, amount, requestedAt, finalized, invalidated)
+  (let [out (js->clj (js/JSON.parse
+                      (cast! "call" contract "withdrawals(uint64)(address,uint256,uint64,bool,bool)"
+                             (str claim) "--rpc-url" rpc "--json")))]
+    (not= "0" (str (nth out 2 "0")))))
+
+(defn- contract-signers []
+  (set (map str/lower (first (js->clj (js/JSON.parse
+                                       (cast! "call" contract "currentSigners()(address[])"
+                                              "--rpc-url" rpc "--json")))))))
+
+(defn- usable
+  "The signatures the contract will count, decided here: recovered locally
+  (a validator's word about whose signature it served is not evidence), in the
+  contract's current set, one per signer, in ascending address order. One
+  endpoint serving a wrong or copied signature used to make every attempt
+  revert; now it is just one signature fewer."
+  [digest sigs members]
+  (->> sigs
+       (keep (fn [c] (let [who (bs/recover-address digest (:sig c))]
+                       (when (and who (contains? members who)) (assoc c :signer who)))))
+       (reduce (fn [m c] (if (contains? m (:signer c)) m (assoc m (:signer c) c))) {})
+       vals
+       (sort-by :signer)))
+
+(defn relay! []
+  (p/let [epoch (js/parseInt (cast! "call" contract "epoch()(uint64)" "--rpc-url" rpc) 10)
+          answers (p/all (for [v validators]
+                           (-> (js/fetch (str v "/bridge/signatures?epoch=" epoch))
+                               (.then #(.json %))
+                               (.then #(js->clj % :keywordize-keys true))
+                               (.catch (fn [_] nil)))))
+          by-claim (group-by :claim
+                             (for [a answers :when (:signer a)
+                                   c (:claims a)]
+                               (assoc c :signer (str/lower (:signer a)))))]
+    (println (str "epoch " epoch ", " (count (filter :signer answers)) "/" (count validators)
+                  " validators answered, " (count by-claim) " pending claims"))
+    (doseq [:let [members (contract-signers)]
+            [claim sigs] (sort-by key by-claim)
+            :let [digests (frequencies (map :digest sigs))
+                  [digest _] (last (sort-by val digests))
+                  agreed (usable digest (filter #(= digest (:digest %)) sigs) members)
+                  {:keys [dest amount]} (first agreed)
+                  sig-list (str "[" (str/join "," (map :sig agreed)) "]")]]
+      (cond
+        (requested? claim) (println (str "claim " claim ": already requested"))
+        relay-key
+        (try
+          (cast! "send" contract "requestWithdrawal(uint64,address,uint256,bytes[])"
+                 (str claim) dest (str amount) sig-list
+                 "--rpc-url" rpc "--private-key" relay-key)
+          (println (str "claim " claim ": requested with " (count agreed) " signatures"))
+          ;; Usually too few signatures yet (the contract says NoQuorum);
+          ;; the next run tries again.
+          (catch :default e
+            (println (str "claim " claim ": not requested — " (.-message e)))))
+        :else
+        (println (str "cast send " contract " 'requestWithdrawal(uint64,address,uint256,bytes[])' "
+                      claim " " dest " " amount " '" sig-list "' --rpc-url " rpc))))))
+
+(when (and contract (seq validators))
+  (relay!))
