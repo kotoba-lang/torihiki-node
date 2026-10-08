@@ -1,0 +1,104 @@
+;; A light client: one account's collateral, proved (roadmap D5).
+;;
+;;   NODES=http://h1:8801,http://h2:8801,... ACCOUNT=<id> CHAIN_ID=... \
+;;   SET=w1=<base64 spki>,w2=... EPOCH=<n> \
+;;     kbb --backend sci -cp "src:$CP" script/light_client.cljk
+;;
+;; WHAT IT TRUSTS. The validator set (`SET`, the keys of engine epoch `EPOCH`)
+;; and nothing else: no node, no host, no provider. A root counts when more
+;; than 2/3 of that set signed it as members of that epoch; a balance counts
+;; when the account's own merkle-sum leaf checks against the root. Any number
+;; of the NODES may lie; they can make it fail, not make it accept.
+;;
+;; Without SET, `TRUST_MAJORITY=1` takes the set the majority of NODES report
+;; at /duties — which trusts that most of THOSE URLS are honest, a much weaker
+;; thing, since anybody can run nodes. It says so in its output.
+;;
+;; Keys anybody can compute (a devnet's, derived from the chain id) are
+;; refused unless `ALLOW_DEVNET=1`: signatures under them prove nothing.
+;;
+;; Exit 0: verified. 1: not verified. 2: the set signed two roots at one
+;; height — printed as evidence.
+(ns light-client
+  (:require ["node:crypto" :as nc]
+            [kotoba.lang.text :as str]
+            [kotoba.bytes.sha256 :as sha]
+            [promesa.core :as p]
+            [torihiki.light :as light]))
+
+(defn- env [k d] (or (aget js/process.env k) d))
+(def nodes (remove str/blank? (str/split (env "NODES" "") #",")))
+(def account (let [a (env "ACCOUNT" nil)] (when (and a (re-matches #"[0-9]+" a)) (js/parseInt a 10))))
+(def chain-id (env "CHAIN_ID" "torihiki-standalone-1"))
+
+(defn- verify [pubkey payload sig]
+  (try (nc/verify nil (js/Buffer.from payload "utf8")
+                  (nc/createPublicKey #js {:key (js/Buffer.from pubkey "base64") :format "der" :type "spki"})
+                  (js/Buffer.from sig "base64"))
+       (catch :default _ false)))
+
+(defn- devnet-pub
+  "The key a devnet derives for witness `w` from the chain id alone."
+  [w]
+  (let [der (js/Buffer.concat #js [(js/Buffer.from "302e020100300506032b657004220420" "hex")
+                                   (js/Buffer.from (sha/sha256-hex (str chain-id "/" w)) "hex")])]
+    (.toString (.export (nc/createPublicKey (nc/createPrivateKey #js {:key der :format "der" :type "pkcs8"}))
+                        #js {:format "der" :type "spki"})
+               "base64")))
+
+(defn- GET [url]
+  (-> (js/fetch url #js {:signal (js/AbortSignal.timeout 5000)})
+      (.then #(when (.-ok %) (.text %)))
+      (.then #(when (and % (< (count %) 4000000)) (js->clj (js/JSON.parse %) :keywordize-keys true)))
+      (.catch (fn [_] nil))))
+
+(defn- fail! [code what] (println "NOT VERIFIED:" what) (js/process.exit code))
+
+(defn- configured []
+  (when-let [s (env "SET" nil)]
+    {:epoch (js/parseInt (env "EPOCH" "") 10)
+     :members (into {} (for [p (str/split s #",") :let [[w k] (str/split p #"=" 2)]]
+                         [w {:pubkey k :weight 1}]))}))
+
+(when-not account (fail! 1 "set ACCOUNT to the account id"))
+
+(p/let [duties (p/all (map #(GET (str % "/duties")) nodes))
+        trusted (or (configured)
+                    (when (env "TRUST_MAJORITY" nil)
+                      (some (fn [[s n]] (when (> (* 2 n) (count nodes)) s))
+                            (frequencies (keep #(when (:segment-keys %)
+                                                  {:epoch (:epoch %)
+                                                   :members (into {} (for [[w k] (:segment-keys %)]
+                                                                       [(name w) {:pubkey k :weight 1}]))})
+                                               duties)))))
+        _ (when-not (and trusted (seq (:members trusted)) (integer? (:epoch trusted)) (not (js/isNaN (:epoch trusted))))
+            (fail! 1 "no trusted set: pass SET and EPOCH (or TRUST_MAJORITY=1 to trust most of NODES)"))
+        members (:members trusted)
+        epoch (:epoch trusted)
+        _ (when (env "TRUST_MAJORITY" nil)
+            (println "WARNING: the set was taken from a majority of the given URLs, not held by this client"))
+        derivable (filter (fn [[w {:keys [pubkey]}]] (= pubkey (devnet-pub w))) members)
+        _ (when (and (seq derivable) (not (env "ALLOW_DEVNET" nil)))
+            (fail! 1 (str "keys of " (vec (sort (map key derivable)))
+                          " are derived from the chain id; anyone can sign with them (ALLOW_DEVNET=1 to accept)")))
+        latest (p/all (map #(GET (str % "/attestation")) nodes))
+        heights (sort > (distinct (filter integer? (keep :height latest))))
+        found (p/loop [hs heights]
+                (if (empty? hs)
+                  nil
+                  (p/let [h (first hs)
+                          as (p/all (map #(GET (str % "/attestation?h=" h)) nodes))
+                          r (light/attested-root (remove nil? as) members chain-id epoch verify)]
+                    (if r r (p/recur (rest hs))))))
+        _ (when (:conflict found)
+            (println "EVIDENCE: the set signed different roots at one height:")
+            (doseq [c (:conflict found)] (println " " (pr-str c)))
+            (fail! 2 "conflicting roots"))
+        _ (when-not found (fail! 1 "no root signed by more than 2/3 of the set"))
+        proofs (p/all (map #(GET (str % "/proof?a=" account "&h=" (:height found))) nodes))
+        ok (some #(light/verify-account % found account) (remove nil? proofs))]
+  (if ok
+    (println (str "VERIFIED account " account " collateral " (:collateral ok)
+                  " at height " (:height ok) " (epoch " epoch "), root signed by "
+                  (count (:signers ok)) "/" (count members) " validators " (vec (sort (:signers ok)))))
+    (fail! 1 (str "no node served a proof for account " account " that checks against the signed root"))))

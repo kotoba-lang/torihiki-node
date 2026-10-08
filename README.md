@@ -150,6 +150,29 @@ Catch-up counts only members of the segment being left, needs f + 1 of them
 to agree, and checks the boundary block against that set's certificate. A node
 whose consensus key was rotated on chain halts until it is given the new key.
 
+### Anyone can follow and check it (D5)
+
+Nothing below depends on where validators run — a host, a VM, a laptop —
+or on any vendor's primitive: it is plain HTTP between ordinary processes.
+
+- **Observer** (`OBSERVER=1`, `HTTP_PEERS` naming the set): a full node in
+  nobody's address book, with no listening socket. It asks members for
+  `/blocks` over HTTP, and inga verifies every certificate and link before its
+  engine applies anything; across epoch boundaries it takes the handoff like
+  any node (f + 1 members, boundary certificate). Non-member validators use
+  the same loop. Measured: an observer started late synced 3,710 blocks from
+  genesis by HTTP, and one run through seven epoch handoffs held the same state
+  root as the members at every attested height it was asked about.
+- **Root attestations**: every `ATTEST_EVERY` (20) engine heights a node signs
+  `torihiki/root/v1` (chain, height, state root) with its consensus key —
+  `GET /attestation?h=` — and keeps the leaves to serve `GET /proof?a=&h=`.
+- **Light client** (`script/light_client.cljk`, `torihiki.light` in the
+  engine): a root is trusted when more than 2/3 of the set signed it; the
+  account's own merkle-sum leaf is then checked against it, so the collateral
+  itself is proved. Measured: verified against five nodes; with one node
+  forging roots and inflating the balance among them, still verified the true
+  balance from the other three; with only the forger, refused.
+
 **Upgrading:** every node of a chain with `CHAIN_VALIDATORS=1` must run this
 before the chain's first epoch boundary; a node that crosses one on an older
 build keeps applying blocks the others no longer apply.
