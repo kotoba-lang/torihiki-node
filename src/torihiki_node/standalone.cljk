@@ -290,10 +290,17 @@
   [pubkey payload sig]
   (try
     (let [k (js/Buffer.from pubkey "base64")
-          der (if (= 32 (.-length k)) (js/Buffer.concat #js [spki-ed25519-prefix k]) k)]
-      (nc/verify nil (js/Buffer.from payload "utf8")
-                 (nc/createPublicKey #js {:key der :format "der" :type "spki"})
-                 (js/Buffer.from sig "base64")))
+          der (if (= 32 (.-length k)) (js/Buffer.concat #js [spki-ed25519-prefix k]) k)
+          key (nc/createPublicKey #js {:key der :format "der" :type "spki"})]
+      (and
+       ;; One key, one spelling. Node's base64 decoder ignores junk,
+       ;; whitespace and padding, so one key had endless strings — each
+       ;; deriving its own account id — until the decoded bytes must
+       ;; re-encode to exactly the string given.
+       (= pubkey (.toString k "base64"))
+       ;; And Ed25519 only: `verify nil` would take other SPKI key types.
+       (= "ed25519" (.-asymmetricKeyType key))
+       (nc/verify nil (js/Buffer.from payload "utf8") key (js/Buffer.from sig "base64"))))
     (catch :default _ false)))
 
 (defn- decode-tx [s]
@@ -682,13 +689,14 @@
 
 (declare bridge-signatures duty-status epoch-answer)
 
-(defn- handle-http [^js req ^js res]
+(defn- handle-http* [^js req ^js res]
   (if (= "OPTIONS" (.-method req))
     ;; A browser asks before POSTing JSON from another origin. Every route here
     ;; already answers `*`; this is the question before the request.
     (do (.writeHead res 204 #js {"Access-Control-Allow-Origin" "*"
                                  "Access-Control-Allow-Methods" "GET,POST,OPTIONS"
-                                 "Access-Control-Allow-Headers" "content-type"})
+                                 "Access-Control-Allow-Headers" "content-type"
+                                 "Access-Control-Max-Age" "86400"})
         (.end res))
   (let [url (js/URL. (.-url req) "http://x")
         path (.-pathname url)
@@ -880,14 +888,14 @@
       ;; Recent fills, newest first.
       "/trades"
       (let [m (js/parseInt (or (q "m") "1") 10)
-            n (max 1 (min 200 (js/parseInt (or (q "n") "20") 10)))]
+            n (let [x (js/parseInt (or (q "n") "20") 10)] (if (js/isNaN x) 20 (max 1 (min 200 x))))]
         (json-response res 200 {:market m :trades (vec (reverse (take-last n (get @tapes m []))))}))
 
       ;; Block candles, rebucketed to `span` blocks, the newest `n`.
       "/candles"
       (let [m (js/parseInt (or (q "m") "1") 10)
-            span (max 1 (js/parseInt (or (q "span") "10") 10))
-            n (max 1 (min 1000 (js/parseInt (or (q "n") "200") 10)))
+            span (let [x (js/parseInt (or (q "span") "10") 10)] (if (js/isNaN x) 10 (max 1 x)))
+            n (let [x (js/parseInt (or (q "n") "200") 10)] (if (js/isNaN x) 200 (max 1 (min 1000 x))))
             arr (get @candles m [])
             floor (when (seq arr) (- (cndl/bucket span (:h (peek arr))) (* span (dec n))))
             window (if floor (filterv #(>= (:h %) floor) arr) [])]
@@ -1752,6 +1760,17 @@
              (.catch (fn [_] (swap! follow-state update :errors inc)))
              (.finally (fn [] (swap! follow-state assoc :busy false)))))))
    300))
+
+(defn- handle-http
+  "Every request, behind a catch. A route that throws is a 500 for that
+  request — not an uncaught exception that stops the replica, which would make
+  any route bug a remote way to take a validator down."
+  [^js req ^js res]
+  (try
+    (handle-http* req res)
+    (catch :default e
+      (try (json-response res 500 {:error "internal" :message (str (.-message e))})
+           (catch :default _ nil)))))
 
 (defn- config-errors
   "What is wrong with this replica's configuration, before anything listens.
