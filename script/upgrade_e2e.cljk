@@ -1,5 +1,6 @@
-;; A protocol upgrade, end to end: the operators vote version 2 in, and from
-;; its height an order the account cannot back is refused.
+;; A protocol upgrade, end to end: the operators vote a version in
+;; (TARGET_VERSION, default 2), and from its height an order the account
+;; cannot back is refused — which holds from version 2 on.
 ;;
 ;;   NODES=http://127.0.0.1:8801,... CHAIN_ID=... \
 ;;   SEEDS=w1=<hex>,w2=<hex>,w3=<hex>  (operators' signing seeds; 3 of 4 is >2/3) \
@@ -20,6 +21,11 @@
 (def chain (env "CHAIN_ID"))
 (def nodes (str/split (env "NODES") #","))
 (def notice (js/parseInt (env "NOTICE") 10))
+;; The version to vote in (default 2). Order margin holds from 2 on, so the
+;; checks below hold for any later version too.
+(def target (let [v (js/parseInt (or (aget js/process.env "TARGET_VERSION") "2") 10)]
+              (when-not (>= v 2) (println "FAIL: TARGET_VERSION must be 2 or more") (js/process.exit 1))
+              v))
 
 (def ^:private pkcs8 (js/Buffer.from "302e020100300506032b657004220420" "hex"))
 (defn- key-of [seed-hex]
@@ -71,30 +77,30 @@
         ;; no-op. A few hundred blocks covers the round trips at any speed.
         activation (+ (:engine-height head (:height head)) notice (js/parseInt (or (aget js/process.env "SLACK") "600") 10))
         [w1 & voters] (vals operators)
-        p1 (p/-> (send! w1 {:tx :upgrade-propose :version 2 :activation activation}) outcome)
+        p1 (p/-> (send! w1 {:tx :upgrade-propose :version target :activation activation}) outcome)
         d1 (J (str (first nodes) "/duties"))
         proposal (:protocol-last-proposal d1)
-        _ (println "propose v2 at" activation "->" (:status p1) (:reason p1) "— proposal" proposal)
+        _ (println (str "propose v" target " at") activation "->" (:status p1) (:reason p1) "— proposal" proposal)
         votes (p/all (for [k voters] (p/-> (send! k {:tx :upgrade-vote :proposal proposal}) outcome)))
         _ (println "votes ->" (mapv (juxt :status :reason) votes))
         d2 (J (str (first nodes) "/duties"))
-        _ (when-not (= 2 (:version (:protocol-scheduled d2)))
-            (fail! (str "the votes did not schedule version 2: " (pr-str (:protocol-scheduled d2)))))
+        _ (when-not (= target (:version (:protocol-scheduled d2)))
+            (fail! (str "the votes did not schedule version " target ": " (pr-str (:protocol-scheduled d2)))))
         _ (p/loop [i 0]
             (p/let [v (version)]
-              (cond (= 2 v) (println "version 2 active")
-                    (> i 600) (fail! "version 2 never activated")
+              (cond (= target v) (println "version" target "active")
+                    (> i 600) (fail! (str "version " target " never activated"))
                     :else (p/do (wait 1000) (p/recur (inc i))))))
         after (fresh-key)
         _ (p/-> (send! after {:tx :deposit :amount 10000000}) outcome)
         refused (p/-> (send! after (order 0 900 50000000)) outcome)
-        _ (println "version 2: the same bid ->" (:status refused) (:reason refused))
+        _ (println (str "version " target ": the same bid ->") (:status refused) (:reason refused))
         m (J (str (first nodes) "/market"))
         ;; Half of what 10M backs at the mark and the market's initial-margin
         ;; rate (scaled by 1e9), so a moving mark does not decide the result.
         lots (quot (quot (* 10000000 1000000000) (* (:mark m) (:initial-margin-rate m))) 2)
         fits (p/-> (send! after (order 0 (dec (:mark m)) lots)) outcome)
-        _ (println "version 2:" lots "lots just under the mark (half of what 10M backs) ->" (:status fits) (:reason fits))
+        _ (println (str "version " target ":") lots "lots just under the mark (half of what 10M backs) ->" (:status fits) (:reason fits))
         acct (J (str (first nodes) "/account?id=" (addr/derive (:pub after))))
         _ (println "free collateral with that bid resting:" (:free-collateral acct) "order margin:" (:order-margin acct))]
   (cond
@@ -102,4 +108,4 @@
     (fail! "the oversized order was not refused for margin")
     (not= "applied" (:status fits)) (fail! "an affordable order was refused")
     (not (< (:free-collateral acct) 10000000)) (fail! "a resting order did not reduce free collateral")
-    :else (println "PASS: version 2 voted in; orders are margined from its height")))
+    :else (println (str "PASS: version " target " voted in; orders are margined from its height"))))

@@ -28,8 +28,11 @@
   past it is running rules this code does not have.
 
   2: an order must be one the account can back (`torihiki.order-margin`,
-  kotoba-lang/torihiki#41)."
-  2)
+  kotoba-lang/torihiki#41).
+  3: a liquidation slice is a real trade, quoted first with every maker
+  credited (#42), and every fill is settled however many the block made
+  (#43)."
+  3)
 
 (defn halt-reason
   "Why this binary must stop following `ex`, or nil.
