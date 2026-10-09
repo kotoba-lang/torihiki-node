@@ -954,7 +954,8 @@
       ;; final; "pending" while this node holds it (`:hint` the last
       ;; rejection that spent no nonce); a non-final "rejected"; or "unknown".
       "/tx-status"
-      (let [sig (canonical-sig (q "sig"))]
+      ;; An unencoded `+` arrives as a space; base64 has no spaces.
+      (let [sig (canonical-sig (some-> (q "sig") (str/replace " " "+")))]
         (json-response res 200 (assoc (mempool/status @tx-outcomes @tracked-txs sig) :sig sig)))
 
       "/book"

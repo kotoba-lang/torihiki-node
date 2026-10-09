@@ -57,6 +57,11 @@
            (< nonce expected) (>= nonce (+ expected per-account))
            (>= (count tracked) cap)
            (>= (count (filter #(= account (:account %)) (vals tracked))) per-account)
+           ;; Ahead of the next nonce only as part of an unbroken run: keys
+           ;; are free and every key owns its account, so nonces 2..65 with
+           ;; no nonce 1 — never applicable — would otherwise fill the table.
+           (and (> nonce expected)
+                (not (some #(and (= account (:account %)) (= (dec nonce) (:nonce %))) (vals tracked))))
            (not (true? (authentic?))))
      tracked
      (assoc tracked sig {:body body :account account :nonce nonce :at now :sent-at now}))))
@@ -113,9 +118,17 @@
             {:by-sig (assoc by-sig sig o) :order (conj order sig)})
         extra (- (count (:order m)) cap)]
     (if (pos? extra)
+      ;; A fresh vector, not `subvec`: a subvec keeps the whole vector under
+      ;; it alive and appends into it, so every signature ever recorded
+      ;; stayed in memory (review of #45).
       {:by-sig (apply dissoc (:by-sig m) (take extra (:order m)))
-       :order (subvec (:order m) extra)}
+       :order (vec (drop extra (:order m)))}
       m)))
+
+(defn- bounded-remove [{:keys [by-sig order] :as m} sig]
+  (if (contains? by-sig sig)
+    {:by-sig (dissoc by-sig sig) :order (filterv #(not= sig %) order)}
+    m))
 
 (def empty-log {:final {:by-sig {} :order []} :hints {:by-sig {} :order []}})
 
@@ -134,7 +147,7 @@
    (reduce (fn [l [sig o]]
              (cond (get-in l [:final :by-sig sig]) l
                    (:final o) (-> l (update :final bounded-put sig o outcome-cap)
-                                  (update-in [:hints :by-sig] dissoc sig))
+                                  (update :hints bounded-remove sig))
                    :else (update l :hints bounded-put sig o hint-cap)))
            (or log empty-log) outs)))
 

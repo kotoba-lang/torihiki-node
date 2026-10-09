@@ -11,7 +11,8 @@
 
 (deftest only-what-could-still-apply-is-kept
   (is (= #{"a"} (set (keys (admit {} "a" 5)))) "the next nonce")
-  (is (= #{"a"} (set (keys (admit {} "a" 7)))) "a little ahead: waits for the ones before it")
+  (is (empty? (admit {} "a" 7)) "ahead, with nothing before it held: may never apply")
+  (is (= #{"a" "b"} (set (keys (-> {} (admit "a" 5) (admit "b" 6))))) "an unbroken run")
   (is (empty? (admit {} "a" 4)) "already spent")
   (is (empty? (admit {} "a" (+ 5 64))) "absurdly far ahead")
   (is (empty? (admit {} "a" 5 5 (constantly false))) "the engine's authentication refuses it")
@@ -34,6 +35,7 @@
   (let [calls (atom 0)
         v #(do (swap! calls inc) true)]
     (admit {} "a" 4 5 v)
+    (admit {} "a" 7 5 v)
     (admit {"a" {}} "a" 5 5 v)
     (admit {} "a" 5 5 v (apply str (repeat 600 "x")))
     (is (zero? @calls) "nothing cheap ruled out was authenticated")))
@@ -107,3 +109,21 @@
         log (reduce #(m/record-outcomes %1 [[(str %2) {:final true}]] opts) nil (range 5))]
     (is (= ["2" "3" "4"] (get-in log [:final :order])))
     (is (= #{"2" "3" "4"} (set (keys (get-in log [:final :by-sig])))))))
+
+(deftest junk-runs-cannot-fill-the-table
+  ;; Review of #45: keys are free and own their accounts, so nonces 2..65
+  ;; with no nonce 1 filled all 4096 slots for two minutes.
+  (let [tr (reduce (fn [tr n] (m/admit tr (str "s" n) (str "b" n) (t 1 n) 0 1 ok)) {} (range 2 66))]
+    (is (empty? tr))))
+
+(deftest the-log-frees-what-it-drops
+  (let [opts (assoc m/defaults :outcome-cap 10)
+        log (reduce #(m/record-outcomes %1 [[(str %2) {:final true}]] opts) nil (range 2000))]
+    (is (= 10 (count (get-in log [:final :order]))))
+    (is (not (instance? #?(:cljs cljs.core/Subvec :clj clojure.lang.APersistentVector$SubVector)
+                        (get-in log [:final :order]))))))
+
+(deftest a-hint-that-becomes-final-leaves-the-hints
+  (let [log (m/record-outcomes nil [["a" {:status :rejected :final false}]])
+        log (m/record-outcomes log [["a" {:status :applied :final true}]])]
+    (is (empty? (get-in log [:hints :order])))))
