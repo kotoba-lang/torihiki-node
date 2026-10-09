@@ -83,7 +83,9 @@
             [torihiki.light :as light]
             [torihiki.commit :as cm]
             [merkle-sum.core :as ms]
-            [torihiki.state :as st]))
+            [torihiki.state :as st]
+            [torihiki.book :as bk]
+            [torihiki-chart.candle :as cndl]))
 
 (defn- env [k d] (or (some-> js/process .-env (aget k)) d))
 
@@ -333,6 +335,35 @@
       {:id id :bytes (vec (:bytes l)) :sum (:sum l 0) :proof p
        :root (:hash (:root t)) :reserves (:sum (:root t))})))
 
+;; ── the tape and the candles (what a terminal draws) ─────────────────────────
+
+(def ^:private tape-size 200)
+(def ^:private candle-retention 2000)
+
+(defonce tapes (atom {}))
+(defonce candles (atom {}))
+
+(defn- record-fills!
+  "Keep the last fills and one candle per traded block, per market — the
+  Worker's `/trades` and `/candles`, on an ordinary node. The engine resets
+  its event buffers every block, so they are read here, once, as the block is
+  applied. A view for clients, not consensus: nothing reads it back."
+  [ex]
+  (try
+    (let [h (:height ex 0)]
+      (doseq [[m book] (:books ex)
+              :let [fills (bk/fills book)]
+              :when (seq fills)]
+        (swap! tapes update m (fn [t] (vec (take-last tape-size
+                                                       (concat t (map (fn [f] {:level (:level f) :qty (:qty f)
+                                                                               :side (:taker-side f) :h h})
+                                                                      fills))))))
+        (let [c (reduce (fn [c f] (cndl/absorb c {:level (:level f) :qty (:qty f)
+                                                   :side (cndl/normalize-side (:taker-side f))}))
+                        nil fills)]
+          (swap! candles update m (fn [cs] (vec (take-last candle-retention (conj (or cs []) (assoc c :h h)))))))))
+    (catch :default _ nil)))
+
 (defn- machine-for
   "The machine for segment `sg`. `init-fn` builds its first state (the genesis
   exchange for segment 0, the state at the boundary after that).
@@ -360,9 +391,10 @@
                                 ;; list: every replica derives the same table.
                                 :vote-verify-fn (epoch/vote-verifier chain-id (epoch/segments-of ex)
                                                                      tx-verify)})
-                 ;; A side record only: what the engine computed is returned
+                 ;; Side records only: what the engine computed is returned
                  ;; unchanged.
-                 record-attestation!)))
+                 record-attestation!
+                 record-fills!)))
    :root-fn st/state-root})
 
 (defonce segment-init (atom genesis-exchange))
@@ -639,6 +671,13 @@
 (declare bridge-signatures duty-status epoch-answer)
 
 (defn- handle-http [^js req ^js res]
+  (if (= "OPTIONS" (.-method req))
+    ;; A browser asks before POSTing JSON from another origin. Every route here
+    ;; already answers `*`; this is the question before the request.
+    (do (.writeHead res 204 #js {"Access-Control-Allow-Origin" "*"
+                                 "Access-Control-Allow-Methods" "GET,POST,OPTIONS"
+                                 "Access-Control-Allow-Headers" "content-type"})
+        (.end res))
   (let [url (js/URL. (.-url req) "http://x")
         path (.-pathname url)
         q (fn [k] (.get (.-searchParams url) k))
@@ -648,6 +687,11 @@
       "/head"
       (json-response res 200
                      {:witness me
+                      ;; What a client signs transactions under, and where the
+                      ;; engine is (inga's `:height` restarts in each epoch
+                      ;; segment).
+                      :chain-id chain-id
+                      :engine-height (:height ex 0)
                       ;; What this set may claim about itself
                       ;; (torihiki-node.claims). Running on ordinary hosts is
                       ;; D1's shape; it is not D1's gate.
@@ -815,12 +859,32 @@
       (json-response res 200 (api/book-snapshot ex (js/parseInt (or (q "m") "1") 10)))
 
       "/account"
-      (json-response res 200 (api/account-state ex (js/parseInt (q "a") 10)))
+      (json-response res 200 (api/account-state ex (js/parseInt (or (q "a") (q "id")) 10)))
+
+      ;; One market's parameters, mark, oracle and funding (`id` or `m`).
+      "/market"
+      (json-response res 200 (api/market-info ex (js/parseInt (or (q "id") (q "m") "1") 10)))
+
+      ;; Recent fills, newest first.
+      "/trades"
+      (let [m (js/parseInt (or (q "m") "1") 10)
+            n (max 1 (min 200 (js/parseInt (or (q "n") "20") 10)))]
+        (json-response res 200 {:market m :trades (vec (reverse (take-last n (get @tapes m []))))}))
+
+      ;; Block candles, rebucketed to `span` blocks, the newest `n`.
+      "/candles"
+      (let [m (js/parseInt (or (q "m") "1") 10)
+            span (max 1 (js/parseInt (or (q "span") "10") 10))
+            n (max 1 (min 1000 (js/parseInt (or (q "n") "200") 10)))
+            arr (get @candles m [])
+            floor (when (seq arr) (- (cndl/bucket span (:h (peek arr))) (* span (dec n))))
+            window (if floor (filterv #(>= (:h %) floor) arr) [])]
+        (json-response res 200 {:market m :span span :unit "blocks" :candles (cndl/rebucket span window)}))
 
       "/markets"
       (json-response res 200 {:markets (mapv #(api/market-info ex (:id %)) markets)})
 
-      (json-response res 404 {:ok false :reason "no-such-route"}))))
+      (json-response res 404 {:ok false :reason "no-such-route"})))))
 
 ;; ── start ───────────────────────────────────────────────────────────────────
 
