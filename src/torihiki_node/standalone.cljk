@@ -269,7 +269,14 @@
          (assoc :validators {:genesis (duties/genesis-validators witnesses pub-of addr/derive)
                              :epoch-length (js/parseInt (env "EPOCH_LENGTH" "1000") 10)
                              :min-stake (js/parseInt (env "MIN_STAKE" "1") 10)}
-                :protocol {})
+                ;; Governance parameters are genesis, so every replica of a
+                ;; chain must set them alike. `PROTOCOL_NOTICE` shortens the
+                ;; blocks between a passed upgrade and its height — for a
+                ;; devnet that wants to exercise an upgrade in minutes; a
+                ;; real chain leaves the default.
+                :protocol (cond-> {}
+                            (env "PROTOCOL_NOTICE" nil)
+                            (assoc :notice (js/parseInt (env "PROTOCOL_NOTICE" "") 10))))
          (and (env "CHAIN_VALIDATORS" nil) (env "BRIDGE_CONTRACT" nil))
          (assoc :bridge {:contract (str/lower (env "BRIDGE_CONTRACT" ""))
                          :evm-chain-id (js/parseInt (env "BRIDGE_EVM_CHAIN_ID" "0") 10)

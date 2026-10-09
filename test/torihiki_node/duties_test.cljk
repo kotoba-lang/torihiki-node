@@ -20,7 +20,8 @@
 
 (deftest the-binary-stops-on-a-version-it-does-not-know
   (is (nil? (d/halt-reason (chain))))
-  (is (string? (d/halt-reason (assoc-in (chain) [:protocol :version] 2)))))
+  (is (nil? (d/halt-reason (assoc-in (chain) [:protocol :version] 2))) "2 is known: order margin")
+  (is (string? (d/halt-reason (assoc-in (chain) [:protocol :version] (inc d/max-protocol))))))
 
 (deftest genesis-from-the-consensus-witnesses
   (is (= [{:witness "w1" :pubkey "P-w1" :account 11}]
@@ -85,7 +86,7 @@
 ;; ── review fixes ───────────────────────────────────────────────────────────
 
 (deftest halt-before-the-activation-block
-  (let [ex (-> (chain) (assoc-in [:protocol :scheduled] {:version 2 :at 50 :proposal 1}))]
+  (let [ex (-> (chain) (assoc-in [:protocol :scheduled] {:version (inc d/max-protocol) :at 50 :proposal 1}))]
     (is (nil? (d/halt-reason (assoc ex :height 48))))
     (is (string? (d/halt-reason (assoc ex :height 49))) "block 50 would run rules this binary lacks")))
 
