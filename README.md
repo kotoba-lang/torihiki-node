@@ -1,9 +1,32 @@
 # torihiki-node
 
-The transport for [`torihiki`](https://github.com/kotoba-lang/torihiki): a
-Cloudflare Worker in front of a Durable Object sequencer.
+The node for [`torihiki`](https://github.com/kotoba-lang/torihiki).
 
-**Live:** `https://torihiki-node.04-feasts-minded.workers.dev`
+## Which implementation is the node
+
+**`src/torihiki_node/standalone.cljk` is the reference implementation.** It is
+an ordinary process (`kbb --backend sci -m torihiki-node.standalone`, systemd or
+launchd — see `deploy/`), it talks plain WebSocket and HTTP, and it depends on
+no vendor's primitive. Everything the decentralization roadmap needs lives
+there and nowhere else: BFT consensus on its own hosts, the validator set as
+chain state and epoch handoffs, equivocation evidence, the bridge
+watcher/signer, the validator oracle, governed upgrades, HTTP observers and
+signed root attestations for light clients. A node can run on any host, VM or
+laptop, and an observer can follow from anywhere it can make an HTTP request.
+
+**The Cloudflare implementation (`worker.cljk`, the single Durable Object
+sequencer, and `validator.cljk`, the Durable Object validator set) is frozen
+and deprecated.** It has none of the duties above, does not follow epochs,
+cannot be one of several independent operators (all its keys sit in one
+account), and its premise — one vendor's object guaranteeing a single writer —
+is the dependency the roadmap removes. It stays in the tree for its history
+and its measurements; do not build on it or deploy it anew. The sections below
+that describe it are kept as a record.
+
+The deployed `torihiki-node` / `torihiki-validator-v3` Workers are a stalled
+devnet (`v3` at height 5805) and are not where this chain is going.
+
+**Historical (Cloudflare):** `https://torihiki-node.04-feasts-minded.workers.dev`
 
 ```
 GET  /head                    height, state root, running code version
@@ -13,7 +36,7 @@ GET  /account?id=<n>          positions, equity, margin, free collateral
 POST /tx                      a signed transaction envelope
 ```
 
-## Why a Durable Object
+## Why a Durable Object (historical — see "Which implementation is the node")
 
 `torihiki.log` needs exactly one writer. Cloudflare guarantees one instance
 per id, single-threaded — so "there is exactly one writer" comes from the
