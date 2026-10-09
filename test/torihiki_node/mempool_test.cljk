@@ -1,70 +1,109 @@
 (ns torihiki-node.mempool-test
-  "Transactions a node accepted survive a proposal that loses its height."
+  "Transactions a node accepted survive a proposal that loses its height, and
+  `/tx-status` says what became of them."
   (:require [cljs.test :refer [deftest is testing]]
             [torihiki-node.mempool :as m]))
 
 (def ok (constantly true))
 (defn- t [account nonce] {:tx {:tx :deposit :amount 1} :account account :nonce nonce :pubkey "k" :sig "s"})
+(defn- admit [tr sig nonce & [expected auth body]]
+  (m/admit tr sig (or body (str "body-" sig)) (t 1 nonce) 0 (or expected 5) (or auth ok)))
 
 (deftest only-what-could-still-apply-is-kept
-  (is (= #{"a"} (set (keys (m/admit {} "a" (t 1 5) 0 5 ok)))) "the next nonce")
-  (is (= #{"a"} (set (keys (m/admit {} "a" (t 1 7) 0 5 ok)))) "a little ahead: waits for the ones before it")
-  (is (empty? (m/admit {} "a" (t 1 4) 0 5 ok)) "already spent")
-  (is (empty? (m/admit {} "a" (t 1 (+ 5 64)) 0 5 ok)) "absurdly far ahead")
-  (is (empty? (m/admit {} "a" (t 1 5) 0 5 (constantly false))) "a bad signature")
-  (is (empty? (m/admit {} "a" (t nil 5) 0 nil ok)) "no account")
-  (is (empty? (m/admit {} "a" (assoc (t 1 5) :nonce "5") 0 5 ok)) "a nonce that is not a number"))
+  (is (= #{"a"} (set (keys (admit {} "a" 5)))) "the next nonce")
+  (is (= #{"a"} (set (keys (admit {} "a" 7)))) "a little ahead: waits for the ones before it")
+  (is (empty? (admit {} "a" 4)) "already spent")
+  (is (empty? (admit {} "a" (+ 5 64))) "absurdly far ahead")
+  (is (empty? (admit {} "a" 5 5 (constantly false))) "the engine's authentication refuses it")
+  (is (empty? (admit {} nil 5)) "a signature not in its canonical spelling")
+  (is (empty? (m/admit {} "a" "b" (t nil 5) 0 nil ok)) "no account")
+  (is (empty? (m/admit {} "a" "b" (assoc (t 1 5) :nonce "5") 0 5 ok)) "a nonce that is not a number"))
 
-(deftest the-verifier-runs-last
+(deftest a-body-that-cannot-be-in-a-block-is-not-kept
+  ;; Review of #45: inga refuses a block with a proposal over 512 characters,
+  ;; and an unsigned pad field keeps the signature valid. Resubmitted for two
+  ;; minutes, one such body spoiled every block this node led.
+  (is (empty? (admit {} "a" 5 5 ok (apply str (repeat 513 "x")))))
+  (is (seq (admit {} "a" 5 5 ok (apply str (repeat 512 "x"))))))
+
+(deftest one-transaction-one-entry
+  (let [tr (admit {} "a" 5)]
+    (is (= tr (admit tr "a" 5 5 ok "another spelling of the body")) "the signature is the key")))
+
+(deftest the-authentication-runs-last
   (let [calls (atom 0)
         v #(do (swap! calls inc) true)]
-    (m/admit {} "a" (t 1 4) 0 5 v)
-    (m/admit {"a" {}} "a" (t 1 5) 0 5 v)
-    (is (zero? @calls) "nothing cheap ruled out was verified")))
+    (admit {} "a" 4 5 v)
+    (admit {"a" {}} "a" 5 5 v)
+    (admit {} "a" 5 5 v (apply str (repeat 600 "x")))
+    (is (zero? @calls) "nothing cheap ruled out was authenticated")))
 
 (deftest the-table-is-bounded
-  (let [full (into {} (for [i (range 3)] [(str i) {:account 9 :nonce i :at 0 :sent-at 0}]))]
-    (is (= full (m/admit full "x" (t 1 5) 0 5 ok (assoc m/defaults :cap 3))) "in all")
-    (is (= full (m/admit full "x" (t 9 3) 0 0 ok (assoc m/defaults :per-account 3))) "per account")))
+  (let [full (into {} (for [i (range 3)] [(str i) {:body (str i) :account 9 :nonce i :at 0 :sent-at 0}]))]
+    (is (= full (m/admit full "x" "x" (t 1 5) 0 5 ok (assoc m/defaults :cap 3))) "in all")
+    (is (= full (m/admit full "x" "x" (t 9 3) 0 0 ok (assoc m/defaults :per-account 3))) "per account")))
 
 (deftest consumed-and-stale-are-forgotten
-  (let [tr {"a" {:account 1 :nonce 5 :at 0 :sent-at 0}
-            "b" {:account 1 :nonce 6 :at 0 :sent-at 0}
-            "c" {:account 2 :nonce 1 :at 0 :sent-at 0}}
+  (let [tr {"a" {:body "A" :account 1 :nonce 5 :at 0 :sent-at 0}
+            "b" {:body "B" :account 1 :nonce 6 :at 0 :sent-at 0}
+            "c" {:body "C" :account 2 :nonce 1 :at 0 :sent-at 0}}
         expected {1 6 2 1}]
     (is (= #{"b" "c"} (set (keys (m/sweep tr 1000 expected)))) "nonce 5 was spent")
     (is (empty? (m/sweep tr 120001 expected)) "given up after the ttl")))
 
 (deftest due-resends-in-nonce-order-and-not-too-often
-  (let [tr {"n6" {:account 1 :nonce 6 :at 0 :sent-at 0}
-            "n5" {:account 1 :nonce 5 :at 0 :sent-at 0}
-            "q"  {:account 2 :nonce 1 :at 0 :sent-at 0}
-            "fresh" {:account 3 :nonce 1 :at 0 :sent-at 2500}}
-        [bodies tr'] (m/due tr 3000 ["q"])]
-    (is (= ["n5" "n6"] bodies) "lowest nonce first; not what is still pending; not what was just sent")
-    (is (= 3000 (get-in tr' ["n5" :sent-at])))
-    (is (= 2500 (get-in tr' ["fresh" :sent-at])))
-    (is (= [] (first (m/due tr' 3500 ["q"]))) "nothing again within the gap")
-    (is (= ["fresh"] (first (m/due tr' 5500 ["q"]))))))
+  (let [tr {"n6" {:body "N6" :account 1 :nonce 6 :at 0 :sent-at 0}
+            "n5" {:body "N5" :account 1 :nonce 5 :at 0 :sent-at 0}
+            "q"  {:body "Q" :account 2 :nonce 1 :at 0 :sent-at 0}
+            "fresh" {:body "F" :account 3 :nonce 1 :at 0 :sent-at 4000}}
+        [bodies tr'] (m/due tr 5000 ["Q"])]
+    (is (= ["N5" "N6"] bodies) "lowest nonce first; not what is still pending; not what was just sent")
+    (is (= 5000 (get-in tr' ["n5" :sent-at])))
+    (is (= 4000 (get-in tr' ["fresh" :sent-at])))
+    (is (= [] (first (m/due tr' 6000 ["Q"]))) "nothing again within the gap")
+    (is (= ["F"] (first (m/due tr' 9000 ["Q"]))))))
 
-(deftest outcomes-are-per-signature
+(deftest outcomes-are-per-signature-in-block-order
   (let [txs [{:sig "a"} {:sig "b"} {:sig "c"} {}]
         o (m/outcomes txs [{:index 1 :reason :bad-nonce} {:index 2 :reason :insufficient-margin}] 7)]
-    (is (= {:status :applied :reason nil :height 7 :final true} (o "a")))
-    (is (= {:status :rejected :reason :bad-nonce :height 7 :final false} (o "b")) "may still land")
-    (is (= {:status :rejected :reason :insufficient-margin :height 7 :final true} (o "c")) "nonce consumed")
-    (is (= 3 (count o)) "an unsigned entry has nothing to be looked up by")))
+    (is (= [["a" {:status :applied :reason nil :height 7 :final true}]
+            ["b" {:status :rejected :reason :bad-nonce :height 7 :final false}]
+            ["c" {:status :rejected :reason :insufficient-margin :height 7 :final true}]]
+           o)
+        "an unsigned entry has nothing to be looked up by")))
 
 (deftest a-final-outcome-is-never-replaced
-  (let [log (m/record-outcomes nil {"a" {:status :applied :final true :height 5}} 10)
-        log (m/record-outcomes log {"a" {:status :rejected :reason :bad-nonce :final false :height 9}} 10)]
-    (is (= :applied (get-in log [:by-sig "a" :status])) "the resubmitted copy's bad-nonce does not win"))
-  (let [log (m/record-outcomes nil {"b" {:status :rejected :reason :bad-nonce :final false :height 5}} 10)
-        log (m/record-outcomes log {"b" {:status :applied :final true :height 9}} 10)]
-    (is (= :applied (get-in log [:by-sig "b" :status])) "a non-final one is")
-    (is (= ["b"] (:order log)))))
+  (testing "by a later block"
+    (let [log (m/record-outcomes nil [["a" {:status :applied :final true :height 5}]])
+          log (m/record-outcomes log [["a" {:status :rejected :reason :bad-nonce :final false :height 9}]])]
+      (is (= :applied (:status (m/status log {} "a"))))))
+  (testing "by a second copy in the same block (review of #45)"
+    (let [log (m/record-outcomes nil (m/outcomes [{:sig "a"} {:sig "a"}] [{:index 1 :reason :bad-nonce}] 5))]
+      (is (= :applied (:status (m/status log {} "a"))))))
+  (testing "a non-final one is"
+    (let [log (m/record-outcomes nil [["b" {:status :rejected :reason :bad-nonce :final false :height 5}]])
+          log (m/record-outcomes log [["b" {:status :applied :final true :height 9}]])]
+      (is (= :applied (:status (m/status log {} "b"))))
+      (is (empty? (get-in log [:hints :by-sig]))))))
+
+(deftest status-prefers-what-is-known
+  (let [log (m/record-outcomes nil [["h" {:status :rejected :reason :wrong-key :final false :height 3}]])]
+    (is (= {:status :pending :final false :hint :wrong-key} (m/status log {"h" {}} "h"))
+        "still held: a forged envelope's rejection does not make it look refused")
+    (is (= :wrong-key (:reason (m/status log {} "h"))) "no longer held: the rejection is the answer, non-final")
+    (is (= {:status :unknown :final false} (m/status log {} "z")))))
+
+(deftest junk-cannot-crowd-out-final-outcomes
+  ;; Non-final rejections are free to produce; they go to their own table.
+  (let [opts (assoc m/defaults :outcome-cap 3 :hint-cap 2)
+        log (m/record-outcomes nil [["real" {:status :applied :final true}]] opts)
+        log (reduce #(m/record-outcomes %1 [[(str "junk" %2) {:status :rejected :final false}]] opts)
+                    log (range 100))]
+    (is (= :applied (:status (m/status log {} "real"))))
+    (is (= 2 (count (get-in log [:hints :order]))))))
 
 (deftest the-outcome-log-is-bounded
-  (let [log (reduce #(m/record-outcomes %1 {(str %2) {:final true}} 3) nil (range 5))]
-    (is (= ["2" "3" "4"] (:order log)))
-    (is (= #{"2" "3" "4"} (set (keys (:by-sig log)))))))
+  (let [opts (assoc m/defaults :outcome-cap 3)
+        log (reduce #(m/record-outcomes %1 [[(str %2) {:final true}]] opts) nil (range 5))]
+    (is (= ["2" "3" "4"] (get-in log [:final :order])))
+    (is (= #{"2" "3" "4"} (set (keys (get-in log [:final :by-sig])))))))

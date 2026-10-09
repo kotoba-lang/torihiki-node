@@ -389,14 +389,24 @@
   ;; transaction, by signature, for `GET /tx-status`. A view, like the tapes.
   (atom nil))
 
+(defn- canonical-sig
+  "`sig` as the one base64 spelling of its 64 bytes, or nil. Node's decoder
+  takes padding, whitespace, URL-safe letters and junk, so one signature has
+  many spellings; keyed by the given string, a copy re-posted under another
+  spelling would be filed under a name its signer never used."
+  [sig]
+  (when (string? sig)
+    (let [b (js/Buffer.from sig "base64")]
+      (when (= 64 (.-length b)) (.toString b "base64")))))
+
 (defn- record-outcomes!
-  "Keep what each transaction in the block came to. Keyed by signature, which
-  only the signer could produce, so nobody can post a status for somebody
-  else's transaction."
+  "Keep what each transaction in the block came to, by canonical signature
+  (`torihiki-node.mempool/record-outcomes`)."
   [ex txs]
   (try
     (swap! tx-outcomes mempool/record-outcomes
-           (mempool/outcomes txs (:rejected ex) (:height ex 0)) 50000)
+           (mempool/outcomes (mapv #(assoc % :sig (canonical-sig (:sig %))) txs)
+                             (:rejected ex) (:height ex 0)))
     (catch :default _ nil))
   ex)
 
@@ -715,15 +725,23 @@
 
 (defn- track-tx!
   "Remember a client transaction until its nonce is spent. Anything that does
-  not decode or could never apply is simply not remembered."
+  not decode, is not signed in the canonical spelling, or could never apply
+  is simply not remembered.
+
+  \"Could apply\" is the engine's own authentication, run as if the
+  transaction's nonce were next (`auth/check` on a state whose nonce for the
+  account is one short of it): the key must own the account or be its agent,
+  and the signature must verify. A signature check alone let one key fill
+  the table with transactions for accounts it does not hold."
   [body ex]
-  (try
-    (let [{:keys [tx account nonce pubkey sig] :as t} (decode-tx body)]
-      (swap! tracked-txs mempool/admit body t (js/Date.now)
-             (when (integer? account) (auth/expected-nonce ex account))
-             #(and (string? pubkey) (string? sig) (map? tx)
-                   (tx-verify pubkey (auth/signing-payload chain-id account nonce tx) sig))))
-    (catch :default _ nil)))
+  (when-not observer?
+    (try
+      (let [{:keys [account nonce sig] :as t} (decode-tx body)]
+        (swap! tracked-txs mempool/admit (when (= sig (canonical-sig sig)) sig) body t (js/Date.now)
+               (when (integer? account) (auth/expected-nonce ex account))
+               #(nil? (auth/check (assoc-in ex [:nonces account] (dec nonce)) t
+                                  chain-id tx-verify addr/derive))))
+      (catch :default _ nil))))
 
 (defn- resubmit-lost-txs!
   "Hand the replica again what it accepted and the chain has not consumed."
@@ -734,7 +752,10 @@
         swept (mempool/sweep @tracked-txs now #(auth/expected-nonce ex %))
         [bodies tracked] (mempool/due swept now (:pending s))]
     (reset! tracked-txs tracked)
-    (doseq [b bodies] (swap! state r/submit b))))
+    ;; A halted node still forgets what was consumed or expired, so its
+    ;; `/tx-status` does not say "pending" forever; it hands nothing on.
+    (when-not @halted
+      (doseq [b bodies] (swap! state r/submit b)))))
 
 (defn- handle-http* [^js req ^js res]
   (if (= "OPTIONS" (.-method req))
@@ -920,24 +941,21 @@
       "/tx"
       (-> (read-body req)
           (.then (fn [body]
-                   (swap! state r/submit body)
-                   (track-tx! body ex)
-                   (json-response res 200 {:ok true}))))
+                   (if (> (count body) mempool/max-body)
+                     ;; inga refuses a block holding a proposal this long, so
+                     ;; accepting it would only spoil this node's next block.
+                     (json-response res 413 {:ok false :reason "too-large" :max mempool/max-body})
+                     (do (swap! state r/submit body)
+                         (track-tx! body ex)
+                         (json-response res 200 {:ok true}))))))
 
-      ;; What became of one transaction, by its signature: "applied" or
-      ;; "rejected" with the engine's reason and the height, "pending" while
-      ;; this node still holds it, else "unknown". A rejection that consumed no
-      ;; nonce (`:final false`) can still be followed by the transaction
-      ;; landing.
+      ;; What became of one transaction, by its signature (any spelling):
+      ;; "applied" or "rejected" with the engine's reason and height when
+      ;; final; "pending" while this node holds it (`:hint` the last
+      ;; rejection that spent no nonce); a non-final "rejected"; or "unknown".
       "/tx-status"
-      (let [sig (q "sig")
-            o (get-in @tx-outcomes [:by-sig sig])]
-        (json-response res 200
-                       (cond o (assoc o :sig sig)
-                             (some #(= sig (:sig (try (decode-tx %) (catch :default _ nil))))
-                                   (keys @tracked-txs))
-                             {:sig sig :status :pending}
-                             :else {:sig sig :status :unknown})))
+      (let [sig (canonical-sig (q "sig"))]
+        (json-response res 200 (assoc (mempool/status @tx-outcomes @tracked-txs sig) :sig sig)))
 
       "/book"
       (json-response res 200 (api/book-snapshot ex (js/parseInt (or (q "m") "1") 10)))
@@ -1928,7 +1946,7 @@
     ;; it rather than proposing its own, which is what stops four replicas from
     ;; each starting a different chain.
     (bootstrap-segment!)
-    (js/setInterval #(when-not @halted (resubmit-lost-txs!)) 1000)
+    (js/setInterval resubmit-lost-txs! 1000)
     (js/setInterval
      (fn []
        (when-let [nd @out-node] ((:tick! nd)))
