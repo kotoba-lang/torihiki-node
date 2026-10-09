@@ -1,0 +1,166 @@
+(ns torihiki-node.mempool
+  "Transactions this node accepted, kept until the chain consumes their nonce,
+  and what became of each.
+
+  inga empties a replica's pending list into the block it proposes. When that
+  block is not the one certified at its height — another leader's block wins,
+  the view times out, the proposal is `:locked-elsewhere` — the transactions
+  in it are gone: nobody else ever had them. Measured on a healthy four-node
+  standalone cluster: 3 of 12 deposits submitted at once never landed, and the
+  terminal said \"queued — a block will carry it\" forever.
+
+  So the node that accepted a transaction remembers it and hands it to its
+  replica again until the transaction's nonce is spent. Resubmitting is safe
+  because the engine's nonces are strictly sequential: a copy that lands
+  after the original is `:bad-nonce` and changes nothing.
+
+  What is remembered is only what could still apply: the node runs the
+  engine's own authentication on it (`admit`'s `authentic?`), the body fits
+  in a block (inga refuses a block with any proposal over `max-body`, so a
+  padded body resubmitted for two minutes would spoil every block this node
+  leads), and the table is bounded overall and per account.
+
+  Keys are the CANONICAL signature: base64 decoders accept many spellings of
+  one signature, and a key that differed by spelling would let a copy of
+  somebody's transaction be filed — or tracked — under another name.
+
+  Pure: the node passes in the clock, the checks and the engine's nonces.")
+
+(def max-body
+  "inga's `:max-string`: the longest proposal a block may carry."
+  512)
+
+(def defaults
+  {:cap 4096             ; transactions remembered in all
+   :per-account 64       ; per account, which is also how far ahead a nonce may be
+   :ttl-ms 120000        ; given up after this long
+   :gap-ms 5000          ; resubmitted at most this often — longer than a block
+                         ; takes to commit, so a copy already in flight is rarely
+                         ; sent again
+   :outcome-cap 50000    ; final outcomes kept
+   :hint-cap 4096})      ; non-final rejections kept
+
+(defn admit
+  "`tracked` (`{sig {:body :account :nonce :at :sent-at}}`) with this
+  transaction remembered, or unchanged when it could never apply, does not
+  fit in a block, or there is no room.
+
+  `sig` is the canonical signature, nil when the given one is not canonical.
+  `expected` is the account's next nonce on this node's engine;
+  `authentic?` is the engine's authentication of the transaction AS IF its
+  nonce were next — called last, because it is the expensive check."
+  ([tracked sig body t now expected authentic?] (admit tracked sig body t now expected authentic? defaults))
+  ([tracked sig body {:keys [account nonce]} now expected authentic? {:keys [cap per-account]}]
+   (if (or (not (string? sig)) (contains? tracked sig)
+           (not (string? body)) (> (count body) max-body)
+           (not (integer? account)) (not (integer? nonce)) (not (integer? expected))
+           (< nonce expected) (>= nonce (+ expected per-account))
+           (>= (count tracked) cap)
+           (>= (count (filter #(= account (:account %)) (vals tracked))) per-account)
+           ;; Ahead of the next nonce only as part of an unbroken run: keys
+           ;; are free and every key owns its account, so nonces 2..65 with
+           ;; no nonce 1 — never applicable — would otherwise fill the table.
+           (and (> nonce expected)
+                (not (some #(and (= account (:account %)) (= (dec nonce) (:nonce %))) (vals tracked))))
+           (not (true? (authentic?))))
+     tracked
+     (assoc tracked sig {:body body :account account :nonce nonce :at now :sent-at now}))))
+
+(defn sweep
+  "Forget what the chain has consumed (the account's next nonce is past it:
+  applied, or overtaken by another transaction with that nonce) and what has
+  waited longer than `ttl-ms`."
+  ([tracked now expected-of] (sweep tracked now expected-of defaults))
+  ([tracked now expected-of {:keys [ttl-ms]}]
+   (into {} (remove (fn [[_ {:keys [account nonce at]}]]
+                      (or (> (expected-of account) nonce)
+                          (> (- now at) ttl-ms))))
+         tracked)))
+
+(defn due
+  "`[bodies tracked']`: what to hand the replica again now — not resent within
+  `gap-ms` and not already in its pending list — with `:sent-at` moved on.
+  Lowest nonce first per account, so a run of transactions arrives in an
+  order the engine can apply."
+  ([tracked now pending] (due tracked now pending defaults))
+  ([tracked now pending {:keys [gap-ms]}]
+   (let [in-pending (set pending)
+         picked (->> tracked
+                     (filter (fn [[_ {:keys [body sent-at]}]]
+                               (and (>= (- now sent-at) gap-ms) (not (contains? in-pending body)))))
+                     (sort-by (fn [[_ {:keys [account nonce]}]] [account nonce])))]
+     [(mapv (comp :body val) picked)
+      (reduce #(assoc-in %1 [(key %2) :sent-at] now) tracked picked)])))
+
+(def auth-reasons
+  "Rejections `torihiki.auth/check` gives. They consume no nonce, so the same
+  transaction may still land later (a copy arriving before the transaction
+  ahead of it, say); every other outcome is final."
+  #{:missing-account :unsigned :wrong-key :agent-may-not :not-your-account
+    :bad-nonce :bad-signature})
+
+(defn outcomes
+  "`[sig {:status :applied|:rejected :reason r :height h :final bool}]` for each
+  transaction in a block, in block order. `txs` are its decoded envelopes
+  with `:sig` already canonical (nil when not), `rejected` the engine's
+  `[{:index :reason}]` for it."
+  [txs rejected height]
+  (let [why (into {} (map (juxt :index :reason)) rejected)]
+    (vec (for [[i {:keys [sig]}] (map-indexed vector txs)
+               :when (string? sig)
+               :let [r (get why i)]]
+           [sig {:status (if r :rejected :applied) :reason r :height height
+                 :final (not (contains? auth-reasons r))}]))))
+
+(defn- bounded-put [{:keys [by-sig order] :as m} sig o cap]
+  (let [m (if (contains? by-sig sig)
+            (assoc-in m [:by-sig sig] o)
+            {:by-sig (assoc by-sig sig o) :order (conj order sig)})
+        extra (- (count (:order m)) cap)]
+    (if (pos? extra)
+      ;; A fresh vector, not `subvec`: a subvec keeps the whole vector under
+      ;; it alive and appends into it, so every signature ever recorded
+      ;; stayed in memory (review of #45).
+      {:by-sig (apply dissoc (:by-sig m) (take extra (:order m)))
+       :order (vec (drop extra (:order m)))}
+      m)))
+
+(defn- bounded-remove [{:keys [by-sig order] :as m} sig]
+  (if (contains? by-sig sig)
+    {:by-sig (dissoc by-sig sig) :order (filterv #(not= sig %) order)}
+    m))
+
+(def empty-log {:final {:by-sig {} :order []} :hints {:by-sig {} :order []}})
+
+(defn record-outcomes
+  "`log` with a block's `outcomes` merged, in block order.
+
+  A FINAL outcome — applied, or refused after the nonce was spent — is never
+  replaced: the first copy of a transaction applies and every later copy,
+  in the same block or a later one, is `:bad-nonce`. Final outcomes cost a
+  real account a nonce each, so junk cannot crowd them out; non-final
+  rejections (anybody can produce those, by wrapping a copied signature in an
+  envelope that fails authentication) go to a separate, smaller table of
+  hints and never displace a final outcome."
+  ([log outs] (record-outcomes log outs defaults))
+  ([log outs {:keys [outcome-cap hint-cap]}]
+   (reduce (fn [l [sig o]]
+             (cond (get-in l [:final :by-sig sig]) l
+                   (:final o) (-> l (update :final bounded-put sig o outcome-cap)
+                                  (update :hints bounded-remove sig))
+                   :else (update l :hints bounded-put sig o hint-cap)))
+           (or log empty-log) outs)))
+
+(defn status
+  "What `/tx-status` says for canonical signature `sig`: a final outcome; else
+  pending while this node still holds the transaction (with the last
+  non-final rejection, if any, as `:hint`); else that rejection, non-final;
+  else unknown."
+  [log tracked sig]
+  (let [fin (get-in log [:final :by-sig sig])
+        hint (get-in log [:hints :by-sig sig])]
+    (cond fin fin
+          (contains? tracked sig) (cond-> {:status :pending :final false}
+                                    hint (assoc :hint (:reason hint)))
+          hint hint
+          :else {:status :unknown :final false})))
