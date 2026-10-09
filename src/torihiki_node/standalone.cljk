@@ -276,12 +276,24 @@
       (as-> ex (reduce (fn [e m] (st/apply-tx e {:tx :oracle :market (:id m) :price 1000}))
                        ex markets))))
 
-(defn- tx-verify [pubkey payload sig]
+(def ^:private spki-ed25519-prefix
+  "The 12 bytes that make a raw 32-byte Ed25519 public key an SPKI one."
+  (js/Buffer.from "302a300506032b6570032100" "hex"))
+
+(defn- tx-verify
+  "Does `sig` verify under `pubkey` (base64) over `payload`?
+
+  The key may be SPKI DER (what node:crypto exports, and what validators use
+  here) or the raw 32 bytes WebCrypto exports with `\"raw\"` — which is what
+  every browser session key is. Accepting only SPKI refused every
+  transaction a browser signed."
+  [pubkey payload sig]
   (try
-    (nc/verify nil (js/Buffer.from payload "utf8")
-               (nc/createPublicKey #js {:key (js/Buffer.from pubkey "base64")
-                                        :format "der" :type "spki"})
-               (js/Buffer.from sig "base64"))
+    (let [k (js/Buffer.from pubkey "base64")
+          der (if (= 32 (.-length k)) (js/Buffer.concat #js [spki-ed25519-prefix k]) k)]
+      (nc/verify nil (js/Buffer.from payload "utf8")
+                 (nc/createPublicKey #js {:key der :format "der" :type "spki"})
+                 (js/Buffer.from sig "base64")))
     (catch :default _ false)))
 
 (defn- decode-tx [s]
