@@ -1,5 +1,6 @@
-;; A protocol upgrade, end to end: the operators vote version 2 in, and from
-;; its height an order the account cannot back is refused.
+;; A protocol upgrade, end to end: the operators vote a version in
+;; (TARGET_VERSION, default 2), and from its height an order the account
+;; cannot back is refused — which holds from version 2 on.
 ;;
 ;;   NODES=http://127.0.0.1:8801,... CHAIN_ID=... \
 ;;   SEEDS=w1=<hex>,w2=<hex>,w3=<hex>  (operators' signing seeds; 3 of 4 is >2/3) \
@@ -22,7 +23,9 @@
 (def notice (js/parseInt (env "NOTICE") 10))
 ;; The version to vote in (default 2). Order margin holds from 2 on, so the
 ;; checks below hold for any later version too.
-(def target (js/parseInt (or (aget js/process.env "VERSION") "2") 10))
+(def target (let [v (js/parseInt (or (aget js/process.env "TARGET_VERSION") "2") 10)]
+              (when-not (>= v 2) (println "FAIL: TARGET_VERSION must be 2 or more") (js/process.exit 1))
+              v))
 
 (def ^:private pkcs8 (js/Buffer.from "302e020100300506032b657004220420" "hex"))
 (defn- key-of [seed-hex]
