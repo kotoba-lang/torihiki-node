@@ -136,6 +136,7 @@ decides what the set agrees on. `GET /duties` reports all of them.
 | env | duty |
 |---|---|
 | `CHAIN_VALIDATORS=1` (+ `EPOCH_LENGTH`, `MIN_STAKE`) | genesis with the validator set, oracle and upgrades as chain state (a new chain — give it its own `CHAIN_ID`) |
+| `PROTOCOL_NOTICE` (with `CHAIN_VALIDATORS`) | blocks between an upgrade passing and its height (default 10000). Genesis: under the state root, the same on every node, never changed for an existing chain — set `GENESIS_ROOT` to catch a mismatch. For a devnet that exercises an upgrade (`script/upgrade_e2e.cljk`) |
 | always, with a set | proofs of equivocation inga holds are submitted as `:equivocation-evidence` |
 | always | a chain that voted past `duties/max-protocol` HALTS this binary (`/duties :halted`) |
 | `BRIDGE_CONTRACT`, `BRIDGE_EVM_CHAIN_ID`, `BRIDGE_ASSET` | bridge mode at genesis |

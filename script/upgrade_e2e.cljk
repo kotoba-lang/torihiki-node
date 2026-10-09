@@ -7,7 +7,8 @@
 ;;     kbb --backend sci -cp "src:$CP" script/upgrade_e2e.cljk
 ;;
 ;; The chain must have been started with CHAIN_VALIDATORS=1 (governance is
-;; chain state only with a validator set) and PROTOCOL_NOTICE=NOTICE.
+;; chain state only with a validator set) and PROTOCOL_NOTICE=NOTICE. SLACK
+;; (default 600) is how many blocks past the notice the activation is set.
 (ns upgrade-e2e
   (:require ["node:crypto" :as nc]
             [kotoba.lang.text :as str]
@@ -65,12 +66,20 @@
         _ (println "version 1: 50,000,000-lot bid with $100k ->" (:status big) (:reason big))
         _ (when-not (= "applied" (:status big)) (fail! "version 1 should be unchanged"))
         head (J (str (first nodes) "/head"))
-        activation (+ (:engine-height head (:height head)) notice 30)
+        ;; Slack past the notice: the proposal's vote window closes at
+        ;; `activation - notice`, and a vote that lands after it is a silent
+        ;; no-op. A few hundred blocks covers the round trips at any speed.
+        activation (+ (:engine-height head (:height head)) notice (js/parseInt (or (aget js/process.env "SLACK") "600") 10))
         [w1 & voters] (vals operators)
         p1 (p/-> (send! w1 {:tx :upgrade-propose :version 2 :activation activation}) outcome)
-        _ (println "propose v2 at" activation "->" (:status p1) (:reason p1))
-        votes (p/all (for [k voters] (p/-> (send! k {:tx :upgrade-vote :proposal 1}) outcome)))
+        d1 (J (str (first nodes) "/duties"))
+        proposal (:protocol-last-proposal d1)
+        _ (println "propose v2 at" activation "->" (:status p1) (:reason p1) "— proposal" proposal)
+        votes (p/all (for [k voters] (p/-> (send! k {:tx :upgrade-vote :proposal proposal}) outcome)))
         _ (println "votes ->" (mapv (juxt :status :reason) votes))
+        d2 (J (str (first nodes) "/duties"))
+        _ (when-not (= 2 (:version (:protocol-scheduled d2)))
+            (fail! (str "the votes did not schedule version 2: " (pr-str (:protocol-scheduled d2)))))
         _ (p/loop [i 0]
             (p/let [v (version)]
               (cond (= 2 v) (println "version 2 active")
@@ -80,8 +89,12 @@
         _ (p/-> (send! after {:tx :deposit :amount 10000000}) outcome)
         refused (p/-> (send! after (order 0 900 50000000)) outcome)
         _ (println "version 2: the same bid ->" (:status refused) (:reason refused))
-        fits (p/-> (send! after (order 0 900 400000)) outcome)
-        _ (println "version 2: 400,000 lots at 900 (margined at the mark: 400M x 2.5% = 10M of 10M) ->" (:status fits) (:reason fits))
+        m (J (str (first nodes) "/market"))
+        ;; Half of what 10M backs at the mark and the market's initial-margin
+        ;; rate (scaled by 1e9), so a moving mark does not decide the result.
+        lots (quot (quot (* 10000000 1000000000) (* (:mark m) (:initial-margin-rate m))) 2)
+        fits (p/-> (send! after (order 0 (dec (:mark m)) lots)) outcome)
+        _ (println "version 2:" lots "lots just under the mark (half of what 10M backs) ->" (:status fits) (:reason fits))
         acct (J (str (first nodes) "/account?id=" (addr/derive (:pub after))))
         _ (println "free collateral with that bid resting:" (:free-collateral acct) "order margin:" (:order-margin acct))]
   (cond
