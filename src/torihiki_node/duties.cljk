@@ -25,8 +25,11 @@
 
 (def ^:const max-protocol
   "The highest protocol version this binary implements. A chain that has voted
-  past it is running rules this code does not have."
-  1)
+  past it is running rules this code does not have.
+
+  2: an order must be one the account can back (`torihiki.order-margin`,
+  kotoba-lang/torihiki#41)."
+  2)
 
 (defn halt-reason
   "Why this binary must stop following `ex`, or nil.

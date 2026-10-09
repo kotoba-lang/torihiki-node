@@ -269,7 +269,14 @@
          (assoc :validators {:genesis (duties/genesis-validators witnesses pub-of addr/derive)
                              :epoch-length (js/parseInt (env "EPOCH_LENGTH" "1000") 10)
                              :min-stake (js/parseInt (env "MIN_STAKE" "1") 10)}
-                :protocol {})
+                ;; Governance parameters are genesis, so every replica of a
+                ;; chain must set them alike. `PROTOCOL_NOTICE` shortens the
+                ;; blocks between a passed upgrade and its height — for a
+                ;; devnet that wants to exercise an upgrade in minutes; a
+                ;; real chain leaves the default.
+                :protocol (cond-> {}
+                            (env "PROTOCOL_NOTICE" nil)
+                            (assoc :notice (js/parseInt (env "PROTOCOL_NOTICE" "") 10))))
          (and (env "CHAIN_VALIDATORS" nil) (env "BRIDGE_CONTRACT" nil))
          (assoc :bridge {:contract (str/lower (env "BRIDGE_CONTRACT" ""))
                          :evm-chain-id (js/parseInt (env "BRIDGE_EVM_CHAIN_ID" "0") 10)
@@ -1501,6 +1508,10 @@
 (defn- duty-status []
   (let [ex (:machine-state @state)]
     {:protocol-version (gov/active-version ex)
+     ;; What is scheduled and the last proposal id, so an operator (or
+     ;; `script/upgrade_e2e.cljk`) can see a vote land instead of inferring it.
+     :protocol-scheduled (get-in ex [:protocol :scheduled])
+     :protocol-last-proposal (get-in ex [:protocol :seq])
      :binary-knows duties/max-protocol
      :halted @halted
      :validator-set (when (vals/enabled? ex) (mapv :witness (vals/active-set ex)))
@@ -1889,6 +1900,12 @@
 
     (not (re-matches #"[1-9][0-9]*" (env "ATTEST_EVERY" "20")))
     (conj "ATTEST_EVERY must be a positive integer")
+
+    ;; Genesis, like EPOCH_LENGTH: NaN or 0 would mean no notice at all, and
+    ;; with it no window in which an un-upgraded binary stops before the
+    ;; activation block.
+    (and (env "PROTOCOL_NOTICE" nil) (not (re-matches #"[1-9][0-9]*" (env "PROTOCOL_NOTICE" ""))))
+    (conj "PROTOCOL_NOTICE must be a positive integer")
 
     (and (env "BRIDGE_CONTRACT" nil)
          (not (re-matches #"0x[0-9a-fA-F]{40}" (env "BRIDGE_CONTRACT" ""))))
