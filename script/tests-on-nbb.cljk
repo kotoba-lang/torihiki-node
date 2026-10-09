@@ -20,9 +20,10 @@
             [torihiki-node.store-test]
             [torihiki-node.claims-test]
             [torihiki-node.duties-test]
-            [torihiki-node.epoch-test]))
+            [torihiki-node.epoch-test]
+            [torihiki-node.mempool-test]))
 
-(def ^:private expected-namespaces 4)
+(def ^:private expected-namespaces 5)
 (defonce ^:private ns-seen (atom 0))
 
 (defmethod ct/report [::ct/default :begin-test-ns] [_] (swap! ns-seen inc))
@@ -42,4 +43,4 @@
       (pos? (+ fail error)) (js/process.exit 1)
       :else (println "TESTS-ON-NBB: pass"))))
 
-(ct/run-tests 'torihiki-node.store-test 'torihiki-node.claims-test 'torihiki-node.duties-test 'torihiki-node.epoch-test)
+(ct/run-tests 'torihiki-node.store-test 'torihiki-node.claims-test 'torihiki-node.duties-test 'torihiki-node.epoch-test 'torihiki-node.mempool-test)

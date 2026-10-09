@@ -1,0 +1,107 @@
+(ns torihiki-node.mempool
+  "Transactions this node accepted, kept until the chain consumes their nonce.
+
+  inga empties a replica's pending list into the block it proposes. When that
+  block is not the one certified at its height — another leader's block wins,
+  the view times out, the proposal is `:locked-elsewhere` — the transactions
+  in it are gone: nobody else ever had them. Measured on a healthy four-node
+  standalone cluster: 3 of 12 deposits submitted at once never landed, and the
+  terminal said \"queued — a block will carry it\" forever.
+
+  So the node that accepted a transaction remembers it and hands it to its
+  replica again until the transaction's nonce is spent. Resubmitting is safe
+  because the engine's nonces are strictly sequential: a copy that lands
+  after the original is `:bad-nonce` and changes nothing. It is the same
+  reasoning `torihiki.auth/expected-nonce` gives for not allowing gaps.
+
+  Only transactions that could still apply are kept — signature valid, nonce
+  not yet spent and not absurdly far ahead — and the table is bounded overall
+  and per account, so junk cannot be amplified by resubmission.
+
+  Pure: the node passes in the clock, the verifier and the engine's nonces.")
+
+(def defaults
+  {:cap 4096             ; transactions remembered in all
+   :per-account 64       ; per account, which is also how far ahead a nonce may be
+   :ttl-ms 120000        ; given up after this long
+   :gap-ms 3000})        ; resubmitted at most this often
+
+(defn admit
+  "`tracked` with `body` (the raw transaction string) remembered, or unchanged
+  when the transaction could never apply or there is no room.
+
+  `t` is the decoded envelope `{:tx :account :nonce :pubkey :sig}`;
+  `expected` the account's next nonce on this node's engine; `verify?` the
+  signature check, called last because it is the expensive one."
+  ([tracked body t now expected verify?] (admit tracked body t now expected verify? defaults))
+  ([tracked body {:keys [account nonce]} now expected verify? {:keys [cap per-account]}]
+   (if (or (contains? tracked body)
+           (not (integer? account)) (not (integer? nonce)) (not (integer? expected))
+           (< nonce expected) (>= nonce (+ expected per-account))
+           (>= (count tracked) cap)
+           (>= (count (filter #(= account (:account %)) (vals tracked))) per-account)
+           (not (true? (verify?))))
+     tracked
+     (assoc tracked body {:account account :nonce nonce :at now :sent-at now}))))
+
+(defn sweep
+  "Forget what the chain has consumed (the account's next nonce is past it:
+  applied, or overtaken by another transaction with that nonce) and what has
+  waited longer than `ttl-ms`."
+  ([tracked now expected-of] (sweep tracked now expected-of defaults))
+  ([tracked now expected-of {:keys [ttl-ms]}]
+   (into {} (remove (fn [[_ {:keys [account nonce at]}]]
+                      (or (> (expected-of account) nonce)
+                          (> (- now at) ttl-ms))))
+         tracked)))
+
+(defn due
+  "`[bodies tracked']`: what to hand the replica again now — not resent within
+  `gap-ms` and not already in its pending list — with `:sent-at` moved on.
+  Lowest nonce first per account, so a run of transactions arrives in an
+  order the engine can apply."
+  ([tracked now pending] (due tracked now pending defaults))
+  ([tracked now pending {:keys [gap-ms]}]
+   (let [in-pending (set pending)
+         bodies (->> tracked
+                     (filter (fn [[b {:keys [sent-at]}]]
+                               (and (>= (- now sent-at) gap-ms) (not (contains? in-pending b)))))
+                     (sort-by (fn [[_ {:keys [account nonce]}]] [account nonce]))
+                     (mapv key))]
+     [bodies (reduce #(assoc-in %1 [%2 :sent-at] now) tracked bodies)])))
+
+(def auth-reasons
+  "Rejections `torihiki.auth/check` gives. They consume no nonce, so the same
+  transaction may still land later (a copy arriving before the transaction
+  ahead of it, say); every other outcome is final."
+  #{:missing-account :unsigned :wrong-key :agent-may-not :not-your-account
+    :bad-nonce :bad-signature})
+
+(defn outcomes
+  "`{sig {:status :applied|:rejected :reason r :height h :final bool}}` for a
+  block: `txs` its decoded envelopes in order, `rejected` the engine's
+  `[{:index :reason}]` for it."
+  [txs rejected height]
+  (let [why (into {} (map (juxt :index :reason)) rejected)]
+    (into {} (for [[i {:keys [sig]}] (map-indexed vector txs)
+                   :when (string? sig)
+                   :let [r (get why i)]]
+               [sig {:status (if r :rejected :applied) :reason r :height height
+                     :final (not (contains? auth-reasons r))}]))))
+
+(defn record-outcomes
+  "`log` (`{:by-sig {} :order []}`) with `new` merged: a final outcome is never
+  replaced — a resubmitted copy that lands afterwards as `:bad-nonce` must not
+  turn \"applied\" into \"refused\" — and the oldest are dropped past `cap`."
+  [log new cap]
+  (let [log (reduce (fn [{:keys [by-sig] :as l} [sig o]]
+                      (let [old (get by-sig sig)]
+                        (cond (:final old) l
+                              old (assoc-in l [:by-sig sig] o)
+                              :else (-> l (assoc-in [:by-sig sig] o) (update :order conj sig)))))
+                    (or log {:by-sig {} :order []}) new)
+        extra (- (count (:order log)) cap)]
+    (if (pos? extra)
+      {:by-sig (apply dissoc (:by-sig log) (take extra (:order log)))
+       :order (vec (drop extra (:order log)))}
+      log)))
